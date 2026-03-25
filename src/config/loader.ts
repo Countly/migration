@@ -65,11 +65,11 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             manifestDb: env.MANIFEST_DB,
             redisUrl: env.REDIS_URL,
             redisKeyPrefix: env.REDIS_KEY_PREFIX,
+            timelineSnapshotInterval: env.TIMELINE_SNAPSHOT_INTERVAL,
         },
 
         memory: {
             gcEnabled: env.GC_ENABLED,
-            gcMaxOldSpaceSizeMb: env.GC_MAX_OLD_SPACE_SIZE_MB,
             gcRssSoftLimitMb: env.GC_RSS_SOFT_LIMIT_MB,
             gcRssHardLimitMb: env.GC_RSS_HARD_LIMIT_MB,
             gcHeapUsedRatio: env.GC_HEAP_USED_RATIO,
@@ -105,7 +105,7 @@ function stripUndefined(obj: Record<string, unknown>): Record<string, unknown> {
 /**
  * Load and validate configuration from environment variables.
  *
- * 1. Reads `.env` (if present) via `dotenv`.
+ * 1. Reads environment variables from `process.env`.
  * 2. Maps flat env vars into the nested config shape.
  * 3. Parses and validates through the Zod schema, applying defaults.
  *
@@ -132,6 +132,20 @@ export function loadConfig(): Config {
         throw new Error(
             `CLICKHOUSE_RETRY_BASE_DELAY_MS (${target.retryBaseDelayMs}) must be <= CLICKHOUSE_RETRY_MAX_DELAY_MS (${target.retryMaxDelayMs})`,
         );
+    }
+
+    const { backpressure } = config;
+    if (backpressure.enabled) {
+        if (backpressure.partitionPctLow >= backpressure.partitionPctHigh) {
+            throw new Error(
+                `BACKPRESSURE_PARTITION_PCT_LOW (${backpressure.partitionPctLow}) must be < BACKPRESSURE_PARTITION_PCT_HIGH (${backpressure.partitionPctHigh})`,
+            );
+        }
+        if (backpressure.totalPctLow >= backpressure.totalPctHigh) {
+            throw new Error(
+                `BACKPRESSURE_TOTAL_PCT_LOW (${backpressure.totalPctLow}) must be < BACKPRESSURE_TOTAL_PCT_HIGH (${backpressure.totalPctHigh})`,
+            );
+        }
     }
 
     return config;

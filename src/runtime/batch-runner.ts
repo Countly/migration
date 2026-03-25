@@ -315,7 +315,7 @@ export class BatchRunner {
           await this.deps.manifestStore.insertBatch(batch);
           this.lastCommittedId = upperInclusiveId;
 
-          // Manifest first, then Redis (continue if Redis fails)
+          // Advance run cursor
           await this.deps.manifestStore.updateRunLastCommittedCursor(runId, upperInclusiveId);
           await this.bestEffortRedis(
             () => this.deps.redisState.markBatchDone(runId, this.batchSeq),
@@ -395,18 +395,10 @@ export class BatchRunner {
             },
           );
 
-          // (k) On success: mark 'done' in manifest FIRST, then update Redis
-          await this.deps.manifestStore.updateBatchStatus(
-            runId,
-            this.batchSeq,
-            "done",
-          );
-
+          // (k) On success: atomically mark batch done + advance cursor
+          await this.deps.manifestStore.completeBatch(runId, this.batchSeq, upperInclusiveId);
           this.lastCommittedId = upperInclusiveId;
           this.totalRowsInserted += result.rowsInserted;
-
-          // Manifest authoritative update
-          await this.deps.manifestStore.updateRunLastCommittedCursor(runId, upperInclusiveId);
 
           // Redis is rebuildable (continue if Redis fails)
           await this.bestEffortRedis(
@@ -547,13 +539,20 @@ export class BatchRunner {
         );
       }
 
-      await this.deps.manifestStore.insertEvent({
-        run_id: this.deps.config.runId,
-        event_type: "fatal_error",
-        message: error.message,
-        metadata: { stack: error.stack },
-        created_at: new Date().toISOString(),
-      });
+      try {
+        await this.deps.manifestStore.insertEvent({
+          run_id: this.deps.config.runId,
+          event_type: "fatal_error",
+          message: error.message,
+          metadata: { stack: error.stack },
+          created_at: new Date().toISOString(),
+        });
+      } catch (eventErr) {
+        this.logger.warn(
+          { error: toError(eventErr).message },
+          "Failed to insert fatal error event (continuing with throw)",
+        );
+      }
 
       throw error;
     }
@@ -702,6 +701,13 @@ export class BatchRunner {
 
     this.lastCommittedId = run.last_committed_cursor;
 
+    // Derive cursor from highest done batch as fallback (handles crash between
+    // updateBatchStatus("done") and updateRunLastCommittedCursor)
+    const lastDoneBatch = await this.deps.manifestStore.getLastDoneBatch(runId);
+    if (lastDoneBatch?.upper_inclusive_cursor) {
+      this.lastCommittedId = lastDoneBatch.upper_inclusive_cursor;
+    }
+
     // Find batches that need recovery (inflight or prepared)
     const inflightBatches = await this.deps.manifestStore.getBatches(runId, {
       status: "inflight",
@@ -797,11 +803,12 @@ export class BatchRunner {
           );
         }
 
-        // Step 6: Mark done, set digest_match, advance checkpoint
-        await this.deps.manifestStore.updateBatchStatus(runId, batch.batch_seq, "done");
+        // Step 6: Mark done + advance cursor, then set digest_match
+        await this.deps.manifestStore.completeBatch(runId, batch.batch_seq, batch.upper_inclusive_cursor);
         await this.deps.manifestStore.updateBatchDigestMatch(runId, batch.batch_seq, digestMatched);
         this.lastCommittedId = batch.upper_inclusive_cursor;
-        await this.deps.manifestStore.updateRunLastCommittedCursor(runId, batch.upper_inclusive_cursor);
+        this.totalDocsRead += page.docs.length;
+        this.totalRowsInserted += rows.length;
 
         try {
           await this.deps.redisState.markBatchDone(runId, batch.batch_seq);
@@ -829,9 +836,10 @@ export class BatchRunner {
         const error = toError(err);
         this.logger.error(
           { batchSeq: batch.batch_seq, error: error.message },
-          "Failed to recover interrupted batch, marking failed",
+          "Failed to recover interrupted batch — aborting recovery to prevent data gap",
         );
         await this.deps.manifestStore.updateBatchStatus(runId, batch.batch_seq, "failed", error.message);
+        throw error;
       }
     }
 
@@ -882,10 +890,14 @@ export class BatchRunner {
    */
   private async waitForResume(): Promise<void> {
     while (this.status === "paused") {
-      await Promise.race([
-        new Promise<void>((resolve) => this.emitter.once("resumed", resolve)),
-        sleep(2_000),
-      ]);
+      await new Promise<void>((resolve) => {
+        const onResume = () => { clearTimeout(timer); resolve(); };
+        const timer = setTimeout(() => {
+          this.emitter.off("resumed", onResume);
+          resolve();
+        }, 2_000);
+        this.emitter.once("resumed", onResume);
+      });
       if (this.status === "paused") {
         await this.checkCommands();
       }

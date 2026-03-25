@@ -83,10 +83,10 @@ export const configSchema = z.object({
         enabled: booleanFromEnv.default(true),
         partsToThrowInsert: intFromEnv.default(300),
         maxPartsInTotal: intFromEnv.default(500),
-        partitionPctHigh: numberFromEnv.default(0.50),
-        partitionPctLow: numberFromEnv.default(0.35),
-        totalPctHigh: numberFromEnv.default(0.50),
-        totalPctLow: numberFromEnv.default(0.40),
+        partitionPctHigh: numberFromEnv.default(0.50).pipe(z.number().min(0).max(1)),
+        partitionPctLow: numberFromEnv.default(0.35).pipe(z.number().min(0).max(1)),
+        totalPctHigh: numberFromEnv.default(0.50).pipe(z.number().min(0).max(1)),
+        totalPctLow: numberFromEnv.default(0.40).pipe(z.number().min(0).max(1)),
         pollIntervalMs: intFromEnv.default(15_000),
         maxPauseEpisodeMs: intFromEnv.default(180_000),
     }),
@@ -102,7 +102,6 @@ export const configSchema = z.object({
     // ── Memory / GC ─────────────────────────────────────────────────────
     memory: z.object({
         gcEnabled: booleanFromEnv.default(true),
-        gcMaxOldSpaceSizeMb: intFromEnv.default(2_048),
         gcRssSoftLimitMb: intFromEnv.default(1_536),
         gcRssHardLimitMb: intFromEnv.default(2_048),
         gcHeapUsedRatio: numberFromEnv.default(0.70),

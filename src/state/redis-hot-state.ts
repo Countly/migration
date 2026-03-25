@@ -257,7 +257,10 @@ export class RedisHotState {
 
     async pushTimelineSnapshot(runId: string, snapshot: TimelineSnapshot): Promise<void> {
         const key = k(this.prefix, "run", runId, "timeline");
-        await this.redis.rpush(key, JSON.stringify(snapshot));
+        const pipeline = this.redis.multi();
+        pipeline.rpush(key, JSON.stringify(snapshot));
+        pipeline.ltrim(key, -1000, -1);
+        await pipeline.exec();
     }
 
     async getTimeline(runId: string): Promise<TimelineSnapshot[]> {
@@ -279,7 +282,10 @@ export class RedisHotState {
         error: VerboseError,
     ): Promise<void> {
         const key = k(this.prefix, "run", runId, "batch", String(batchSeq), "errors");
-        await this.redis.rpush(key, JSON.stringify(error));
+        const pipeline = this.redis.multi();
+        pipeline.rpush(key, JSON.stringify(error));
+        pipeline.ltrim(key, -20, -1);
+        await pipeline.exec();
     }
 
     async getVerboseErrors(

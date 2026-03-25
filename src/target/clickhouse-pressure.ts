@@ -52,6 +52,25 @@ export class ClickHousePressure {
     const maxPartsInPartition = results[1].status === 'fulfilled' ? results[1].value : 0;
     const mergesInFlight = results[2].status === 'fulfilled' ? results[2].value : 0;
 
+    const allFailed = results.every(r => r.status === 'rejected');
+    if (allFailed) {
+      const errors = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+      this.logger.error({ errors: errors.map(e => e.reason?.message ?? String(e.reason)) }, 'all pressure queries failed — treating as pressured');
+      return {
+        activePartsTotal: 0,
+        maxPartsInPartition: 0,
+        mergesInFlight: 0,
+        partitionPressure: 1,
+        totalPressure: 1,
+        compactionStalled: false,
+        rssExceeded: false,
+        diskCheckSkipped: true,
+        shouldPause: true,
+        canResume: false,
+        pauseReason: 'all_pressure_queries_failed',
+      };
+    }
+
     if (results.some(r => r.status === 'rejected')) {
       const errors = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
       this.logger.warn({ errors: errors.map(e => e.reason?.message ?? String(e.reason)) }, 'some pressure queries failed, using fallback values');

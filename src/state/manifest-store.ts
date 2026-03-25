@@ -112,7 +112,9 @@ export class ManifestStore {
 
     constructor(uri: string, dbName: string) {
         this.dbName = dbName;
-        this.client = new MongoClient(uri);
+        this.client = new MongoClient(uri, {
+            writeConcern: { w: "majority", journal: true },
+        });
     }
 
     async connect(): Promise<void> {
@@ -191,9 +193,12 @@ export class ManifestStore {
         return { runs: docs, total };
     }
 
-    async getActiveRun(): Promise<Run | undefined> {
+    async getActiveRun(sourceNs?: string, targetTable?: string): Promise<Run | undefined> {
         const { runs } = this.ensureConnected();
-        const doc = await runs.findOne({ status: "active" }, { projection: { _id: 0 } });
+        const filter: Record<string, unknown> = { status: "active" };
+        if (sourceNs) filter.source_ns = sourceNs;
+        if (targetTable) filter.target_table = targetTable;
+        const doc = await runs.findOne(filter, { projection: { _id: 0 } });
         return doc ?? undefined;
     }
 
@@ -268,10 +273,12 @@ export class ManifestStore {
     ): Promise<void> {
         const { batches } = this.ensureConnected();
         const now = new Date().toISOString();
-        const $set: { status: BatchStatus; finished_at: string; last_error?: string } = {
-            status,
-            finished_at: now,
-        };
+        const $set: Record<string, unknown> = { status };
+
+        // Only set finished_at for terminal statuses
+        if (status === "done" || status === "failed" || status === "skipped_empty") {
+            $set.finished_at = now;
+        }
 
         if (error !== undefined) {
             $set.last_error = error;
@@ -283,6 +290,33 @@ export class ManifestStore {
                 ? { $set, $inc: { retry_count: 1 } }
                 : { $set },
         );
+    }
+
+    /**
+     * Mark a batch as done and advance the run's last_committed_cursor.
+     * Two-step write (not transactional) — the resume path's `getLastDoneBatch`
+     * fallback compensates if the process crashes between the two writes.
+     */
+    async completeBatch(
+        runId: string,
+        batchSeq: number,
+        lastCommittedCursor: string,
+    ): Promise<void> {
+        const { batches, runs } = this.ensureConnected();
+        const now = new Date().toISOString();
+        const start = performance.now();
+
+        await batches.updateOne(
+            { run_id: runId, batch_seq: batchSeq },
+            { $set: { status: "done" as BatchStatus, finished_at: now } },
+        );
+
+        await runs.updateOne(
+            { run_id: runId },
+            { $set: { last_committed_cursor: lastCommittedCursor, updated_at: now } },
+        );
+
+        this._lastWriteLatencyMs = Math.round(performance.now() - start);
     }
 
     async updateBatchDigestMatch(
@@ -319,6 +353,24 @@ export class ManifestStore {
             { sort: { batch_seq: -1 }, projection: { _id: 0 } },
         );
         return doc ?? null;
+    }
+
+    async getLastDoneBatch(runId: string): Promise<Batch | null> {
+        const { batches } = this.ensureConnected();
+        const doc = await batches.findOne(
+            { run_id: runId, status: "done" },
+            { sort: { batch_seq: -1 }, projection: { _id: 0 } },
+        );
+        return doc ?? null;
+    }
+
+    async existsCompletedRun(sourceNs: string, targetTable: string): Promise<boolean> {
+        const { runs } = this.ensureConnected();
+        const count = await runs.countDocuments(
+            { status: "completed", source_ns: sourceNs, target_table: targetTable },
+            { limit: 1 },
+        );
+        return count > 0;
     }
 
     async getBatches(runId: string, opts: GetBatchesOptions = {}): Promise<Batch[]> {

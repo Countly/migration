@@ -12,6 +12,8 @@ import { randomUUID } from 'node:crypto';
 export interface ResolvedRun {
     runId: string;
     upperBoundId: string;
+    /** True if the source collection was empty — caller should skip migration. */
+    isEmpty?: boolean;
 }
 
 export interface ResolveRunOpts {
@@ -60,8 +62,8 @@ export async function resolveRun(opts: ResolveRunOpts): Promise<ResolvedRun> {
     }
 
     if (rerunMode === 'resume') {
-        // Priority 1: active run (crash recovery)
-        const activeRun = await manifestStore.getActiveRun();
+        // Priority 1: active run for THIS collection (crash recovery)
+        const activeRun = await manifestStore.getActiveRun(sourceNs, targetTable);
         if (activeRun) {
             logger.info({ runId: activeRun.run_id }, 'Resuming active run');
             return { runId: activeRun.run_id, upperBoundId: activeRun.upper_bound_cursor };
@@ -90,7 +92,11 @@ export async function resolveRun(opts: ResolveRunOpts): Promise<ResolvedRun> {
 
         // Priority 3: no resumable run, create new
         const runId = randomUUID();
-        const upperBoundId = serializeCursor(await mongoReader.getUpperBound());
+        const upperBound = await mongoReader.getUpperBound();
+        if (!upperBound) {
+            return { runId, upperBoundId: '', isEmpty: true };
+        }
+        const upperBoundId = serializeCursor(upperBound);
         await createNewRun(runId, upperBoundId);
         logger.info({ runId, upperBoundId, sourceNs, targetTable }, 'Created new migration run');
         return { runId, upperBoundId };
@@ -98,8 +104,12 @@ export async function resolveRun(opts: ResolveRunOpts): Promise<ResolvedRun> {
 
     if (rerunMode === 'new-run') {
         const runId = randomUUID();
-        const upperBoundId = serializeCursor(await mongoReader.getUpperBound());
-        const activeRun = await manifestStore.getActiveRun();
+        const upperBound = await mongoReader.getUpperBound();
+        if (!upperBound) {
+            return { runId, upperBoundId: '', isEmpty: true };
+        }
+        const upperBoundId = serializeCursor(upperBound);
+        const activeRun = await manifestStore.getActiveRun(sourceNs, targetTable);
         if (activeRun) {
             await manifestStore.updateRunStatus(activeRun.run_id, 'completed');
         }
@@ -109,7 +119,7 @@ export async function resolveRun(opts: ResolveRunOpts): Promise<ResolvedRun> {
     }
 
     if (rerunMode === 'clone-run') {
-        const activeRun = await manifestStore.getActiveRun();
+        const activeRun = await manifestStore.getActiveRun(sourceNs, targetTable);
         if (!activeRun) throw new Error('No existing run to clone from');
         const runId = randomUUID();
         const upperBoundId = activeRun.upper_bound_cursor;

@@ -10,6 +10,8 @@ import type { CollectionOrchestrator, OrchestratorProgress } from '../runtime/co
 
 export interface StatsDeps {
   orchestrator: CollectionOrchestrator;
+  mongoReader: { isConnected(): boolean };
+  chWriter: { isConnected(): boolean };
   redisState: {
     isHealthy(): Promise<boolean>;
     getBitmapCount(runId: string): Promise<number>;
@@ -133,14 +135,14 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
       },
       batch: null,
       mongo: {
-        connected: true,
+        connected: deps.mongoReader.isConnected(),
         readPreference: config.source.readPreference,
         readConcern: config.source.readConcern,
         batchRowsTarget: config.source.batchRowsTarget,
         cursorBatchSize: config.source.cursorBatchSize,
       },
       clickhouse: {
-        connected: true,
+        connected: deps.chWriter.isConnected(),
         target: `${config.target.db}.${config.target.table}`,
         compression: 'gzip',
         partsToThrowInsert: config.backpressure.partsToThrowInsert,

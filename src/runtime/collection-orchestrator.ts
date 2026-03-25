@@ -63,6 +63,7 @@ export class CollectionOrchestrator {
     private discoveredCollections: string[] = [];
     private results: CollectionResult[] = [];
     private currentCollection: string | null = null;
+    private currentRunId: string | null = null;
     private currentBatchRunner: BatchRunner | null = null;
     private currentRedisState: RedisHotState | null = null;
     private stopping = false;
@@ -99,10 +100,7 @@ export class CollectionOrchestrator {
             const targetTable = `${config.target.db}.${config.target.table}`;
 
             // Check if a completed run already exists for this collection
-            const existingRuns = await manifestStore.listRuns({ status: "completed" });
-            const alreadyCompleted = existingRuns.runs.some(
-                (r) => r.source_ns === sourceNs && r.target_table === targetTable,
-            );
+            const alreadyCompleted = await manifestStore.existsCompletedRun(sourceNs, targetTable);
 
             if (alreadyCompleted) {
                 this.logger.info({ collection: collectionName, sourceNs }, "Collection already migrated, skipping");
@@ -142,6 +140,7 @@ export class CollectionOrchestrator {
         }
 
         this.currentCollection = null;
+        this.currentRunId = null;
         this.currentBatchRunner = null;
 
         // 3. Summary
@@ -182,10 +181,7 @@ export class CollectionOrchestrator {
     }
 
     getCurrentRunId(): string | null {
-        if (!this.currentBatchRunner) return null;
-        return this.currentBatchRunner.getStats().status !== "idle"
-            ? this.results.find((r) => r.collection === this.currentCollection)?.runId ?? null
-            : null;
+        return this.currentRunId;
     }
 
     pause(): void {
@@ -248,7 +244,7 @@ export class CollectionOrchestrator {
         this.currentRedisState = redisState;
 
         // Resolve run (resume or new)
-        const { runId, upperBoundId } = await resolveRun({
+        const resolved = await resolveRun({
             rerunMode: config.service.rerunMode,
             manifestStore,
             redisState,
@@ -258,6 +254,15 @@ export class CollectionOrchestrator {
             transformVersion: config.transform.version,
             logger: this.logger,
         });
+
+        const { runId, upperBoundId } = resolved;
+        this.currentRunId = runId;
+
+        if (resolved.isEmpty) {
+            this.currentRunId = null;
+            this.logger.info({ collection: collectionName }, "Collection is empty, skipping");
+            return { collection: collectionName, sourceNs, runId, status: "completed" };
+        }
 
         this.logger.info(
             { collection: collectionName, runId, upperBoundId },

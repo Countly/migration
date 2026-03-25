@@ -85,7 +85,7 @@ export function toDouble(val: unknown, defaultVal: number): number {
     return isFinite(val) ? val : defaultVal;
   }
   const parsed = Number(val);
-  return isNaN(parsed) ? defaultVal : parsed;
+  return (isNaN(parsed) || !isFinite(parsed)) ? defaultVal : parsed;
 }
 
 /**

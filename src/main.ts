@@ -146,6 +146,8 @@ async function main(): Promise<void> {
 
   registerStatsRoute(app, {
     orchestrator,
+    mongoReader,
+    chWriter,
     redisState,
     gcController,
     processMetrics,
@@ -163,6 +165,7 @@ async function main(): Promise<void> {
   registerRunRoutes(app, {
     manifestStore,
     redisState,
+    orchestrator,
   });
 
   // ── 7. Start HTTP server ────────────────────────────────────────────

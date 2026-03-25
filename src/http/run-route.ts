@@ -4,7 +4,7 @@ import type { Run, Batch, BatchStatus, RunStatus, GetBatchesOptions } from '../s
 
 export interface RunDeps {
   manifestStore: {
-    getActiveRun(): Promise<Run | undefined>;
+    getActiveRun(sourceNs?: string, targetTable?: string): Promise<Run | undefined>;
     getRun(runId: string): Promise<Run | undefined>;
     listRuns(opts: { status?: RunStatus; limit?: number; offset?: number }): Promise<{ runs: Run[]; total: number }>;
     getBatches(runId: string, opts: GetBatchesOptions): Promise<Batch[]>;
@@ -17,6 +17,9 @@ export interface RunDeps {
     getVerboseErrors(runId: string, batchSeq: number): Promise<import('../state/redis-hot-state.ts').VerboseError[]>;
     cleanupRun(runId: string): Promise<number>;
     isHealthy(): Promise<boolean>;
+  };
+  orchestrator?: {
+    getCurrentRunId(): string | null;
   };
 }
 
@@ -160,11 +163,16 @@ export function registerRunRoutes(app: FastifyInstance, deps: RunDeps): void {
         if (healthy) {
           redisDataAvailable = true;
           recentErrors = await redisState.getRecentErrors(runId);
+          const verboseResults = await Promise.all(
+            failedBatches.map(batch =>
+              redisState.getVerboseErrors(runId, batch.batch_seq)
+                .then(v => ({ seq: batch.batch_seq, errors: v }))
+            )
+          );
           const errorEntries: Record<number, unknown[]> = {};
-          for (const batch of failedBatches) {
-            const verbose = await redisState.getVerboseErrors(runId, batch.batch_seq);
-            if (verbose.length > 0) {
-              errorEntries[batch.batch_seq] = verbose;
+          for (const { seq, errors } of verboseResults) {
+            if (errors.length > 0) {
+              errorEntries[seq] = errors;
             }
           }
           verboseErrors = errorEntries;
@@ -207,6 +215,11 @@ export function registerRunRoutes(app: FastifyInstance, deps: RunDeps): void {
     async (request, reply) => {
       const { runId } = request.params;
 
+      const run = await manifestStore.getRun(runId);
+      if (!run) {
+        return reply.status(404).send({ error: 'Run not found' });
+      }
+
       const doneBatches = await manifestStore.getBatches(runId, { status: 'done' });
       const allBatches = await manifestStore.getBatches(runId, {});
       const coverage = buildCoverageFromBatches(doneBatches);
@@ -229,6 +242,12 @@ export function registerRunRoutes(app: FastifyInstance, deps: RunDeps): void {
     '/runs/:runId/cache',
     async (request, reply) => {
       const { runId } = request.params;
+      const currentRunId = deps.orchestrator?.getCurrentRunId?.();
+      if (currentRunId && currentRunId === runId) {
+        return reply.status(409).send({
+          error: 'Cannot delete cache for the currently active run',
+        });
+      }
       const keysDeleted = await redisState.cleanupRun(runId);
       return reply.status(200).send({ runId, keys_deleted: keysDeleted });
     },

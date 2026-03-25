@@ -67,6 +67,9 @@ export class MongoReader {
       retryReads,
       appName,
       readConcern: { level: readConcern as "local" | "majority" | "linearizable" | "available" | "snapshot" },
+      serverSelectionTimeoutMS: 30_000,
+      connectTimeoutMS: 10_000,
+      socketTimeoutMS: this.config.maxTimeMs + 30_000,
     });
 
     await this.client.connect();
@@ -113,7 +116,7 @@ export class MongoReader {
     return this.db;
   }
 
-  async getUpperBound(): Promise<Cursor> {
+  async getUpperBound(): Promise<Cursor | null> {
     this.ensureConnected();
 
     const result = await this.collection!
@@ -125,7 +128,8 @@ export class MongoReader {
       .toArray();
 
     if (result.length === 0) {
-      throw new Error("Collection is empty, cannot determine upper bound cursor");
+      this.logger.info({ collection: this.currentCollectionName }, "Collection is empty");
+      return null;
     }
 
     const upperBound: Cursor = { cd: cdToEpoch(result[0].cd), id: String(result[0]._id) };
@@ -208,7 +212,9 @@ export class MongoReader {
       this.logger.info("Closing MongoDB connection");
       await this.client.close();
       this.client = null;
+      this.db = null;
       this.collection = null;
+      this.currentCollectionName = null;
       this.connected = false;
       this.logger.info("MongoDB connection closed");
     }
