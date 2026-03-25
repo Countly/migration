@@ -15,6 +15,7 @@ import {
   formatTimestamp,
   firstNonBlank,
 } from './validators.ts';
+import type { CollectionDefaults } from './hash-resolver.ts';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -99,9 +100,9 @@ export interface TransformResult {
  *
  * Returns `{ row, skipReason }` where exactly one of the two is non-null.
  */
-export function transformDocument(doc: SourceDocument): TransformResult {
+export function transformDocument(doc: SourceDocument, defaults?: CollectionDefaults): TransformResult {
   try {
-    return doTransform(doc);
+    return doTransform(doc, defaults);
   } catch {
     return { row: null, skipReason: SkipReason.TRANSFORM_ERROR };
   }
@@ -122,13 +123,14 @@ export function transformDocument(doc: SourceDocument): TransformResult {
 export function transformBatch(
   docs: SourceDocument[],
   skipCounter: SkipCounter,
+  defaults?: CollectionDefaults,
 ): { rows: OutputRow[]; skippedSamples: Array<{ _id: string; reason: SkipReason }> } {
   const rows: OutputRow[] = [];
   const skippedSamples: Array<{ _id: string; reason: SkipReason }> = [];
   const MAX_SKIP_SAMPLES = 10;
 
   for (const doc of docs) {
-    const { row, skipReason } = transformDocument(doc);
+    const { row, skipReason } = transformDocument(doc, defaults);
 
     if (row !== null) {
       rows.push(row);
@@ -148,19 +150,21 @@ export function transformBatch(
 // Internal helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-function doTransform(doc: SourceDocument): TransformResult {
+function doTransform(doc: SourceDocument, defaults?: CollectionDefaults): TransformResult {
   // ── Skip if already migrated ──────────────────────────────────────────
   if (doc.migrated === true) {
     return { row: null, skipReason: SkipReason.ALREADY_MARKED_MIGRATED };
   }
 
   // ── Required field checks ─────────────────────────────────────────────
-  const a = asString(doc.a);
+  // Fall back to collection-level defaults derived from the collection hash
+  // when the document itself is missing `a` or `e`.
+  const a = asString(doc.a) ?? defaults?.a ?? null;
   if (a === null) {
     return { row: null, skipReason: SkipReason.MISSING_A };
   }
 
-  const e = asString(doc.e);
+  const e = asString(doc.e) ?? defaults?.e ?? null;
   if (e === null) {
     return { row: null, skipReason: SkipReason.MISSING_E };
   }

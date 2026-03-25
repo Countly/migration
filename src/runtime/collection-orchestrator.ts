@@ -9,6 +9,7 @@ import type { RetryPolicy } from "./retry-policy.ts";
 import { BatchRunner, type RunnerStatus, type BatchRunnerStats } from "./batch-runner.ts";
 import { resolveRun } from "./resolve-run.ts";
 import { discoverCollections } from "../source/discover-collections.ts";
+import type { HashResolver } from "../transform/hash-resolver.ts";
 import type { Config } from "../config/schema.ts";
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,8 @@ export interface CollectionResult {
     runId: string;
     status: "completed" | "failed" | "skipped";
     error?: string;
+    docsRead?: number;
+    rowsInserted?: number;
 }
 
 export interface OrchestratorResult {
@@ -48,6 +51,7 @@ export interface OrchestratorDeps {
     chPressure: ClickHousePressure;
     gcController: GcController;
     retryPolicy: RetryPolicy;
+    hashResolver: HashResolver;
     logger: Logger;
     config: Config;
 }
@@ -62,6 +66,7 @@ export class CollectionOrchestrator {
 
     private discoveredCollections: string[] = [];
     private results: CollectionResult[] = [];
+    private estimatedCounts: Map<string, number> = new Map();
     private currentCollection: string | null = null;
     private currentRunId: string | null = null;
     private currentBatchRunner: BatchRunner | null = null;
@@ -221,6 +226,10 @@ export class CollectionOrchestrator {
         return this.currentBatchRunner?.getCurrentBatchSeq() ?? 0;
     }
 
+    getEstimatedCounts(): Map<string, number> {
+        return new Map(this.estimatedCounts);
+    }
+
     // -----------------------------------------------------------------------
     // Private
     // -----------------------------------------------------------------------
@@ -236,6 +245,29 @@ export class CollectionOrchestrator {
 
         // Switch MongoReader to this collection (also ensures index)
         await mongoReader.switchCollection(collectionName);
+
+        // Get estimated document count for progress tracking
+        const estimatedCount = await mongoReader.getEstimatedCount();
+        this.estimatedCounts.set(collectionName, estimatedCount);
+        this.logger.info({ collection: collectionName, estimatedCount }, "Estimated document count");
+
+        // Resolve collection defaults from hash (once per collection)
+        const collectionDefaults = this.deps.hashResolver.resolveCollectionName(
+            collectionName,
+            config.source.collectionPrefix,
+        );
+
+        if (collectionDefaults) {
+            this.logger.info(
+                { collection: collectionName, appId: collectionDefaults.a, event: collectionDefaults.e },
+                "Resolved collection hash defaults",
+            );
+        } else if (collectionName !== config.source.collectionPrefix) {
+            this.logger.warn(
+                { collection: collectionName },
+                "No hash match found for collection — documents missing a/e will be skipped",
+            );
+        }
 
         // Create per-collection RedisHotState with isolated key prefix
         const redisClient = this.deps.redisState.getRedisClient();
@@ -291,6 +323,7 @@ export class CollectionOrchestrator {
                 database: config.target.db,
                 table: config.target.table,
                 snapshotInterval: config.state.timelineSnapshotInterval,
+                collectionDefaults: collectionDefaults ?? undefined,
             },
         });
 
@@ -301,12 +334,21 @@ export class CollectionOrchestrator {
             await batchRunner.run();
 
             const finalStatus = batchRunner.getStatus();
+            const finalStats = batchRunner.getStats();
             if (finalStatus === "completed") {
-                return { collection: collectionName, sourceNs, runId, status: "completed" };
+                return {
+                    collection: collectionName, sourceNs, runId, status: "completed",
+                    docsRead: finalStats.totalDocsRead,
+                    rowsInserted: finalStats.totalRowsInserted,
+                };
             }
             if (finalStatus === "stopped" || finalStatus === "stopping") {
                 // Stopped by operator — treat as incomplete, not failed
-                return { collection: collectionName, sourceNs, runId, status: "failed", error: "Stopped by operator" };
+                return {
+                    collection: collectionName, sourceNs, runId, status: "failed", error: "Stopped by operator",
+                    docsRead: finalStats.totalDocsRead,
+                    rowsInserted: finalStats.totalRowsInserted,
+                };
             }
             return {
                 collection: collectionName,
@@ -314,6 +356,8 @@ export class CollectionOrchestrator {
                 runId,
                 status: "failed",
                 error: `BatchRunner ended with status: ${finalStatus}`,
+                docsRead: finalStats.totalDocsRead,
+                rowsInserted: finalStats.totalRowsInserted,
             };
         } catch (err) {
             const error = err instanceof Error ? err.message : String(err);

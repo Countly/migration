@@ -12,6 +12,7 @@ import type { GcController } from "./gc-controller.ts";
 import type { RetryPolicy } from "./retry-policy.ts";
 import { SkipCounter, type SkipReason } from "../transform/skip-reasons.ts";
 import { transformBatch, type OutputRow } from "../transform/normalize.ts";
+import type { CollectionDefaults } from "../transform/hash-resolver.ts";
 import { type Cursor, deserializeCursor, serializeCursor } from "../types/cursor.ts";
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,7 @@ export interface BatchRunnerConfig {
   database: string;
   table: string;
   snapshotInterval: number;
+  collectionDefaults?: CollectionDefaults;
 }
 
 export interface BatchRunnerDeps {
@@ -283,6 +285,7 @@ export class BatchRunner {
         const { rows, skippedSamples } = transformBatch(
           page.docs,
           this.skipCounter,
+          this.deps.config.collectionDefaults,
         );
 
         // Record skip samples in manifest
@@ -732,7 +735,7 @@ export class BatchRunner {
         );
 
         // Step 2: Re-transform
-        const { rows } = transformBatch(page.docs, this.skipCounter);
+        const { rows } = transformBatch(page.docs, this.skipCounter, this.deps.config.collectionDefaults);
 
         // Step 3: Recompute digest
         const newDigest = computePayloadDigest(rows);

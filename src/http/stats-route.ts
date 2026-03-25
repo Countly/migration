@@ -8,6 +8,35 @@ import type { CommandFlags } from '../state/redis-hot-state.ts';
 import type { Config } from '../config/schema.ts';
 import type { CollectionOrchestrator, OrchestratorProgress } from '../runtime/collection-orchestrator.ts';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Formatting helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+function progressBar(pct: number, width = 30): string {
+  const filled = Math.round((pct / 100) * width);
+  const arrow = filled < width ? '>' : '';
+  const empty = Math.max(0, width - filled - (arrow ? 1 : 0));
+  return '[' + '='.repeat(filled) + arrow + ' '.repeat(empty) + '] ' + pct + '%';
+}
+
+function fmtDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m ${sec}s`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
+function fmtNum(n: number): string {
+  return n.toLocaleString('en-US');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Route
+// ─────────────────────────────────────────────────────────────────────────────
+
 export interface StatsDeps {
   orchestrator: CollectionOrchestrator;
   mongoReader: { isConnected(): boolean };
@@ -46,6 +75,7 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
     const batchStats = orchestrator.getStats();
     const runnerStatus = orchestrator.getStatus();
     const currentBatchSeq = orchestrator.getCurrentBatchSeq();
+    const estimatedCounts = orchestrator.getEstimatedCounts();
 
     // Find the current run ID from the orchestrator's progress
     const currentResult = progress.results.find(
@@ -78,6 +108,27 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
     const elapsedMs = batchStats?.elapsedMs ?? 0;
     const elapsedSec = elapsedMs / 1000;
 
+    // ── Progress calculations ───────────────────────────────────────────
+    const currentCollEstimate = progress.currentCollection
+      ? estimatedCounts.get(progress.currentCollection) ?? 0 : 0;
+    const currentCollDocsRead = totalDocsRead;
+    const currentCollPct = currentCollEstimate > 0
+      ? Math.min(100, Math.round((currentCollDocsRead / currentCollEstimate) * 100)) : 0;
+
+    // Overall: completed collections use actual docsRead, fallback to estimate
+    const totalEstimated = Array.from(estimatedCounts.values()).reduce((a, b) => a + b, 0);
+    const completedDocsRead = progress.results
+      .filter(r => r.status === 'completed' || r.status === 'skipped')
+      .reduce((sum, r) => sum + (r.docsRead ?? estimatedCounts.get(r.collection) ?? 0), 0);
+    const overallDocsRead = completedDocsRead + currentCollDocsRead;
+    const overallPct = totalEstimated > 0
+      ? Math.min(100, Math.round((overallDocsRead / totalEstimated) * 100)) : 0;
+
+    // ETA based on elapsed time and progress percentage
+    const etaMs = overallPct > 0 && overallPct < 100 && elapsedMs > 0
+      ? Math.round(((Date.now() - startedAt.getTime()) / overallPct) * (100 - overallPct))
+      : null;
+
     // Commands from Redis (best-effort)
     let commands: CommandFlags = {};
     if (runId) {
@@ -91,6 +142,37 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
     const redisMetrics = redisState.getMetrics();
 
     const payload = {
+      // ── Quick-glance summary ──────────────────────────────────────────
+      summary: {
+        overall: progressBar(overallPct),
+        overallPct,
+        currentCollection: progress.currentCollection
+          ? `${progress.currentCollection}  ${progressBar(currentCollPct)}`
+          : 'idle',
+        currentCollectionPct: currentCollPct,
+        collections: `${progress.completedCollections}/${progress.totalCollections} done`
+          + (progress.failedCollections > 0 ? `, ${progress.failedCollections} failed` : '')
+          + (progress.skippedCollections > 0 ? `, ${progress.skippedCollections} skipped` : ''),
+        docsProgress: `${fmtNum(overallDocsRead)} / ~${fmtNum(totalEstimated)} docs`,
+        throughput: `${fmtNum(Math.round(batchStats?.docsPerSecond ?? 0))} docs/s`,
+        elapsed: fmtDuration(Date.now() - startedAt.getTime()),
+        eta: etaMs !== null ? `~${fmtDuration(etaMs)}` : 'calculating...',
+        status: runnerStatus,
+      },
+
+      // ── Current collection detail ─────────────────────────────────────
+      currentCollectionProgress: progress.currentCollection ? {
+        collection: progress.currentCollection,
+        estimated: currentCollEstimate,
+        docsRead: currentCollDocsRead,
+        rowsInserted: totalRowsInserted,
+        pct: currentCollPct,
+        bar: progressBar(currentCollPct),
+        batchSeq: currentBatchSeq,
+        skipRate: currentCollDocsRead > 0
+          ? `${((totalDocsSkipped / currentCollDocsRead) * 100).toFixed(1)}%` : '0%',
+      } : null,
+
       service: {
         name: config.service.name,
         version,
@@ -107,6 +189,13 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
         skippedCollections: progress.skippedCollections,
         currentCollection: progress.currentCollection,
         collections: progress.collections,
+        collectionProgress: progress.results.map(r => ({
+          collection: r.collection,
+          status: r.status,
+          estimated: estimatedCounts.get(r.collection) ?? null,
+          docsRead: r.docsRead ?? null,
+          rowsInserted: r.rowsInserted ?? null,
+        })),
       },
       run: {
         sourceNs: runRecord?.source_ns ?? null,

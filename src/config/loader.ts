@@ -22,6 +22,7 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
         source: {
             uri: env.MONGO_URI,
             db: env.MONGO_DB,
+            countlyDb: env.MONGO_COUNTLY_DB,
             collectionPrefix: env.MONGO_COLLECTION_PREFIX,
             readPreference: env.MONGO_READ_PREFERENCE,
             readConcern: env.MONGO_READ_CONCERN,

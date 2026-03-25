@@ -8,6 +8,7 @@ import { MongoReader } from './source/mongo-reader.ts';
 import { ClickHouseWriter } from './target/clickhouse-writer.ts';
 import { ClickHousePressure } from './target/clickhouse-pressure.ts';
 import { CollectionOrchestrator } from './runtime/collection-orchestrator.ts';
+import { HashResolver } from './transform/hash-resolver.ts';
 import { RetryPolicy } from './runtime/retry-policy.ts';
 import { GcController, type GcConfig } from './runtime/gc-controller.ts';
 import { ProcessMetricsCollector } from './runtime/process-metrics.ts';
@@ -119,6 +120,14 @@ async function main(): Promise<void> {
   }
   logger.info('All external services connected');
 
+  // ── 4b. Build hash resolver for drill_events* collection defaults ────
+  const hashResolver = new HashResolver(
+    { uri: config.source.uri, countlyDb: config.source.countlyDb },
+    logger,
+  );
+  await hashResolver.build();
+  logger.info({ hashEntries: hashResolver.size }, 'Hash resolver built');
+
   // ── 5. Create CollectionOrchestrator ────────────────────────────────
   const orchestrator = new CollectionOrchestrator({
     manifestStore,
@@ -128,6 +137,7 @@ async function main(): Promise<void> {
     chPressure,
     gcController,
     retryPolicy,
+    hashResolver,
     logger,
     config,
   });
@@ -227,6 +237,7 @@ async function main(): Promise<void> {
     await closeResource('ClickHouse', async () => { await chWriter.close(); await pressureClient.close(); });
     await closeResource('Redis', () => redisState.close());
     await closeResource('ManifestStore', () => manifestStore.close());
+    await closeResource('HashResolver', () => hashResolver.close());
     processMetrics.stop();
     gcController.dispose();
 

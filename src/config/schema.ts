@@ -49,6 +49,7 @@ export const configSchema = z.object({
     source: z.object({
         uri: z.string().min(1),
         db: z.string().default("countly_drill"),
+        countlyDb: z.string().default("countly"),
         collectionPrefix: z.string().default("drill_events"),
         readPreference: z.string().default("primary"),
         readConcern: z.string().default("majority"),
