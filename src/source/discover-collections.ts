@@ -20,6 +20,13 @@ export async function discoverCollections(
 
     const names = collections.map((c) => c.name).sort();
 
+    // Ensure the base collection (exact prefix match) is always processed first
+    const baseIdx = names.indexOf(prefix);
+    if (baseIdx > 0) {
+        names.splice(baseIdx, 1);
+        names.unshift(prefix);
+    }
+
     if (names.length === 0) {
         throw new Error(
             `No collections found matching prefix "${prefix}" in database "${db.databaseName}"`,

@@ -30,6 +30,14 @@ export interface PressureState {
   pauseReason: string | null;
 }
 
+export interface ServerMergeTreeLimits {
+  partsToThrowInsert: number;
+  partsToDelayInsert: number;
+  maxPartsInTotal: number;
+  inactivePartsToThrowInsert: number;
+  inactivePartsToDelayInsert: number;
+}
+
 export class ClickHousePressure {
   private readonly client: ClickHouseClient;
   private readonly config: BackpressureConfig;
@@ -39,6 +47,47 @@ export class ClickHousePressure {
     this.client = client;
     this.config = config;
     this.logger = logger.child({ component: 'clickhouse-pressure' });
+  }
+
+  /**
+   * Query the actual MergeTree settings from the ClickHouse server.
+   * Returns the server-side limits that govern when inserts are rejected or delayed.
+   */
+  static async fetchServerLimits(
+    client: ClickHouseClient,
+    logger: Logger,
+  ): Promise<ServerMergeTreeLimits> {
+    const result = await client.query({
+      query: `
+        SELECT name, value
+        FROM system.merge_tree_settings
+        WHERE name IN (
+          'parts_to_throw_insert',
+          'parts_to_delay_insert',
+          'max_parts_in_total',
+          'inactive_parts_to_throw_insert',
+          'inactive_parts_to_delay_insert'
+        )
+      `,
+      format: 'JSONEachRow',
+    });
+
+    const rows = await result.json<{ name: string; value: string }>();
+    const map: Record<string, number> = {};
+    for (const row of rows) {
+      map[row.name] = Number(row.value);
+    }
+
+    const limits: ServerMergeTreeLimits = {
+      partsToThrowInsert: map['parts_to_throw_insert'] ?? 300,
+      partsToDelayInsert: map['parts_to_delay_insert'] ?? 150,
+      maxPartsInTotal: map['max_parts_in_total'] ?? 100000,
+      inactivePartsToThrowInsert: map['inactive_parts_to_throw_insert'] ?? 0,
+      inactivePartsToDelayInsert: map['inactive_parts_to_delay_insert'] ?? 0,
+    };
+
+    logger.info({ limits }, 'Fetched ClickHouse merge_tree_settings');
+    return limits;
   }
 
   async sample(database: string, table: string): Promise<PressureState> {

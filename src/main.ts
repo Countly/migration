@@ -87,6 +87,11 @@ async function main(): Promise<void> {
     request_timeout: config.target.queryTimeoutMs,
   });
 
+  // Fetch actual ClickHouse MergeTree settings and override config defaults
+  const serverLimits = await ClickHousePressure.fetchServerLimits(pressureClient, logger);
+  config.backpressure.partsToThrowInsert = serverLimits.partsToThrowInsert;
+  config.backpressure.maxPartsInTotal = serverLimits.maxPartsInTotal;
+
   const chPressure = new ClickHousePressure(pressureClient, config.backpressure, logger);
 
   // Map config.memory to GcConfig shape
