@@ -29,6 +29,7 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             retryReads: env.MONGO_RETRY_READS,
             appName: env.MONGO_APP_NAME,
             batchRowsTarget: env.MONGO_BATCH_ROWS_TARGET,
+            mongoPageSize: env.MONGO_PAGE_SIZE,
             cursorBatchSize: env.MONGO_CURSOR_BATCH_SIZE,
             maxTimeMs: env.MONGO_MAX_TIME_MS,
         },

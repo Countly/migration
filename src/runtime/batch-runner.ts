@@ -26,6 +26,7 @@ export interface BatchRunnerConfig {
   targetTable: string;
   upperBoundId: string;
   batchRowsTarget: number;
+  mongoPageSize: number;
   backpressure: BackpressureConfig;
   useDedupToken: boolean;
   database: string;
@@ -233,19 +234,43 @@ export class BatchRunner {
           if (this.status !== "running") break;
         }
 
-        // (c) Read next Mongo page
-        const page = await this.deps.retryPolicy.execute(
-          () =>
-            this.deps.mongoReader.readPage(
-              this.lastCommittedId ? deserializeCursor(this.lastCommittedId) : null,
-              deserializeCursor(upperBoundId),
-            ),
-          `mongo-read-batch-${this.batchSeq}`,
-          this.logger,
-        );
+        // (c) Accumulate multiple MongoDB pages into one ClickHouse write batch
+        const { batchRowsTarget, mongoPageSize } = this.deps.config;
+        const accRows: OutputRow[] = [];
+        const accSkipSamples: Array<{ _id: string; reason: SkipReason }> = [];
+        let accDocsRead = 0;
+        let pageCursor: Cursor | null = this.lastCommittedId
+          ? deserializeCursor(this.lastCommittedId) : null;
+        const upperBoundCursor = deserializeCursor(upperBoundId);
+        let lastPageCursor: Cursor | null = null;
 
-        // (d) Empty page = run complete
-        if (page.docs.length === 0) {
+        while (accRows.length < batchRowsTarget) {
+          const page = await this.deps.retryPolicy.execute(
+            () => this.deps.mongoReader.readPage(pageCursor, upperBoundCursor, mongoPageSize),
+            `mongo-read-batch-${this.batchSeq + 1}-page`,
+            this.logger,
+          );
+
+          if (page.docs.length === 0) break;
+
+          accDocsRead += page.docs.length;
+          lastPageCursor = page.lastCursor;
+          pageCursor = page.lastCursor;
+
+          const { rows: pageRows, skippedSamples } = transformBatch(
+            page.docs,
+            this.skipCounter,
+            this.deps.config.collectionDefaults,
+          );
+          accRows.push(...pageRows);
+          accSkipSamples.push(...skippedSamples);
+
+          // Stop if MongoDB returned fewer docs than requested (last page)
+          if (page.docs.length < mongoPageSize) break;
+        }
+
+        // (d) Empty accumulation = run complete
+        if (accDocsRead === 0) {
           this.logger.info(
             {
               totalBatches: this.batchSeq,
@@ -278,18 +303,11 @@ export class BatchRunner {
           break;
         }
 
-        this.totalDocsRead += page.docs.length;
+        this.totalDocsRead += accDocsRead;
         this.batchSeq++;
 
-        // (e) Transform docs
-        const { rows, skippedSamples } = transformBatch(
-          page.docs,
-          this.skipCounter,
-          this.deps.config.collectionDefaults,
-        );
-
         // Record skip samples in manifest
-        for (const sample of skippedSamples) {
+        for (const sample of accSkipSamples) {
           await this.deps.manifestStore.insertSkipSample({
             run_id: runId,
             batch_seq: this.batchSeq,
@@ -300,17 +318,18 @@ export class BatchRunner {
         }
 
         const lowerExclusiveId = this.lastCommittedId ?? "";
-        const upperInclusiveId = serializeCursor(page.lastCursor!);
-        const docsSkipped = page.docs.length - rows.length;
+        const upperInclusiveId = serializeCursor(lastPageCursor!);
+        const docsSkipped = accDocsRead - accRows.length;
+        const rows = accRows;
 
         // (f) All docs skipped -> record skipped_empty batch, advance
         if (rows.length === 0) {
           this.logger.info(
-            { batchSeq: this.batchSeq, docsRead: page.docs.length, docsSkipped },
+            { batchSeq: this.batchSeq, docsRead: accDocsRead, docsSkipped },
             "All documents in batch were skipped",
           );
 
-          const batch = buildBatch(runId, this.batchSeq, lowerExclusiveId, upperInclusiveId, page.docs.length, docsSkipped, {
+          const batch = buildBatch(runId, this.batchSeq, lowerExclusiveId, upperInclusiveId, accDocsRead, docsSkipped, {
             status: "skipped_empty",
             finished_at: new Date().toISOString(),
           });
@@ -336,7 +355,7 @@ export class BatchRunner {
           ? `mig:${runId}:${this.batchSeq}`
           : "";
 
-        const batch = buildBatch(runId, this.batchSeq, lowerExclusiveId, upperInclusiveId, page.docs.length, docsSkipped, {
+        const batch = buildBatch(runId, this.batchSeq, lowerExclusiveId, upperInclusiveId, accDocsRead, docsSkipped, {
           rows_to_insert: rows.length,
           payload_digest: payloadDigest,
           insert_dedup_token: dedupToken,
@@ -728,10 +747,12 @@ export class BatchRunner {
       );
 
       try {
-        // Step 1: Re-read the exact source range
+        // Step 1: Re-read the exact source range (use full batchRowsTarget since
+        // a batch may span multiple pages worth of documents)
         const page = await this.deps.mongoReader.readPage(
           batch.lower_exclusive_cursor ? deserializeCursor(batch.lower_exclusive_cursor) : null,
           deserializeCursor(batch.upper_inclusive_cursor),
+          this.deps.config.batchRowsTarget,
         );
 
         // Step 2: Re-transform

@@ -48,6 +48,8 @@ export class ClickHouseWriter {
       clickhouse_settings: {
         date_time_input_format: 'best_effort',
         optimize_on_insert: 0,
+        async_insert: 1,
+        wait_for_async_insert: 0,
       },
       request_timeout: this.config.queryTimeoutMs,
     });

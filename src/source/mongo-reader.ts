@@ -145,10 +145,11 @@ export class MongoReader {
     return count;
   }
 
-  async readPage(lastCursor: Cursor | null, upperBound: Cursor): Promise<PageResult> {
+  async readPage(lastCursor: Cursor | null, upperBound: Cursor, limit?: number): Promise<PageResult> {
     this.ensureConnected();
 
-    const { batchRowsTarget, cursorBatchSize, maxTimeMs } = this.config;
+    const { cursorBatchSize, maxTimeMs } = this.config;
+    const pageLimit = limit ?? this.config.batchRowsTarget;
 
     const ucd = new Date(upperBound.cd);
     const upperFilter = {
@@ -178,7 +179,7 @@ export class MongoReader {
       .find(filter)
       .sort({ cd: 1, _id: 1 })
       .hint({ cd: 1, _id: 1 })
-      .limit(batchRowsTarget)
+      .limit(pageLimit)
       .batchSize(cursorBatchSize)
       .project(PROJECTION)
       .maxTimeMS(maxTimeMs)

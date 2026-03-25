@@ -318,6 +318,7 @@ export class CollectionOrchestrator {
                 targetTable,
                 upperBoundId,
                 batchRowsTarget: config.source.batchRowsTarget,
+                mongoPageSize: config.source.mongoPageSize,
                 backpressure: config.backpressure,
                 useDedupToken: config.target.useDedupToken,
                 database: config.target.db,
