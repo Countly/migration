@@ -253,11 +253,15 @@ function doTransform(doc: SourceDocument): TransformResult {
   const luMillis = toEpochMillis(doc.lu);
   if (luMillis !== null) {
     row['lu'] = formatTimestamp(luMillis);
+  } else {
+    delete row['lu'];
   }
 
   const cdMillis = toEpochMillis(doc.cd);
   if (cdMillis !== null) {
     row['cd'] = formatTimestamp(cdMillis);
+  } else {
+    delete row['cd'];
   }
 
   // ── Strip unknown fields ──────────────────────────────────────────────

@@ -70,7 +70,6 @@ async function main(): Promise<void> {
       table: config.target.table,
       username: config.target.username,
       password: config.target.password,
-      compression: config.target.compression,
       queryTimeoutMs: config.target.queryTimeoutMs,
       useDedupToken: config.target.useDedupToken,
     },

@@ -42,7 +42,6 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             table: env.CLICKHOUSE_TABLE,
             username: env.CLICKHOUSE_USERNAME,
             password: env.CLICKHOUSE_PASSWORD,
-            compression: env.CLICKHOUSE_COMPRESSION,
             queryTimeoutMs: env.CLICKHOUSE_QUERY_TIMEOUT_MS,
             maxRetries: env.CLICKHOUSE_MAX_RETRIES,
             retryBaseDelayMs: env.CLICKHOUSE_RETRY_BASE_DELAY_MS,

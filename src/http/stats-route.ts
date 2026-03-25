@@ -142,7 +142,7 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
       clickhouse: {
         connected: true,
         target: `${config.target.db}.${config.target.table}`,
-        compression: config.target.compression,
+        compression: 'gzip',
         partsToThrowInsert: config.backpressure.partsToThrowInsert,
         maxPartsInTotal: config.backpressure.maxPartsInTotal,
       },

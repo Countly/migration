@@ -71,7 +71,6 @@ export const configSchema = z.object({
         table: z.string().default("drill_events"),
         username: z.string().default("default"),
         password: z.string().default(""),
-        compression: z.string().default("lz4"),
         queryTimeoutMs: positiveIntFromEnv.default(120_000),
         maxRetries: intFromEnv.default(8),
         retryBaseDelayMs: positiveIntFromEnv.default(1_000),

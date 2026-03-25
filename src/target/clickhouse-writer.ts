@@ -8,7 +8,6 @@ export interface ClickHouseWriterConfig {
   table: string;
   username: string;
   password: string;
-  compression: string;
   queryTimeoutMs: number;
   useDedupToken: boolean;
 }
@@ -43,8 +42,12 @@ export class ClickHouseWriter {
       database: this.config.database,
       username: this.config.username,
       password: this.config.password,
+      compression: {
+        request: true,
+      },
       clickhouse_settings: {
         date_time_input_format: 'best_effort',
+        optimize_on_insert: 0,
       },
       request_timeout: this.config.queryTimeoutMs,
     });
