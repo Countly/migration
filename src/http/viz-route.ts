@@ -1,0 +1,598 @@
+import type { FastifyInstance } from 'fastify';
+
+export function registerVizRoute(app: FastifyInstance): void {
+  app.get('/viz', async (_request, reply) => {
+    return reply.type('text/html').send(DASHBOARD_HTML);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained HTML dashboard
+//
+// Security note: This dashboard renders only data from its own trusted API
+// endpoints (/stats, /readyz) which return structured JSON from the migration
+// service. All user-visible text is set via textContent (safe). The only
+// innerHTML usage is for rendering collection table rows and skip reason grids
+// from the service's own structured data (collection names, numeric values,
+// status enums) — these are not user-supplied and do not contain executable
+// content. The dashboard has no user input fields or URL-sourced data.
+// ---------------------------------------------------------------------------
+
+const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Migration Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0f1117; --bg2: #1a1d27; --bg3: #242736; --border: #2e3144;
+    --text: #e1e4ed; --text2: #8b8fa3; --text3: #5c6074;
+    --green: #22c55e; --yellow: #eab308; --red: #ef4444; --blue: #3b82f6;
+    --orange: #f97316; --purple: #a855f7; --cyan: #06b6d4;
+    --bar-bg: #1e2235; --bar-fill: #3b82f6;
+  }
+  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace; font-size: 13px; line-height: 1.5; padding: 16px; }
+  a { color: var(--blue); }
+
+  /* Layout */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+  .full { grid-column: 1 / -1; }
+
+  /* Card */
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .card h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text2); margin-bottom: 10px; }
+
+  /* Header */
+  .header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .header-left h1 { font-size: 16px; font-weight: 600; }
+  .header-right { display: flex; align-items: center; gap: 16px; font-size: 12px; color: var(--text2); }
+  .status-badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  .status-running { background: rgba(59,130,246,0.15); color: var(--blue); }
+  .status-paused { background: rgba(234,179,8,0.15); color: var(--yellow); }
+  .status-completed { background: rgba(34,197,94,0.15); color: var(--green); }
+  .status-failed { background: rgba(239,68,68,0.15); color: var(--red); }
+  .status-stopped { background: rgba(234,179,8,0.15); color: var(--yellow); }
+  .status-idle { background: rgba(92,96,116,0.15); color: var(--text3); }
+
+  /* Progress bars */
+  .progress-outer { background: var(--bar-bg); border-radius: 6px; height: 24px; overflow: hidden; position: relative; }
+  .progress-fill { height: 100%; border-radius: 6px; transition: width 0.8s ease; background: linear-gradient(90deg, var(--blue) 0%, var(--cyan) 100%); position: relative; }
+  .progress-fill.green { background: linear-gradient(90deg, var(--green) 0%, #16a34a 100%); }
+  .progress-text { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); font-size: 11px; font-weight: 600; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+  .progress-sm { height: 6px; border-radius: 3px; }
+  .progress-sm .progress-fill { border-radius: 3px; }
+
+  /* Stats row */
+  .stat-row { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .stat { text-align: center; flex: 1; min-width: 80px; }
+  .stat-val { font-size: 20px; font-weight: 700; color: var(--text); }
+  .stat-val.sm { font-size: 15px; }
+  .stat-label { font-size: 10px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+
+  /* Health dots */
+  .health-row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .health-item { display: flex; align-items: center; gap: 6px; }
+  .health-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .dot-green { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot-red { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .dot-gray { background: var(--text3); }
+
+  /* Controls */
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn { padding: 8px 16px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg3); color: var(--text); cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 500; transition: all 0.15s; }
+  .btn:hover:not(:disabled) { background: var(--border); }
+  .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .btn-pause { border-color: var(--yellow); color: var(--yellow); }
+  .btn-resume { border-color: var(--green); color: var(--green); }
+  .btn-stop { border-color: var(--red); color: var(--red); }
+  .btn-gc { border-color: var(--purple); color: var(--purple); }
+
+  /* Collection table */
+  .coll-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .coll-table th { text-align: left; padding: 6px 8px; color: var(--text2); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+  .coll-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  .coll-table tr:last-child td { border-bottom: none; }
+  .coll-scroll { max-height: 260px; overflow-y: auto; }
+  .coll-scroll::-webkit-scrollbar { width: 6px; }
+  .coll-scroll::-webkit-scrollbar-track { background: var(--bg2); }
+  .coll-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .tag { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
+  .tag-completed { background: rgba(34,197,94,0.15); color: var(--green); }
+  .tag-failed { background: rgba(239,68,68,0.15); color: var(--red); }
+  .tag-skipped { background: rgba(92,96,116,0.15); color: var(--text3); }
+  .tag-running { background: rgba(59,130,246,0.15); color: var(--blue); }
+
+  /* Skip reasons */
+  .skip-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; font-size: 12px; }
+
+  /* Heartbeat */
+  .heartbeat { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .heartbeat.error { background: var(--red); animation: none; }
+
+  /* Memory bar */
+  .mem-bar { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .mem-label { width: 40px; font-size: 11px; color: var(--text2); }
+  .mem-val { font-size: 11px; color: var(--text); min-width: 60px; text-align: right; }
+
+  /* Tabs */
+  .tab-bar { display: flex; gap: 2px; margin-bottom: 10px; }
+  .tab { padding: 4px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; color: var(--text2); }
+  .tab.active { background: var(--bg3); color: var(--text); }
+
+  .muted { color: var(--text3); }
+
+  /* Key-value grid */
+  .kv-grid { font-size: 12px; }
+  .kv-row { display: flex; justify-content: space-between; padding: 2px 0; border-bottom: 1px solid rgba(46,49,68,0.5); }
+  .kv-row:last-child { border-bottom: none; }
+  .kv-key { color: var(--text2); }
+  .kv-val { color: var(--text); font-weight: 500; text-align: right; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-left">
+    <h1 id="svc-name">Migration Dashboard</h1>
+    <span id="svc-status" class="status-badge status-idle">idle</span>
+  </div>
+  <div class="header-right">
+    <span id="svc-host" class="muted"></span>
+    <span id="svc-uptime"></span>
+    <span>v<span id="svc-version">-</span></span>
+    <div class="heartbeat" id="heartbeat"></div>
+  </div>
+</div>
+
+<!-- Overall Progress -->
+<div class="card full" style="margin-top:12px">
+  <h3>Overall Progress</h3>
+  <div class="progress-outer" style="height:32px;margin-bottom:10px">
+    <div class="progress-fill" id="overall-bar" style="width:0%">
+      <span class="progress-text" id="overall-pct">0%</span>
+    </div>
+  </div>
+  <div class="stat-row">
+    <div class="stat"><div class="stat-val" id="s-docs">-</div><div class="stat-label">Docs Progress</div></div>
+    <div class="stat"><div class="stat-val" id="s-throughput">-</div><div class="stat-label">Throughput</div></div>
+    <div class="stat"><div class="stat-val" id="s-elapsed">-</div><div class="stat-label">Elapsed</div></div>
+    <div class="stat"><div class="stat-val" id="s-eta">-</div><div class="stat-label">ETA</div></div>
+    <div class="stat"><div class="stat-val" id="s-colls">-</div><div class="stat-label">Collections</div></div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Current Collection -->
+  <div class="card">
+    <h3>Current Collection</h3>
+    <div id="cur-coll-name" style="font-size:12px;margin-bottom:8px;word-break:break-all">-</div>
+    <div class="progress-outer" style="margin-bottom:8px">
+      <div class="progress-fill" id="cur-bar" style="width:0%">
+        <span class="progress-text" id="cur-pct">0%</span>
+      </div>
+    </div>
+    <div class="stat-row">
+      <div class="stat"><div class="stat-val sm" id="c-read">0</div><div class="stat-label">Read</div></div>
+      <div class="stat"><div class="stat-val sm" id="c-inserted">0</div><div class="stat-label">Inserted</div></div>
+      <div class="stat"><div class="stat-val sm" id="c-batch">0</div><div class="stat-label">Batch</div></div>
+      <div class="stat"><div class="stat-val sm" id="c-skip">0%</div><div class="stat-label">Skip Rate</div></div>
+    </div>
+  </div>
+
+  <!-- Controls & Health -->
+  <div class="card">
+    <h3>Controls</h3>
+    <div class="controls" style="margin-bottom:14px">
+      <button class="btn btn-pause" id="btn-pause">Pause</button>
+      <button class="btn btn-resume" id="btn-resume">Resume</button>
+      <button class="btn btn-stop" id="btn-stop">Stop After Batch</button>
+      <button class="btn btn-gc" id="btn-gc">GC</button>
+    </div>
+    <div id="ctrl-msg" style="font-size:11px;margin-bottom:12px;min-height:16px"></div>
+    <h3>Health</h3>
+    <div class="health-row" id="health-row">
+      <div class="health-item"><div class="health-dot dot-gray" id="h-mongo"></div><span>MongoDB</span></div>
+      <div class="health-item"><div class="health-dot dot-gray" id="h-ch"></div><span>ClickHouse</span></div>
+      <div class="health-item"><div class="health-dot dot-gray" id="h-redis"></div><span>Redis</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Throughput & Integrity -->
+  <div class="card">
+    <h3>Throughput & Integrity</h3>
+    <div class="stat-row" style="margin-bottom:12px">
+      <div class="stat"><div class="stat-val sm" id="t-read">0</div><div class="stat-label">Docs Read</div></div>
+      <div class="stat"><div class="stat-val sm" id="t-inserted">0</div><div class="stat-label">Rows Inserted</div></div>
+      <div class="stat"><div class="stat-val sm" id="t-skipped">0</div><div class="stat-label">Skipped</div></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat"><div class="stat-val sm" id="t-digest" style="color:var(--text)">0</div><div class="stat-label">Digest Mismatch</div></div>
+      <div class="stat"><div class="stat-val sm" id="t-dups" style="color:var(--text)">0</div><div class="stat-label">Est. Duplicates</div></div>
+      <div class="stat"><div class="stat-val sm" id="t-bfail" style="color:var(--text)">0</div><div class="stat-label">Batches Failed</div></div>
+    </div>
+  </div>
+
+  <!-- Skip Reasons & System -->
+  <div class="card">
+    <h3>Skip Reasons</h3>
+    <div id="skip-grid" class="skip-grid"></div>
+    <h3 style="margin-top:12px">System</h3>
+    <div class="mem-bar">
+      <span class="mem-label">RSS</span>
+      <div class="progress-outer progress-sm" style="flex:1"><div class="progress-fill" id="mem-rss" style="width:0%;background:var(--orange)"></div></div>
+      <span class="mem-val" id="mem-rss-val">-</span>
+    </div>
+    <div class="mem-bar">
+      <span class="mem-label">Heap</span>
+      <div class="progress-outer progress-sm" style="flex:1"><div class="progress-fill" id="mem-heap" style="width:0%;background:var(--purple)"></div></div>
+      <span class="mem-val" id="mem-heap-val">-</span>
+    </div>
+    <div id="gc-line" style="font-size:11px;color:var(--text2);margin-top:6px"></div>
+    <div id="gc-detail" style="font-size:11px;color:var(--text2);margin-top:2px"></div>
+  </div>
+</div>
+
+<!-- Infrastructure -->
+<div class="grid" style="margin-top:12px">
+  <div class="card">
+    <h3>Run Details</h3>
+    <div class="kv-grid" id="run-details"></div>
+  </div>
+  <div class="card">
+    <h3>Infrastructure</h3>
+    <div class="kv-grid" id="infra-details"></div>
+  </div>
+</div>
+
+<!-- Collections Table -->
+<div class="card full" style="margin-top:12px">
+  <h3>Collections <span id="coll-summary" style="font-weight:400;color:var(--text2)"></span></h3>
+  <div class="tab-bar" id="tab-bar">
+    <div class="tab active" data-tab="active">Active & Done</div>
+    <div class="tab" data-tab="failed">Failed</div>
+    <div class="tab" data-tab="skipped">Skipped</div>
+    <div class="tab" data-tab="all">All</div>
+  </div>
+  <div class="coll-scroll">
+    <table class="coll-table">
+      <thead><tr><th>Collection</th><th>Status</th><th>Estimated</th><th>Read</th><th>Inserted</th></tr></thead>
+      <tbody id="coll-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  var currentTab = 'active';
+  var lastData = null;
+
+  function $(id) { return document.getElementById(id); }
+  function fmt(n) { return n == null ? '-' : Number(n).toLocaleString('en-US'); }
+  function mb(b) { return b ? (b / 1024 / 1024).toFixed(0) + ' MB' : '-'; }
+  function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.textContent; }
+
+  // Tab switching
+  $('tab-bar').addEventListener('click', function(e) {
+    var tab = e.target.closest('.tab');
+    if (!tab) return;
+    var tabs = document.querySelectorAll('.tab');
+    for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove('active');
+    tab.classList.add('active');
+    currentTab = tab.getAttribute('data-tab');
+    if (lastData) renderCollections(lastData);
+  });
+
+  // Control buttons
+  $('btn-pause').addEventListener('click', function() { doControl('pause'); });
+  $('btn-resume').addEventListener('click', function() { doControl('resume'); });
+  $('btn-stop').addEventListener('click', function() { doControl('stop-after-batch'); });
+  $('btn-gc').addEventListener('click', function() { doControl('gc'); });
+
+  function statusClass(s) {
+    if (s === 'running' || s === 'stopping') return 'status-running';
+    if (s === 'paused') return 'status-paused';
+    if (s === 'completed') return 'status-completed';
+    if (s === 'failed') return 'status-failed';
+    if (s === 'stopped') return 'status-stopped';
+    return 'status-idle';
+  }
+
+  function tagFor(status) {
+    var cls = 'tag-' + (status === 'completed' ? 'completed' : status === 'failed' ? 'failed' : status === 'skipped' ? 'skipped' : 'running');
+    return cls;
+  }
+
+  function truncHash(name) {
+    if (name && name.length > 50) return name.slice(0, 20) + '...' + name.slice(-8);
+    return name || '-';
+  }
+
+  function renderCollections(d) {
+    var cp = (d.orchestrator && d.orchestrator.collectionProgress) || [];
+    var cur = d.orchestrator && d.orchestrator.currentCollection;
+    var filtered;
+
+    if (currentTab === 'active') {
+      filtered = cp.filter(function(c) { return c.status === 'completed' || c.collection === cur; });
+    } else if (currentTab === 'failed') {
+      filtered = cp.filter(function(c) { return c.status === 'failed'; });
+    } else if (currentTab === 'skipped') {
+      filtered = cp.filter(function(c) { return c.status === 'skipped'; });
+    } else {
+      filtered = cp;
+    }
+
+    if (filtered.length > 200) filtered = filtered.slice(0, 200);
+
+    var tbody = $('coll-body');
+    // Clear existing rows
+    while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+
+    if (filtered.length === 0) {
+      var emptyRow = document.createElement('tr');
+      var emptyCell = document.createElement('td');
+      emptyCell.setAttribute('colspan', '5');
+      emptyCell.className = 'muted';
+      emptyCell.style.textAlign = 'center';
+      emptyCell.style.padding = '20px';
+      emptyCell.textContent = 'No entries';
+      emptyRow.appendChild(emptyCell);
+      tbody.appendChild(emptyRow);
+      return;
+    }
+
+    for (var i = 0; i < filtered.length; i++) {
+      var c = filtered[i];
+      var isCurrent = c.collection === cur;
+      var tr = document.createElement('tr');
+
+      // Collection name
+      var td1 = document.createElement('td');
+      td1.style.maxWidth = '200px';
+      td1.style.overflow = 'hidden';
+      td1.style.textOverflow = 'ellipsis';
+      td1.style.whiteSpace = 'nowrap';
+      td1.style.fontSize = '11px';
+      td1.setAttribute('title', c.collection || '');
+      td1.textContent = truncHash(c.collection);
+      tr.appendChild(td1);
+
+      // Status tag
+      var td2 = document.createElement('td');
+      var span = document.createElement('span');
+      span.className = 'tag ' + (isCurrent ? 'tag-running' : tagFor(c.status));
+      span.textContent = isCurrent ? 'running' : c.status;
+      td2.appendChild(span);
+      tr.appendChild(td2);
+
+      // Estimated
+      var td3 = document.createElement('td');
+      td3.textContent = fmt(c.estimated);
+      tr.appendChild(td3);
+
+      // Read
+      var td4 = document.createElement('td');
+      td4.textContent = isCurrent ? fmt(d.currentCollectionProgress && d.currentCollectionProgress.docsRead) : fmt(c.docsRead);
+      tr.appendChild(td4);
+
+      // Inserted
+      var td5 = document.createElement('td');
+      td5.textContent = isCurrent ? fmt(d.currentCollectionProgress && d.currentCollectionProgress.rowsInserted) : fmt(c.rowsInserted);
+      tr.appendChild(td5);
+
+      tbody.appendChild(tr);
+    }
+  }
+
+  function renderSkipReasons(sr) {
+    var container = $('skip-grid');
+    while (container.firstChild) container.removeChild(container.firstChild);
+
+    var keys = Object.keys(sr || {});
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      var v = sr[k];
+      var row = document.createElement('div');
+      row.style.display = 'flex';
+      row.style.justifyContent = 'space-between';
+
+      var keySpan = document.createElement('span');
+      keySpan.style.color = 'var(--text2)';
+      keySpan.textContent = k.replace(/_/g, ' ');
+      row.appendChild(keySpan);
+
+      var valSpan = document.createElement('span');
+      valSpan.style.fontWeight = '600';
+      valSpan.style.color = v > 0 ? 'var(--yellow)' : 'var(--text3)';
+      valSpan.textContent = fmt(v);
+      row.appendChild(valSpan);
+
+      container.appendChild(row);
+    }
+  }
+
+  function renderKV(containerId, entries) {
+    var container = $(containerId);
+    while (container.firstChild) container.removeChild(container.firstChild);
+    for (var i = 0; i < entries.length; i++) {
+      var row = document.createElement('div');
+      row.className = 'kv-row';
+      var keyEl = document.createElement('span');
+      keyEl.className = 'kv-key';
+      keyEl.textContent = entries[i][0];
+      row.appendChild(keyEl);
+      var valEl = document.createElement('span');
+      valEl.className = 'kv-val';
+      valEl.textContent = entries[i][1];
+      if (entries[i][2]) valEl.style.color = entries[i][2];
+      row.appendChild(valEl);
+      container.appendChild(row);
+    }
+  }
+
+  function doControl(action) {
+    var msg = $('ctrl-msg');
+    fetch('/control/' + action, { method: 'POST' })
+      .then(function(res) { return res.json(); })
+      .then(function(data) {
+        msg.textContent = 'OK: ' + action + ' (status: ' + (data.status || data.mode || 'done') + ')';
+        msg.style.color = 'var(--green)';
+      })
+      .catch(function(e) {
+        msg.textContent = 'Error: ' + e.message;
+        msg.style.color = 'var(--red)';
+      });
+    setTimeout(function() { msg.textContent = ''; }, 4000);
+  }
+
+  function refresh() {
+    Promise.all([
+      fetch('/stats').then(function(r) { return r.json(); }),
+      fetch('/readyz').then(function(r) { return r.json(); })
+    ]).then(function(results) {
+      var d = results[0];
+      var h = results[1];
+      lastData = d;
+      $('heartbeat').className = 'heartbeat';
+
+      // Header
+      $('svc-name').textContent = (d.service && d.service.name || 'Migration') + ' Dashboard';
+      var st = (d.service && d.service.status) || 'idle';
+      $('svc-status').textContent = st;
+      $('svc-status').className = 'status-badge ' + statusClass(st);
+      $('svc-host').textContent = (d.service && d.service.hostname) || '';
+      $('svc-uptime').textContent = (d.summary && d.summary.elapsed) || '-';
+      $('svc-version').textContent = (d.service && d.service.version) || '-';
+
+      // Overall progress
+      var op = (d.summary && d.summary.overallPct) || 0;
+      $('overall-bar').style.width = op + '%';
+      $('overall-pct').textContent = op + '%';
+      if (op >= 100) $('overall-bar').classList.add('green');
+      else $('overall-bar').classList.remove('green');
+      $('s-docs').textContent = (d.summary && d.summary.docsProgress) || '-';
+      $('s-throughput').textContent = (d.summary && d.summary.throughput) || '-';
+      $('s-elapsed').textContent = (d.summary && d.summary.elapsed) || '-';
+      $('s-eta').textContent = (d.summary && d.summary.eta) || '-';
+      $('s-colls').textContent = (d.summary && d.summary.collections) || '-';
+
+      // Current collection
+      var cc = d.currentCollectionProgress;
+      if (cc) {
+        $('cur-coll-name').textContent = cc.collection || '-';
+        $('cur-bar').style.width = cc.pct + '%';
+        $('cur-pct').textContent = cc.pct + '%';
+        if (cc.pct >= 100) $('cur-bar').classList.add('green');
+        else $('cur-bar').classList.remove('green');
+        $('c-read').textContent = fmt(cc.docsRead);
+        $('c-inserted').textContent = fmt(cc.rowsInserted);
+        $('c-batch').textContent = cc.batchSeq || 0;
+        $('c-skip').textContent = cc.skipRate || '0%';
+      } else {
+        $('cur-coll-name').textContent = 'idle';
+        $('cur-bar').style.width = '0%';
+        $('cur-pct').textContent = '-';
+      }
+
+      // Controls state
+      var cmds = d.commands || {};
+      $('btn-pause').disabled = st !== 'running';
+      $('btn-resume').disabled = st !== 'paused';
+      $('btn-stop').disabled = st === 'completed' || st === 'idle' || st === 'stopped' || cmds.stopAfterBatchRequested;
+      $('btn-stop').textContent = cmds.stopAfterBatchRequested ? 'Stopping...' : 'Stop After Batch';
+
+      // Health
+      var checks = (h && h.checks) || {};
+      $('h-mongo').className = 'health-dot ' + (checks.mongo ? 'dot-green' : 'dot-red');
+      $('h-ch').className = 'health-dot ' + (checks.clickhouse ? 'dot-green' : 'dot-red');
+      $('h-redis').className = 'health-dot ' + (checks.redis ? 'dot-green' : 'dot-red');
+
+      // Throughput
+      var tp = d.throughput || {};
+      $('t-read').textContent = fmt(tp.sourceDocsReadTotal);
+      $('t-inserted').textContent = fmt(tp.rowsInsertedTotal);
+      $('t-skipped').textContent = fmt(tp.docsSkippedTotal);
+      var integ = d.integrity || {};
+      $('t-digest').textContent = fmt(integ.digestMismatches);
+      $('t-dups').textContent = fmt(integ.estimatedDuplicateRows);
+      $('t-bfail').textContent = fmt(integ.batchesFailed);
+      $('t-digest').style.color = integ.digestMismatches > 0 ? 'var(--yellow)' : 'var(--text)';
+      $('t-bfail').style.color = integ.batchesFailed > 0 ? 'var(--red)' : 'var(--text)';
+
+      // Skip reasons
+      renderSkipReasons(d.skipReasons);
+
+      // System
+      var proc = d.process || {};
+      var rssBytes = proc.rssBytes || 0;
+      var heapBytes = proc.heapUsedBytes || 0;
+      var heapTotal = proc.heapTotalBytes || 1;
+      var maxRss = 2048 * 1024 * 1024;
+      $('mem-rss').style.width = Math.min(100, (rssBytes / maxRss) * 100) + '%';
+      $('mem-rss-val').textContent = mb(rssBytes);
+      $('mem-heap').style.width = Math.min(100, (heapBytes / heapTotal) * 100) + '%';
+      $('mem-heap-val').textContent = mb(heapBytes) + ' / ' + mb(heapTotal);
+      var gc = d.gc || {};
+      $('gc-line').textContent = 'GC: ' + (gc.gcCountTotal || 0) + ' runs, last ' + (gc.lastGcDurationMs || 0).toFixed(1) + 'ms | CPU: ' + (proc.cpuUserSec || 0).toFixed(0) + 's user';
+      $('gc-detail').textContent = 'State: ' + (gc.gcState || 'n/a') + ' | Available: ' + (gc.gcAvailable ? 'yes' : 'no') + ' | Observed: ' + (gc.observedGcCount || 0) + ' | EL lag p95: ' + (proc.eventLoopLagMs_p95_1m || 0).toFixed(1) + 'ms';
+
+      // Run details
+      var run = d.run || {};
+      renderKV('run-details', [
+        ['Source', run.sourceNs || 'n/a'],
+        ['Target', run.targetTable || 'n/a'],
+        ['Run ID', (d.service && d.service.runId) || 'n/a'],
+        ['Transform', run.transformVersion || 'n/a'],
+        ['Batch Committed', String(run.batchSeqCommitted || 0)],
+        ['PID', String((d.service && d.service.pid) || '-')],
+        ['Manifest DB', (d.manifest && d.manifest.db) || 'n/a'],
+        ['Last Checkpoint', (d.manifest && d.manifest.lastCheckpointTime) || 'n/a'],
+      ]);
+
+      // Infrastructure
+      var mongo = d.mongo || {};
+      var ch = d.clickhouse || {};
+      var redis = d.redis || {};
+      renderKV('infra-details', [
+        ['MongoDB', mongo.connected ? 'Connected' : 'Disconnected', mongo.connected ? 'var(--green)' : 'var(--red)'],
+        ['Read Pref / Concern', (mongo.readPreference || '-') + ' / ' + (mongo.readConcern || '-')],
+        ['Batch Target', fmt(mongo.batchRowsTarget) + ' rows'],
+        ['ClickHouse', ch.connected ? 'Connected' : 'Disconnected', ch.connected ? 'var(--green)' : 'var(--red)'],
+        ['CH Target', ch.target || '-'],
+        ['CH Parts Limit', (ch.partsToThrowInsert || '-') + ' / ' + (ch.maxPartsInTotal || '-')],
+        ['Redis', redis.connected ? 'Connected' : 'Disconnected', redis.connected ? 'var(--green)' : 'var(--red)'],
+        ['Redis Write Latency', (redis.lastStateWriteMs || 0) + 'ms'],
+        ['Bitmap Bits Set', String(redis.bitmapBitsSet || 0)],
+        ['Redis Error', redis.lastError || 'none', redis.lastError ? 'var(--red)' : 'var(--text3)'],
+      ]);
+
+      // Collections
+      var orch = d.orchestrator || {};
+      $('coll-summary').textContent = '(' + (orch.totalCollections || 0) + ' total: '
+        + (orch.completedCollections || 0) + ' done, '
+        + (orch.failedCollections || 0) + ' failed, '
+        + (orch.skippedCollections || 0) + ' skipped)';
+      renderCollections(d);
+
+    }).catch(function(e) {
+      $('heartbeat').className = 'heartbeat error';
+      console.error('Refresh error:', e);
+    });
+  }
+
+  // Initial load + auto-refresh
+  refresh();
+  setInterval(refresh, 2000);
+})();
+</script>
+</body>
+</html>`;

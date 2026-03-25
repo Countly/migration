@@ -16,6 +16,7 @@ import { registerHealthRoutes } from './http/health-route.ts';
 import { registerStatsRoute } from './http/stats-route.ts';
 import { registerControlRoutes } from './http/control-route.ts';
 import { registerRunRoutes } from './http/run-route.ts';
+import { registerVizRoute } from './http/viz-route.ts';
 import Fastify from 'fastify';
 import { createClient as createClickHouseClient } from '@clickhouse/client';
 
@@ -177,6 +178,8 @@ async function main(): Promise<void> {
     redisState,
     orchestrator,
   });
+
+  registerVizRoute(app);
 
   // ── 7. Start HTTP server ────────────────────────────────────────────
   await app.listen({ port: config.service.port, host: config.service.host });
