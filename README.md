@@ -72,7 +72,6 @@ Copy `.env.example` and adjust. All values below show defaults where applicable.
 | `CLICKHOUSE_TABLE` | `drill_events` | Target table |
 | `CLICKHOUSE_USERNAME` | `default` | Username |
 | `CLICKHOUSE_PASSWORD` | *(empty)* | Password |
-| `CLICKHOUSE_COMPRESSION` | `lz4` | Compression codec |
 | `CLICKHOUSE_QUERY_TIMEOUT_MS` | `120000` | Query timeout (ms) |
 | `CLICKHOUSE_MAX_RETRIES` | `8` | Max insert retry attempts |
 | `CLICKHOUSE_RETRY_BASE_DELAY_MS` | `1000` | Backoff base delay (ms) |
@@ -230,3 +229,54 @@ ClickHouse              MongoDB manifest (authoritative)
 - **Redis**: Hot state — bitmap tracking, timeline snapshots, recent errors, command flags
 - **Backpressure**: Monitors ClickHouse active parts count; pauses inserts when thresholds exceeded
 - **Dedup tokens**: Each batch insert carries `mig:{runId}:{batchSeq}` for idempotent retries
+
+## CI/CD
+
+A GitHub Actions workflow automatically builds and pushes the Docker image to Docker Hub when a GitHub Release is published.
+
+### Tag Behavior
+
+| Release Tag | Docker Tags | `latest`? |
+|-------------|-------------|-----------|
+| `v1.0.0` | `1.0.0`, `1.0`, `1`, `latest` | Yes |
+| `v2.3.1` | `2.3.1`, `2.3`, `2`, `latest` | Yes |
+| `v1.0.0-rc.1` | `1.0.0-rc.1` | No |
+| `v2.0.0-beta` | `2.0.0-beta` | No |
+
+Pre-release versions (anything with a hyphen after the version) are **not** tagged as `latest`.
+
+### Setting Up Docker Hub Credentials
+
+1. **Create a Docker Hub access token:**
+   - Go to [Docker Hub](https://hub.docker.com) → Account Settings → Security → New Access Token
+   - Name: `github-actions` (or similar)
+   - Permissions: **Read & Write**
+   - Copy the token (you won't see it again)
+
+2. **Add secrets to GitHub:**
+   - Go to your GitHub repo → Settings → Secrets and variables → Actions → New repository secret
+   - Add **`DOCKERHUB_USERNAME`** — your Docker Hub username
+   - Add **`DOCKERHUB_TOKEN`** — the access token from step 1 (not your password)
+
+3. **Verify:**
+   - Create a release (e.g. tag `v1.0.0`) in GitHub
+   - Check the Actions tab — the workflow should build and push the image
+   - Run `docker pull <your-username>/countly-migration:1.0.0`
+
+### Pulling the Image
+
+```bash
+docker pull <your-username>/countly-migration:latest
+docker pull <your-username>/countly-migration:1.0.0
+```
+
+### Using a Pre-Built Image in Production
+
+Replace `build: .` in `docker-compose.yml` with the published image:
+
+```yaml
+services:
+  migration:
+    image: <your-username>/countly-migration:1.0.0
+    # ... rest of config unchanged
+```
