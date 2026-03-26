@@ -195,6 +195,7 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
         collectionProgress: progress.results.map(r => ({
           collection: r.collection,
           status: r.status,
+          runId: r.runId || null,
           estimated: estimatedCounts.get(r.collection) ?? null,
           docsRead: r.docsRead ?? null,
           rowsInserted: r.rowsInserted ?? null,

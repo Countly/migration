@@ -279,7 +279,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   </div>
   <div class="coll-scroll">
     <table class="coll-table">
-      <thead><tr><th>Collection</th><th>Status</th><th>Estimated</th><th>Read</th><th>Inserted</th></tr></thead>
+      <thead><tr><th>Collection</th><th>Status</th><th>Estimated</th><th>Read</th><th>Inserted</th><th>Action</th></tr></thead>
       <tbody id="coll-body"></tbody>
     </table>
   </div>
@@ -366,7 +366,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     if (filtered.length === 0) {
       var emptyRow = document.createElement('tr');
       var emptyCell = document.createElement('td');
-      emptyCell.setAttribute('colspan', '5');
+      emptyCell.setAttribute('colspan', '6');
       emptyCell.className = 'muted';
       emptyCell.style.textAlign = 'center';
       emptyCell.style.padding = '20px';
@@ -414,6 +414,35 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       var td5 = document.createElement('td');
       td5.textContent = isCurrent ? fmt(d.currentCollectionProgress && d.currentCollectionProgress.rowsInserted) : fmt(c.rowsInserted);
       tr.appendChild(td5);
+
+      // Action
+      var td6 = document.createElement('td');
+      td6.style.cssText = 'display:flex;gap:4px';
+      if (!isCurrent && (c.status === 'failed' || c.status === 'skipped')) {
+        var retryBtn = document.createElement('button');
+        retryBtn.className = 'btn';
+        retryBtn.style.cssText = 'padding:2px 8px;font-size:10px;border-color:var(--blue);color:var(--blue)';
+        retryBtn.textContent = 'Retry';
+        retryBtn.setAttribute('data-collection', c.collection);
+        retryBtn.addEventListener('click', function() {
+          var coll = this.getAttribute('data-collection');
+          fetch('/control/retry-collection/' + encodeURIComponent(coll), { method: 'POST' });
+        });
+        td6.appendChild(retryBtn);
+      }
+      if (!isCurrent && c.runId && (c.status === 'completed' || c.status === 'failed')) {
+        var retrySkipBtn = document.createElement('button');
+        retrySkipBtn.className = 'btn';
+        retrySkipBtn.style.cssText = 'padding:2px 8px;font-size:10px;border-color:var(--yellow);color:var(--yellow)';
+        retrySkipBtn.textContent = 'Retry Skipped';
+        retrySkipBtn.setAttribute('data-runid', c.runId);
+        retrySkipBtn.addEventListener('click', function() {
+          var rid = this.getAttribute('data-runid');
+          fetch('/control/retry-skipped-batches/' + encodeURIComponent(rid), { method: 'POST' });
+        });
+        td6.appendChild(retrySkipBtn);
+      }
+      tr.appendChild(td6);
 
       tbody.appendChild(tr);
     }
@@ -602,34 +631,62 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       ]);
 
       // Index status
-      var idx = d.indexStatus || { ready: 0, building: 0, failed: 0, details: [] };
-      $('idx-summary').textContent = '(' + idx.ready + ' ready, ' + idx.building + ' building' + (idx.failed > 0 ? ', ' + idx.failed + ' failed' : '') + ')';
+      var idx = d.indexStatus || { ready: 0, building: 0, checking: 0, failed: 0, details: [] };
+      var idxParts = [idx.ready + ' ready'];
+      if (idx.checking > 0) idxParts.push(idx.checking + ' checking');
+      if (idx.building > 0) idxParts.push(idx.building + ' building');
+      if (idx.failed > 0) idxParts.push(idx.failed + ' failed');
+      $('idx-summary').textContent = '(' + idxParts.join(', ') + ')';
       var idxContainer = $('idx-details');
       while (idxContainer.firstChild) idxContainer.removeChild(idxContainer.firstChild);
-      if (idx.building === 0 && idx.failed === 0) {
+      if (idx.checking === 0 && idx.building === 0 && idx.failed === 0) {
         var allReady = document.createElement('span');
         allReady.style.color = 'var(--green)';
         allReady.textContent = 'All indexes ready';
         idxContainer.appendChild(allReady);
       } else {
+        if (idx.checking > 0) {
+          var checkMsg = document.createElement('div');
+          checkMsg.style.cssText = 'color:var(--cyan);font-size:11px;margin-bottom:4px';
+          checkMsg.textContent = 'Checking for indexed collections... (' + idx.checking + ' remaining)';
+          idxContainer.appendChild(checkMsg);
+        }
         for (var ii = 0; ii < idx.details.length; ii++) {
           var det = idx.details[ii];
           var detRow = document.createElement('div');
-          detRow.style.cssText = 'display:flex;justify-content:space-between;padding:2px 0';
+          detRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:2px 0';
           var detName = document.createElement('span');
-          detName.style.cssText = 'max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px';
+          detName.style.cssText = 'max-width:50%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px';
           detName.textContent = det.collection.length > 50 ? det.collection.slice(0, 20) + '...' + det.collection.slice(-8) : det.collection;
           detRow.appendChild(detName);
+          var detRight = document.createElement('span');
+          detRight.style.cssText = 'display:flex;align-items:center;gap:8px';
           var detStatus = document.createElement('span');
           detStatus.style.fontWeight = '600';
           if (det.status === 'building') {
             detStatus.style.color = 'var(--orange)';
             detStatus.textContent = 'building' + (det.elapsedSec ? ' (' + Math.round(det.elapsedSec / 60) + 'm)' : '');
+          } else if (det.status === 'checking') {
+            detStatus.style.color = 'var(--cyan)';
+            detStatus.textContent = 'checking';
           } else {
             detStatus.style.color = 'var(--red)';
             detStatus.textContent = 'failed';
           }
-          detRow.appendChild(detStatus);
+          detRight.appendChild(detStatus);
+          if (det.status === 'failed') {
+            var reindexBtn = document.createElement('button');
+            reindexBtn.className = 'btn';
+            reindexBtn.style.cssText = 'padding:2px 8px;font-size:10px;border-color:var(--orange);color:var(--orange)';
+            reindexBtn.textContent = 'Reindex';
+            reindexBtn.setAttribute('data-collection', det.collection);
+            reindexBtn.addEventListener('click', function() {
+              var coll = this.getAttribute('data-collection');
+              fetch('/control/reindex/' + encodeURIComponent(coll), { method: 'POST' });
+            });
+            detRight.appendChild(reindexBtn);
+          }
+          detRow.appendChild(detRight);
           idxContainer.appendChild(detRow);
         }
       }

@@ -18,4 +18,4 @@ ENV NODE_ENV=production
 EXPOSE 8080
 
 ENTRYPOINT ["tini", "--"]
-CMD ["node", "--experimental-strip-types", "--expose-gc", "--max-old-space-size=2048", "src/main.ts"]
+CMD ["node", "--experimental-strip-types", "--expose-gc", "--max-old-space-size=4096", "--max-semi-space-size=256", "src/main.ts"]

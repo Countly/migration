@@ -349,7 +349,7 @@ export class BatchRunner {
           continue;
         }
 
-        // (g) Build batch manifest
+        // (g) Build batch record (not persisted yet — only written on success or failure)
         const payloadDigest = computePayloadDigest(rows);
         const queryId = `mig__${runId}__${this.batchSeq}`;
         const dedupToken = this.deps.config.useDedupToken
@@ -363,17 +363,7 @@ export class BatchRunner {
           query_id: queryId,
         });
 
-        // (h) Persist manifest as 'prepared'
-        await this.deps.manifestStore.insertBatch(batch);
-
-        // (i) Mark 'inflight'
-        await this.deps.manifestStore.updateBatchStatus(
-          runId,
-          this.batchSeq,
-          "inflight",
-        );
-
-        // (j) Insert into ClickHouse
+        // (h) Insert into ClickHouse (no pre-write to manifest — single write on success)
         try {
           const currentBatchSeq = this.batchSeq;
           const result = await this.deps.retryPolicy.execute(
@@ -388,14 +378,7 @@ export class BatchRunner {
             async (attempt, err) => {
               const now = new Date().toISOString();
 
-              // Tier 1: Compact error on batch document
-              await this.deps.manifestStore.pushBatchError(runId, currentBatchSeq, {
-                attempt,
-                error: err.message.slice(0, 200),
-                timestamp: now,
-              }).catch(() => {});
-
-              // Tier 2: Audit event
+              // Audit event for retry
               await this.deps.manifestStore.insertEvent({
                 run_id: runId,
                 event_type: "batch_retry_error",
@@ -404,7 +387,7 @@ export class BatchRunner {
                 created_at: now,
               }).catch(() => {});
 
-              // Tier 3: Verbose error to Redis
+              // Verbose error to Redis
               await this.bestEffortRedis(
                 () => this.deps.redisState.pushVerboseError(runId, currentBatchSeq, {
                   attempt,
@@ -418,8 +401,8 @@ export class BatchRunner {
             },
           );
 
-          // (k) On success: atomically mark batch done + advance cursor
-          await this.deps.manifestStore.completeBatch(runId, this.batchSeq, upperInclusiveId);
+          // (i) On success: insert completed batch + advance cursor (single MongoDB write)
+          await this.deps.manifestStore.insertCompletedBatch(batch, upperInclusiveId);
           this.lastCommittedId = upperInclusiveId;
           this.totalRowsInserted += result.rowsInserted;
 
@@ -479,9 +462,12 @@ export class BatchRunner {
             "Batch completed",
           );
         } catch (err) {
-          // Insert failed after all retries
+          // Insert failed after all retries — write batch record as failed
           const error = toError(err);
-          await this.deps.manifestStore.updateBatchStatus(runId, this.batchSeq, "failed", error.message);
+          batch.status = "failed" as any;
+          batch.last_error = error.message;
+          batch.finished_at = new Date().toISOString();
+          await this.deps.manifestStore.insertBatch(batch);
 
           await this.bestEffortRedis(
             () => this.deps.redisState.pushError(runId, {

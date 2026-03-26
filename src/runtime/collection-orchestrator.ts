@@ -21,6 +21,7 @@ export type IndexBuildStatus = "checking" | "building" | "ready" | "failed";
 export interface IndexStatusSummary {
     ready: number;
     building: number;
+    checking: number;
     failed: number;
     details: Array<{ collection: string; status: IndexBuildStatus; elapsedSec?: number }>;
 }
@@ -106,8 +107,8 @@ export class CollectionOrchestrator {
             "Starting migration with index-aware scheduling",
         );
 
-        // 2. Kick off index checks and background builds for ALL collections
-        await this.initializeIndexes();
+        // 2. Start all index checks in background (non-blocking)
+        this.startBackgroundIndexInit();
 
         this.orchestratorStatus = "running";
 
@@ -152,36 +153,17 @@ export class CollectionOrchestrator {
                 continue;
             }
 
-            // No ready collection — are some still building?
-            const buildingCount = this.getCollectionsWithStatus("building").length;
-            const allProcessed = completed.size + buildingCount >= this.discoveredCollections.length
-                || this.allCollectionsResolved(completed);
+            // No ready collection — are some still checking or building?
+            const counts = this.getIndexStatusCounts();
+            const pendingIndexWork = counts.checking + counts.building;
 
-            if (buildingCount > 0 && !allProcessed) {
+            if (pendingIndexWork > 0) {
                 this.orchestratorStatus = "waiting_for_index";
-                const building = this.getCollectionsWithStatus("building");
                 this.logger.info(
-                    { buildingCount: building.length, first5: building.slice(0, 5).map(n => n.slice(0, 30)) },
+                    { checking: counts.checking, building: counts.building, ready: counts.ready },
                     "Waiting for index creation — rechecking in 60s",
                 );
-
-                // Interruptible 60s sleep
-                await this.interruptibleSleep(60_000);
-
-                // Recheck building indexes
-                await this.recheckBuildingIndexes();
-                continue;
-            }
-
-            // If there are building indexes but all other collections are done, wait for them
-            if (buildingCount > 0) {
-                this.orchestratorStatus = "waiting_for_index";
-                const building = this.getCollectionsWithStatus("building");
-                this.logger.info(
-                    { buildingCount: building.length },
-                    "All other collections done — waiting for remaining index builds (60s)",
-                );
-                await this.interruptibleSleep(60_000);
+                await this.interruptibleSleep(10_000);
                 await this.recheckBuildingIndexes();
                 continue;
             }
@@ -284,7 +266,7 @@ export class CollectionOrchestrator {
     }
 
     getIndexStatus(): IndexStatusSummary {
-        let ready = 0, building = 0, failed = 0;
+        let ready = 0, building = 0, failed = 0, checking = 0;
         const details: Array<{ collection: string; status: IndexBuildStatus; elapsedSec?: number }> = [];
 
         for (const [name, status] of this.indexStatus) {
@@ -297,62 +279,111 @@ export class CollectionOrchestrator {
             } else if (status === "failed") {
                 failed++;
                 details.push({ collection: name, status });
+            } else if (status === "checking") {
+                checking++;
+                details.push({ collection: name, status });
             }
         }
 
-        return { ready, building, failed, details };
+        return { ready, building, checking, failed, details };
+    }
+
+    triggerReindex(collectionName: string): void {
+        this.indexStatus.set(collectionName, "building");
+        this.indexBuildStarted.set(collectionName, Date.now());
+        this.logger.info({ collection: collectionName }, "Manual reindex triggered");
+        this.deps.mongoReader.startIndexCreation(collectionName)
+            .then(() => {
+                this.indexStatus.set(collectionName, "ready");
+                const elapsed = Math.round((Date.now() - (this.indexBuildStarted.get(collectionName) ?? Date.now())) / 1000);
+                this.logger.info({ collection: collectionName, durationSec: elapsed }, "Manual reindex completed");
+            })
+            .catch((err) => {
+                this.indexStatus.set(collectionName, "failed");
+                this.logger.error({ collection: collectionName, err: err instanceof Error ? err.message : String(err) }, "Manual reindex failed");
+            });
+    }
+
+    retryCollection(collectionName: string): void {
+        this.results = this.results.filter(r => r.collection !== collectionName);
+        this.logger.info({ collection: collectionName }, "Collection queued for retry");
     }
 
     // -----------------------------------------------------------------------
     // Private: Index Management
     // -----------------------------------------------------------------------
 
-    private async initializeIndexes(): Promise<void> {
-        const { mongoReader } = this.deps;
-
+    /**
+     * Start all index checks in the background. Does NOT block.
+     * drill_events is first in the list so it gets checked first,
+     * but we don't wait for it — migrate whatever is ready first.
+     */
+    private startBackgroundIndexInit(): void {
         for (const name of this.discoveredCollections) {
             this.indexStatus.set(name, "checking");
         }
 
-        // Check all indexes (sequentially to avoid overwhelming MongoDB)
-        for (const name of this.discoveredCollections) {
-            try {
-                const hasIndex = await mongoReader.hasRequiredIndex(name);
-                if (hasIndex) {
-                    this.indexStatus.set(name, "ready");
-                } else {
-                    this.indexStatus.set(name, "building");
-                    this.indexBuildStarted.set(name, Date.now());
+        this.runIndexChecks().catch((err) => {
+            this.logger.error({ err: err instanceof Error ? err.message : String(err) }, "Background index init crashed");
+        });
+    }
 
-                    // Fire and forget — createIndex runs in background
-                    mongoReader.startIndexCreation(name)
-                        .then(() => {
-                            this.indexStatus.set(name, "ready");
-                            const elapsed = Math.round((Date.now() - (this.indexBuildStarted.get(name) ?? Date.now())) / 1000);
-                            this.logger.info({ collection: name, durationSec: elapsed }, "Background index build completed");
-                        })
-                        .catch((err) => {
-                            this.indexStatus.set(name, "failed");
-                            this.logger.error({ collection: name, err: err instanceof Error ? err.message : String(err) }, "Index creation failed");
-                        });
-                }
-            } catch (err) {
-                this.indexStatus.set(name, "failed");
-                this.logger.error({ collection: name, err: err instanceof Error ? err.message : String(err) }, "Failed to check index");
-            }
+    private async runIndexChecks(): Promise<void> {
+        const CONCURRENCY = 10;
+        for (let i = 0; i < this.discoveredCollections.length; i += CONCURRENCY) {
+            const chunk = this.discoveredCollections.slice(i, i + CONCURRENCY);
+            await Promise.allSettled(chunk.map(name => this.checkAndBuildIndex(name)));
         }
+        const counts = this.getIndexStatusCounts();
+        this.logger.info(counts, "Background index initialization complete");
+    }
 
-        const ready = [...this.indexStatus.values()].filter(s => s === "ready").length;
-        const building = [...this.indexStatus.values()].filter(s => s === "building").length;
-        const failed = [...this.indexStatus.values()].filter(s => s === "failed").length;
+    private async checkAndBuildIndex(name: string): Promise<void> {
+        const { mongoReader } = this.deps;
+        try {
+            const hasIndex = await mongoReader.hasRequiredIndex(name);
+            if (hasIndex) {
+                this.indexStatus.set(name, "ready");
+                return;
+            }
+            this.indexStatus.set(name, "building");
+            this.indexBuildStarted.set(name, Date.now());
+            mongoReader.startIndexCreation(name)
+                .then(() => {
+                    this.indexStatus.set(name, "ready");
+                    const elapsed = Math.round((Date.now() - (this.indexBuildStarted.get(name) ?? Date.now())) / 1000);
+                    this.logger.info({ collection: name, durationSec: elapsed }, "Background index build completed");
+                })
+                .catch((err) => {
+                    this.indexStatus.set(name, "failed");
+                    this.logger.error({ collection: name, err: err instanceof Error ? err.message : String(err) }, "Index creation failed");
+                });
+        } catch (err) {
+            this.indexStatus.set(name, "failed");
+            this.logger.error({ collection: name, err: err instanceof Error ? err.message : String(err) }, "Failed to check index");
+        }
+    }
 
-        this.logger.info(
-            { ready, building, failed, total: this.discoveredCollections.length },
-            "Index initialization complete",
-        );
+    private getIndexStatusCounts(): { ready: number; building: number; failed: number; checking: number; total: number } {
+        let ready = 0, building = 0, failed = 0, checking = 0;
+        for (const s of this.indexStatus.values()) {
+            if (s === "ready") ready++;
+            else if (s === "building") building++;
+            else if (s === "failed") failed++;
+            else checking++;
+        }
+        return { ready, building, failed, checking, total: this.discoveredCollections.length };
     }
 
     private findNextReadyCollection(completed: Set<string>): string | null {
+        const prefix = this.deps.config.source.collectionPrefix;
+
+        // Always prefer the base collection (drill_events) when it becomes ready
+        if (!completed.has(prefix) && this.indexStatus.get(prefix) === "ready") {
+            return prefix;
+        }
+
+        // Otherwise pick any ready collection in discovery order
         for (const name of this.discoveredCollections) {
             if (completed.has(name)) continue;
             if (this.indexStatus.get(name) === "ready") return name;
@@ -364,15 +395,6 @@ export class CollectionOrchestrator {
         return [...this.indexStatus.entries()]
             .filter(([, s]) => s === status)
             .map(([name]) => name);
-    }
-
-    private allCollectionsResolved(completed: Set<string>): boolean {
-        for (const name of this.discoveredCollections) {
-            if (completed.has(name)) continue;
-            const idx = this.indexStatus.get(name);
-            if (idx === "building" || idx === "checking") return false;
-        }
-        return true;
     }
 
     private async recheckBuildingIndexes(): Promise<void> {

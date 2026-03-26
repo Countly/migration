@@ -319,6 +319,37 @@ export class ManifestStore {
         this._lastWriteLatencyMs = Math.round(performance.now() - start);
     }
 
+    /**
+     * Insert a completed batch and advance the run cursor in one go.
+     * Skips the intermediate "prepared"/"inflight" states — the batch record
+     * is written only after successful ClickHouse insertion.
+     */
+    async insertCompletedBatch(
+        batch: Omit<Batch, "error_history" | "digest_match">,
+        lastCommittedCursor: string,
+    ): Promise<void> {
+        const { batches, runs } = this.ensureConnected();
+        const now = new Date().toISOString();
+        const start = performance.now();
+
+        const doc = {
+            ...batch,
+            status: "done" as BatchStatus,
+            finished_at: now,
+            error_history: [],
+            digest_match: null,
+        };
+
+        await batches.insertOne(doc as Batch);
+
+        await runs.updateOne(
+            { run_id: batch.run_id },
+            { $set: { last_committed_cursor: lastCommittedCursor, updated_at: now } },
+        );
+
+        this._lastWriteLatencyMs = Math.round(performance.now() - start);
+    }
+
     async updateBatchDigestMatch(
         runId: string,
         batchSeq: number,

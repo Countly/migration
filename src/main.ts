@@ -176,6 +176,9 @@ async function main(): Promise<void> {
   registerControlRoutes(app, {
     orchestrator,
     gcController,
+    manifestStore,
+    mongoReader,
+    chWriter,
   });
 
   registerRunRoutes(app, {

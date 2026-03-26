@@ -104,8 +104,8 @@ export const configSchema = z.object({
     // ── Memory / GC ─────────────────────────────────────────────────────
     memory: z.object({
         gcEnabled: booleanFromEnv.default(true),
-        gcRssSoftLimitMb: intFromEnv.default(1_536),
-        gcRssHardLimitMb: intFromEnv.default(2_048),
+        gcRssSoftLimitMb: intFromEnv.default(3_072),
+        gcRssHardLimitMb: intFromEnv.default(6_144),
         gcHeapUsedRatio: numberFromEnv.default(0.70),
         gcEveryNBatches: intFromEnv.default(10),
     }),
