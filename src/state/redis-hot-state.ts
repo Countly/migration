@@ -403,6 +403,75 @@ export class RedisHotState {
     }
 
     // -----------------------------------------------------------------------
+    // Persistent collection estimates (no TTL)
+    // -----------------------------------------------------------------------
+
+    /** Bulk-write estimated doc counts for all collections (MSET, single round-trip). */
+    async setCollectionEstimates(estimates: Map<string, number>): Promise<void> {
+        if (estimates.size === 0) return;
+        const args: string[] = [];
+        for (const [collection, count] of estimates) {
+            args.push(k(this.prefix, "est", collection), String(count));
+        }
+        await this.redis.mset(...args);
+    }
+
+    /** Read all persisted collection estimates (SCAN + MGET). */
+    async getAllCollectionEstimates(): Promise<Map<string, number>> {
+        const pattern = k(this.prefix, "est", "*");
+        const keys = await this.scanKeys(pattern);
+        if (keys.length === 0) return new Map();
+
+        const values = await this.redis.mget(...keys);
+        const prefix = k(this.prefix, "est") + ":";
+        const result = new Map<string, number>();
+        for (let i = 0; i < keys.length; i++) {
+            const val = values[i];
+            if (val !== null) {
+                const collection = keys[i].slice(prefix.length);
+                result.set(collection, Number(val));
+            }
+        }
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistent collection completion aggregates (no TTL)
+    // -----------------------------------------------------------------------
+
+    /** Write completion aggregate for one collection (SET, no TTL). */
+    async setCollectionCompleted(
+        collection: string,
+        data: { docsRead: number; rowsInserted: number; runId: string; completedAt: string },
+    ): Promise<void> {
+        const key = k(this.prefix, "completed", collection);
+        await this.redis.set(key, JSON.stringify(data));
+    }
+
+    /** Read all completion aggregates (SCAN + MGET). */
+    async getAllCollectionCompleted(): Promise<Map<string, { docsRead: number; rowsInserted: number; runId: string; completedAt: string }>> {
+        const pattern = k(this.prefix, "completed", "*");
+        const keys = await this.scanKeys(pattern);
+        if (keys.length === 0) return new Map();
+
+        const values = await this.redis.mget(...keys);
+        const prefix = k(this.prefix, "completed") + ":";
+        const result = new Map<string, { docsRead: number; rowsInserted: number; runId: string; completedAt: string }>();
+        for (let i = 0; i < keys.length; i++) {
+            const val = values[i];
+            if (val !== null) {
+                try {
+                    const collection = keys[i].slice(prefix.length);
+                    result.set(collection, JSON.parse(val));
+                } catch {
+                    // skip malformed
+                }
+            }
+        }
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
     // Key management
     // -----------------------------------------------------------------------
 

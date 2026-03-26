@@ -125,7 +125,7 @@ export class CollectionOrchestrator {
                     sourceNs: `${config.source.db}.${name}`,
                     runId: '',
                     status: 'skipped',
-                    error: `APM event "${defaults.e}" excluded from migration`,
+                    error: 'apm_collections',
                 });
                 this.logger.info({ collection: name, event: defaults.e }, 'Skipping APM collection');
                 return false;
@@ -144,7 +144,13 @@ export class CollectionOrchestrator {
             "Starting migration with index-aware scheduling",
         );
 
-        // 2. Start lock heartbeat (multi-pod mode)
+        // 2a. Upfront: estimate ALL collections in parallel and persist to Redis
+        await this.populateAllEstimates();
+
+        // 2b. Recover completed collection aggregates from Redis (+ manifest fallback)
+        await this.recoverCompletedCollections();
+
+        // 3. Start lock heartbeat (multi-pod mode)
         collectionLock?.startHeartbeat();
 
         // 3. Start all index checks in background (non-blocking)
@@ -184,13 +190,27 @@ export class CollectionOrchestrator {
                 // Check if range-parallel (uses cached estimate from isRangeParallelCandidate or fresh query)
                 const isRangeParallel = await this.isRangeParallelCandidate(next);
 
+                // Already recovered from Redis in recoverCompletedCollections? Skip.
+                if (this.results.some(r => r.collection === next)) continue;
+
                 // For range-parallel: check if ranges are all done (not existsCompletedRun)
                 // For standard: check if already completed
                 if (!isRangeParallel) {
                     const alreadyCompleted = await manifestStore.existsCompletedRun(sourceNs, targetTable);
                     if (alreadyCompleted) {
-                        this.logger.info({ collection: next, sourceNs }, "Collection already migrated, skipping");
-                        this.results.push({ collection: next, sourceNs, runId: "", status: "skipped" });
+                        // Manifest says completed but Redis had no data (flushed) — recover from manifest
+                        const completedRun = await manifestStore.getCompletedRun(sourceNs, targetTable);
+                        const docsRead = completedRun?.summary?.total_docs_read ?? 0;
+                        const rowsInserted = completedRun?.summary?.total_rows_inserted ?? 0;
+                        const completedRunId = completedRun?.run_id ?? "";
+                        this.logger.info({ collection: next, sourceNs, docsRead, rowsInserted }, "Collection already migrated, skipping (manifest fallback)");
+                        this.results.push({ collection: next, sourceNs, runId: completedRunId, status: "skipped", docsRead, rowsInserted });
+
+                        // Backfill Redis for next restart
+                        await this.deps.redisState.setCollectionCompleted(next, {
+                            docsRead, rowsInserted, runId: completedRunId,
+                            completedAt: new Date().toISOString(),
+                        }).catch(() => {});
                         continue;
                     }
                 }
@@ -202,6 +222,13 @@ export class CollectionOrchestrator {
 
                     if (result.status === "completed") {
                         this.logger.info({ collection: next, runId: result.runId }, "Collection migration completed");
+                        // Persist completion aggregate to Redis (no TTL)
+                        await this.deps.redisState.setCollectionCompleted(next, {
+                            docsRead: result.docsRead ?? 0,
+                            rowsInserted: result.rowsInserted ?? 0,
+                            runId: result.runId,
+                            completedAt: new Date().toISOString(),
+                        }).catch(() => {});
                     } else if (result.status === "failed") {
                         this.logger.error(
                             { collection: next, runId: result.runId, error: result.error },
@@ -426,6 +453,82 @@ export class CollectionOrchestrator {
         }
         this.results = this.results.filter(r => r.collection !== collectionName);
         this.logger.info({ collection: collectionName }, "Collection queued for retry");
+    }
+
+    // -----------------------------------------------------------------------
+    // Private: Upfront Estimates & Recovery
+    // -----------------------------------------------------------------------
+
+    /**
+     * Query estimatedDocumentCount() for ALL discovered collections in parallel
+     * and persist to Redis. This ensures the overall progress denominator is
+     * correct from the first stats request.
+     */
+    private async populateAllEstimates(): Promise<void> {
+        const db = this.deps.mongoReader.getDatabase();
+        const CHUNK_SIZE = 10;
+
+        for (let i = 0; i < this.discoveredCollections.length; i += CHUNK_SIZE) {
+            const chunk = this.discoveredCollections.slice(i, i + CHUNK_SIZE);
+            const results = await Promise.allSettled(
+                chunk.map(async (name) => {
+                    const est = await db.collection(name).estimatedDocumentCount();
+                    return { name, est };
+                }),
+            );
+            for (const r of results) {
+                if (r.status === "fulfilled") {
+                    this.estimatedCounts.set(r.value.name, r.value.est);
+                }
+            }
+        }
+
+        // Persist to Redis for other pods and resume
+        await this.deps.redisState.setCollectionEstimates(this.estimatedCounts).catch((err) => {
+            this.logger.warn({ error: err instanceof Error ? err.message : String(err) }, "Failed to persist estimates to Redis");
+        });
+
+        this.logger.info(
+            { collections: this.estimatedCounts.size, totalEstimated: Array.from(this.estimatedCounts.values()).reduce((a, b) => a + b, 0) },
+            "Estimated counts for all collections stored in Redis",
+        );
+    }
+
+    /**
+     * On resume: recover completed collection aggregates from Redis.
+     * Populates this.results so completed collections aren't re-processed
+     * and their docsRead/rowsInserted are available for progress calculations.
+     */
+    private async recoverCompletedCollections(): Promise<void> {
+        const completedFromRedis = await this.deps.redisState.getAllCollectionCompleted().catch(() => new Map());
+        if (completedFromRedis.size === 0) return;
+
+        const { config } = this.deps;
+        let recovered = 0;
+
+        for (const [collection, data] of completedFromRedis) {
+            // Only recover if this collection is in our discovered list
+            if (!this.discoveredCollections.includes(collection)) continue;
+            // Don't double-add (e.g. APM skip results already in this.results)
+            if (this.results.some(r => r.collection === collection)) continue;
+
+            this.results.push({
+                collection,
+                sourceNs: `${config.source.db}.${collection}`,
+                runId: data.runId,
+                status: "skipped",
+                docsRead: data.docsRead,
+                rowsInserted: data.rowsInserted,
+            });
+            recovered++;
+        }
+
+        if (recovered > 0) {
+            this.logger.info(
+                { recovered, total: completedFromRedis.size },
+                "Recovered completed collection aggregates from Redis",
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

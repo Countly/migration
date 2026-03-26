@@ -880,6 +880,29 @@ export class BatchRunner {
       this.batchSeq = lastBatch.batch_seq;
     }
 
+    // Recover accumulated doc/row counters from Redis stats (or manifest fallback)
+    // so live progress starts from the correct offset, not 0.
+    const lastStats = await this.deps.redisState.getStats(runId).catch(() => null);
+    if (lastStats && lastStats.docsRead > 0) {
+      this.totalDocsRead = lastStats.docsRead;
+      this.totalRowsInserted = lastStats.rowsInserted;
+      this.logger.info(
+        { docsRead: lastStats.docsRead, rowsInserted: lastStats.rowsInserted, source: "redis" },
+        "Recovered accumulated counters from Redis",
+      );
+    } else {
+      // Redis stats missing (flushed) — fallback to manifest aggregate
+      const aggregate = await this.deps.manifestStore.sumCompletedBatchStats(runId);
+      if (aggregate.docsRead > 0) {
+        this.totalDocsRead = aggregate.docsRead;
+        this.totalRowsInserted = aggregate.rowsInserted;
+        this.logger.info(
+          { docsRead: aggregate.docsRead, rowsInserted: aggregate.rowsInserted, source: "manifest" },
+          "Recovered accumulated counters from manifest",
+        );
+      }
+    }
+
     this.logger.info(
       {
         runId,

@@ -435,6 +435,28 @@ export class ManifestStore {
         return count > 0;
     }
 
+    /** Get the most recent completed run for a given sourceNs/targetTable. */
+    async getCompletedRun(sourceNs: string, targetTable: string): Promise<Run | null> {
+        const { runs } = this.ensureConnected();
+        const doc = await runs.findOne(
+            { status: "completed", source_ns: sourceNs, target_table: targetTable },
+            { sort: { created_at: -1 }, projection: { _id: 0 } },
+        );
+        return (doc as Run | null) ?? null;
+    }
+
+    /** Sum source_docs_read and rows_to_insert from all done batches for a run. */
+    async sumCompletedBatchStats(runId: string): Promise<{ docsRead: number; rowsInserted: number }> {
+        const { batches } = this.ensureConnected();
+        const pipeline = [
+            { $match: { run_id: runId, status: "done" } },
+            { $group: { _id: null, docsRead: { $sum: "$source_docs_read" }, rowsInserted: { $sum: "$rows_to_insert" } } },
+        ];
+        const result = await batches.aggregate(pipeline).toArray();
+        if (result.length === 0) return { docsRead: 0, rowsInserted: 0 };
+        return { docsRead: result[0].docsRead ?? 0, rowsInserted: result[0].rowsInserted ?? 0 };
+    }
+
     async getBatches(runId: string, opts: GetBatchesOptions = {}): Promise<Batch[]> {
         const { batches } = this.ensureConnected();
         const filter: { run_id: string; status?: BatchStatus } = { run_id: runId };
