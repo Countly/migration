@@ -73,6 +73,8 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
     version,
   } = deps;
 
+  let frozenElapsedMs: number | null = null;
+
   app.get('/stats', async (_request, reply) => {
     const now = new Date();
     const uptimeSec = Math.floor((now.getTime() - startedAt.getTime()) / 1000);
@@ -252,8 +254,16 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
           + (progress.skippedCollections > 0 ? `, ${progress.skippedCollections} skipped` : ''),
         docsProgress: `${fmtNum(overallDocsRead)} / ~${fmtNum(totalEstimated)} docs`,
         throughput: `${fmtNum(Math.round(batchStats?.docsPerSecond ?? 0))} docs/s`,
-        elapsed: fmtDuration(Date.now() - startedAt.getTime()),
-        eta: etaMs !== null ? `~${fmtDuration(etaMs)}` : 'calculating...',
+        elapsed: (() => {
+          const isTerminal = runnerStatus === 'completed' || runnerStatus === 'failed' || runnerStatus === 'stopped';
+          if (isTerminal && frozenElapsedMs === null) {
+            frozenElapsedMs = Date.now() - startedAt.getTime();
+          }
+          return fmtDuration(frozenElapsedMs ?? (Date.now() - startedAt.getTime()));
+        })(),
+        eta: (runnerStatus === 'completed' || runnerStatus === 'failed' || runnerStatus === 'stopped')
+          ? 'done'
+          : (etaMs !== null ? `~${fmtDuration(etaMs)}` : 'calculating...'),
         status: runnerStatus,
       },
 
