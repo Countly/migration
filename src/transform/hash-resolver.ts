@@ -130,15 +130,19 @@ export class HashResolver {
 
     this.logger.info({ appCount: apps.length }, "Read apps from countly database");
 
-    // 2. For each app, read custom events and build hashes
+    // 2. Batch-fetch all custom events in a single query
+    const appIds = apps.map(a => a._id);
+    const eventsDocs = await db.collection("events")
+      .find({ _id: { $in: appIds } })
+      .toArray();
+    const eventsMap = new Map(eventsDocs.map(d => [String(d._id), d]));
+
+    // 3. For each app, build hashes from known + custom events
     for (const app of apps) {
       const appId = String(app._id);
-
-      // Read custom events for this app
-      const eventsDoc = await db.collection("events").findOne({ _id: app._id });
+      const eventsDoc = eventsMap.get(appId);
       const customEvents: string[] = Array.isArray(eventsDoc?.list) ? eventsDoc.list : [];
 
-      // Combine known + custom events (deduplicate via Set)
       const allEvents = new Set<string>([...KNOWN_CLY_EVENTS, ...customEvents]);
 
       for (const eventName of allEvents) {

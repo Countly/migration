@@ -268,12 +268,5 @@ function doTransform(doc: SourceDocument, defaults?: CollectionDefaults): Transf
     delete row['cd'];
   }
 
-  // ── Strip unknown fields ──────────────────────────────────────────────
-  for (const key of Object.keys(row)) {
-    if (!KNOWN_FIELDS.has(key)) {
-      delete row[key];
-    }
-  }
-
   return { row: row as unknown as OutputRow, skipReason: null };
 }

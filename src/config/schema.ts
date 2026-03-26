@@ -55,8 +55,8 @@ export const configSchema = z.object({
         readConcern: z.string().default("majority"),
         retryReads: booleanFromEnv.default(true),
         appName: z.string().optional(),
-        batchRowsTarget: positiveIntFromEnv.default(50_000),
-        mongoPageSize: positiveIntFromEnv.default(2_000),
+        batchRowsTarget: positiveIntFromEnv.default(10_000),
+        mongoPageSize: positiveIntFromEnv.default(10_000),
         cursorBatchSize: positiveIntFromEnv.default(10_000),
         maxTimeMs: positiveIntFromEnv.default(600_000),
     }),
@@ -89,7 +89,7 @@ export const configSchema = z.object({
         partitionPctLow: numberFromEnv.default(0.55).pipe(z.number().min(0).max(1)),
         totalPctHigh: numberFromEnv.default(0.70).pipe(z.number().min(0).max(1)),
         totalPctLow: numberFromEnv.default(0.55).pipe(z.number().min(0).max(1)),
-        pollIntervalMs: intFromEnv.default(15_000),
+        pollIntervalMs: intFromEnv.default(5_000),
         maxPauseEpisodeMs: intFromEnv.default(180_000),
     }),
 
@@ -107,7 +107,7 @@ export const configSchema = z.object({
         gcRssSoftLimitMb: intFromEnv.default(3_072),
         gcRssHardLimitMb: intFromEnv.default(6_144),
         gcHeapUsedRatio: numberFromEnv.default(0.70),
-        gcEveryNBatches: intFromEnv.default(10),
+        gcEveryNBatches: intFromEnv.default(50),
     }),
 
     // ── Logging ──────────────────────────────────────────────────────────

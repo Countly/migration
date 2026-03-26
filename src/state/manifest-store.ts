@@ -434,6 +434,12 @@ export class ManifestStore {
         await skipSamples.insertOne({ ...sample });
     }
 
+    async insertSkipSamples(samples: SkipSample[]): Promise<void> {
+        if (samples.length === 0) return;
+        const { skipSamples } = this.ensureConnected();
+        await skipSamples.insertMany(samples);
+    }
+
     // -----------------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------------

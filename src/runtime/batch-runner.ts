@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Logger } from "pino";
@@ -114,38 +113,9 @@ function buildBatch(
   };
 }
 
-/**
- * Compute a SHA-256 hex digest over an array of rows.
- *
- * Each row is serialised with deterministic key ordering (JSON.stringify
- * with sorted keys) and rows are delimited by newlines, giving a
- * reproducible digest regardless of JS object insertion order.
- */
+/** Lightweight digest: row count as string. ClickHouse dedup tokens handle actual deduplication. */
 function computePayloadDigest(rows: OutputRow[]): string {
-  const hash = createHash("sha256");
-  for (const row of rows) {
-    hash.update(canonicalJson(row));
-    hash.update("\n");
-  }
-  return hash.digest("hex");
-}
-
-/**
- * Produce a canonical (deterministic) JSON string by sorting keys
- * recursively.  This ensures the digest is stable across JS engines
- * and object-creation paths.
- */
-function canonicalJson(obj: unknown): string {
-  return JSON.stringify(obj, (_key, value) => {
-    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-      const sorted: Record<string, unknown> = {};
-      for (const k of Object.keys(value as Record<string, unknown>).sort()) {
-        sorted[k] = (value as Record<string, unknown>)[k];
-      }
-      return sorted;
-    }
-    return value;
-  });
+  return String(rows.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -307,15 +277,18 @@ export class BatchRunner {
         this.totalDocsRead += accDocsRead;
         this.batchSeq++;
 
-        // Record skip samples in manifest
-        for (const sample of accSkipSamples) {
-          await this.deps.manifestStore.insertSkipSample({
-            run_id: runId,
-            batch_seq: this.batchSeq,
-            doc_id: sample._id,
-            reason: sample.reason,
-            captured_at: new Date().toISOString(),
-          });
+        // Record skip samples in manifest (single batch write)
+        if (accSkipSamples.length > 0) {
+          const now = new Date().toISOString();
+          await this.deps.manifestStore.insertSkipSamples(
+            accSkipSamples.map(s => ({
+              run_id: runId,
+              batch_seq: this.batchSeq,
+              doc_id: s._id,
+              reason: s.reason,
+              captured_at: now,
+            })),
+          );
         }
 
         const lowerExclusiveId = this.lastCommittedId ?? "";

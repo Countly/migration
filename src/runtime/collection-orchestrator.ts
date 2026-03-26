@@ -399,9 +399,10 @@ export class CollectionOrchestrator {
 
     private async recheckBuildingIndexes(): Promise<void> {
         const { mongoReader } = this.deps;
+        const building = [...this.indexStatus.entries()].filter(([, s]) => s === "building");
+        if (building.length === 0) return;
 
-        for (const [name, status] of this.indexStatus) {
-            if (status !== "building") continue;
+        await Promise.allSettled(building.map(async ([name]) => {
             try {
                 const ready = await mongoReader.hasRequiredIndex(name);
                 if (ready) {
@@ -412,22 +413,15 @@ export class CollectionOrchestrator {
             } catch (err) {
                 this.logger.warn({ collection: name, err: err instanceof Error ? err.message : String(err) }, "Failed to recheck index");
             }
-        }
+        }));
     }
 
     private async interruptibleSleep(ms: number): Promise<void> {
         return new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, ms);
-            // Allow stopping to interrupt the sleep
-            const check = setInterval(() => {
-                if (this.stopping) {
-                    clearTimeout(timer);
-                    clearInterval(check);
-                    resolve();
-                }
-            }, 1000);
-            // Ensure interval is cleaned up when timer fires normally
-            setTimeout(() => clearInterval(check), ms + 100);
+            let resolved = false;
+            const done = () => { if (resolved) return; resolved = true; clearTimeout(timer); clearInterval(check); resolve(); };
+            const timer = setTimeout(done, ms);
+            const check = setInterval(() => { if (this.stopping) done(); }, 1000);
         });
     }
 
