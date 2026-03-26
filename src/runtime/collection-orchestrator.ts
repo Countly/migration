@@ -89,6 +89,7 @@ export class CollectionOrchestrator {
     private currentCollection: string | null = null;
     private currentRunId: string | null = null;
     private currentBatchRunner: BatchRunner | null = null;
+    private lastBatchStats: BatchRunnerStats | null = null;
     private currentRangeCoordinator: RangeCoordinator | null = null;
     private currentRedisState: RedisHotState | null = null;
     private orchestratorStatus: "idle" | "running" | "waiting_for_index" | "completed" = "idle";
@@ -317,7 +318,9 @@ export class CollectionOrchestrator {
 
     getStats(): BatchRunnerStats | null {
         if (this.currentBatchRunner) {
-            return this.currentBatchRunner.getStats();
+            const stats = this.currentBatchRunner.getStats();
+            this.lastBatchStats = stats;
+            return stats;
         }
         if (this.currentRangeCoordinator) {
             return {
@@ -336,7 +339,8 @@ export class CollectionOrchestrator {
                 estimatedDuplicateRows: 0,
             } as BatchRunnerStats;
         }
-        return null;
+        // Return cached stats from the last active runner (preserves skip reasons etc.)
+        return this.lastBatchStats;
     }
 
     getCurrentBatchSeq(): number {
