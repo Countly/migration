@@ -70,6 +70,30 @@ export interface VerboseError {
     context: Record<string, unknown>;
 }
 
+export type BatchPhase = "READING" | "TRANSFORMING" | "WRITING" | "COMMITTING";
+
+export interface LiveBatchData {
+    collection: string;
+    podId: string;
+    batchSeq: number;
+    phase: BatchPhase;
+    docsRead: number;
+    rowsToInsert: number;
+    startedAt: number;
+    rangeIdx?: number;
+}
+
+export interface RangeLiveStats {
+    idx: number;
+    status: string;
+    podId: string;
+    docsRead: number;
+    rowsInserted: number;
+    batchesDone: number;
+    docsPerSecond: number;
+    startedAt: number;
+}
+
 // ---------------------------------------------------------------------------
 // Redis key helpers
 // ---------------------------------------------------------------------------
@@ -301,6 +325,84 @@ export class RedisHotState {
     }
 
     // -----------------------------------------------------------------------
+    // Last committed cursor (hot-path authority for async writes)
+    // -----------------------------------------------------------------------
+
+    async setLastCommittedCursor(runId: string, cursor: string): Promise<void> {
+        await this.redis.set(k(this.prefix, "run", runId, "cursor"), cursor);
+    }
+
+    async getLastCommittedCursor(runId: string): Promise<string | null> {
+        return this.redis.get(k(this.prefix, "run", runId, "cursor"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Live batch tracking (phase visibility for dashboard)
+    // -----------------------------------------------------------------------
+
+    async setLiveBatch(collection: string, data: LiveBatchData): Promise<void> {
+        const key = k(this.prefix, "liveBatch", collection);
+        await this.redis.set(key, JSON.stringify(data), "EX", 30);
+    }
+
+    async getLiveBatch(collection: string): Promise<LiveBatchData | null> {
+        const raw = await this.redis.get(k(this.prefix, "liveBatch", collection));
+        if (!raw) return null;
+        return JSON.parse(raw) as LiveBatchData;
+    }
+
+    async clearLiveBatch(collection: string): Promise<void> {
+        await this.redis.del(k(this.prefix, "liveBatch", collection));
+    }
+
+    async getAllLiveBatches(): Promise<LiveBatchData[]> {
+        const keys = await this.scanKeys(k(this.prefix, "liveBatch", "*"));
+        if (keys.length === 0) return [];
+        const pipeline = this.redis.pipeline();
+        for (const key of keys) pipeline.get(key);
+        const results = await pipeline.exec();
+        const batches: LiveBatchData[] = [];
+        if (results) {
+            for (const [err, val] of results) {
+                if (!err && val && typeof val === "string") {
+                    batches.push(JSON.parse(val) as LiveBatchData);
+                }
+            }
+        }
+        return batches;
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-range live stats (range-parallel dashboard visibility)
+    // -----------------------------------------------------------------------
+
+    async setRangeLiveStats(collection: string, rangeIdx: number, stats: RangeLiveStats): Promise<void> {
+        const key = k(this.prefix, "rangeLive", collection, String(rangeIdx));
+        await this.redis.set(key, JSON.stringify(stats), "EX", 60);
+    }
+
+    async getRangeLiveStats(collection: string): Promise<RangeLiveStats[]> {
+        const keys = await this.scanKeys(k(this.prefix, "rangeLive", collection, "*"));
+        if (keys.length === 0) return [];
+        const pipeline = this.redis.pipeline();
+        for (const key of keys) pipeline.get(key);
+        const results = await pipeline.exec();
+        const stats: RangeLiveStats[] = [];
+        if (results) {
+            for (const [err, val] of results) {
+                if (!err && val && typeof val === "string") {
+                    stats.push(JSON.parse(val) as RangeLiveStats);
+                }
+            }
+        }
+        return stats;
+    }
+
+    async clearRangeLiveStats(collection: string, rangeIdx: number): Promise<void> {
+        await this.redis.del(k(this.prefix, "rangeLive", collection, String(rangeIdx)));
+    }
+
+    // -----------------------------------------------------------------------
     // Key management
     // -----------------------------------------------------------------------
 
@@ -321,11 +423,13 @@ export class RedisHotState {
             k(this.prefix, "run", runId, "commands"),
             k(this.prefix, "run", runId, "recent_errors"),
             k(this.prefix, "run", runId, "timeline"),
+            k(this.prefix, "run", runId, "cursor"),
         ];
 
         const batchErrorKeys = await this.scanKeys(
             k(this.prefix, "run", runId, "batch", "*", "errors"),
         );
+        // liveBatch:* and rangeLive:* keys have TTLs (30s/60s) and self-expire
         const allKeys = [...runKeys, ...batchErrorKeys];
 
         const activeRunKey = k(this.prefix, "active_run");

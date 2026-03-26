@@ -4,6 +4,8 @@ import type { GcMode } from '../runtime/gc-controller.ts';
 import type { Batch, ManifestStore } from '../state/manifest-store.ts';
 import type { MongoReader } from '../source/mongo-reader.ts';
 import type { ClickHouseWriter } from '../target/clickhouse-writer.ts';
+import type { GlobalProgress } from '../state/global-progress.ts';
+import type { CollectionLock } from '../state/collection-lock.ts';
 import { transformBatch } from '../transform/normalize.ts';
 import { SkipCounter } from '../transform/skip-reasons.ts';
 import { deserializeCursor } from '../types/cursor.ts';
@@ -24,6 +26,8 @@ export interface ControlDeps {
   manifestStore: ManifestStore;
   mongoReader: MongoReader;
   chWriter: ClickHouseWriter;
+  globalProgress?: GlobalProgress;
+  collectionLock?: CollectionLock;
 }
 
 interface GcRequestBody {
@@ -185,5 +189,118 @@ export function registerControlRoutes(app: FastifyInstance, deps: ControlDeps): 
       mode,
       triggered,
     });
+  });
+
+  // ── Global control endpoints (multi-pod mode) ─────────────────────────
+  const { globalProgress } = deps;
+
+  // POST /control/global/pause - pause all pods
+  app.post('/control/global/pause', async (_request, reply) => {
+    if (!globalProgress) {
+      return reply.status(400).send({ ok: false, error: 'Multi-pod mode not enabled' });
+    }
+    await globalProgress.setGlobalCommand('pause', true);
+    orchestrator.pause(); // Also pause this pod
+    return reply.status(200).send({ ok: true, message: 'Global pause issued' });
+  });
+
+  // POST /control/global/resume - resume all pods
+  app.post('/control/global/resume', async (_request, reply) => {
+    if (!globalProgress) {
+      return reply.status(400).send({ ok: false, error: 'Multi-pod mode not enabled' });
+    }
+    await globalProgress.setGlobalCommand('pause', false);
+    orchestrator.resume();
+    return reply.status(200).send({ ok: true, message: 'Global resume issued' });
+  });
+
+  // POST /control/global/stop - stop all pods
+  app.post('/control/global/stop', async (_request, reply) => {
+    if (!globalProgress) {
+      return reply.status(400).send({ ok: false, error: 'Multi-pod mode not enabled' });
+    }
+    await globalProgress.setGlobalCommand('stop', true);
+    orchestrator.stopAfterBatch();
+    return reply.status(200).send({ ok: true, message: 'Global stop issued' });
+  });
+
+  // ── Lock + Pod management endpoints ───────────────────────────────────
+  const { collectionLock } = deps;
+
+  // GET /control/locks - list all active locks
+  app.get('/control/locks', async (_request, reply) => {
+    if (!collectionLock) {
+      return reply.status(400).send({ ok: false, error: 'Multi-pod mode not enabled' });
+    }
+    const locks = await collectionLock.listAllLocks();
+    return reply.status(200).send({ ok: true, locks });
+  });
+
+  // POST /control/locks/release/:collection - force-release a lock (admin)
+  app.post('/control/locks/release/:collection', async (request, reply) => {
+    if (!collectionLock) {
+      return reply.status(400).send({ ok: false, error: 'Multi-pod mode not enabled' });
+    }
+    const { collection } = request.params as { collection: string };
+    await collectionLock.forceRelease(collection);
+    return reply.status(200).send({ ok: true, collection, message: 'Lock force-released' });
+  });
+
+  // GET /control/pods - list all pods with alive status and locks
+  app.get('/control/pods', async (_request, reply) => {
+    if (!collectionLock) {
+      return reply.status(400).send({ ok: false, error: 'Multi-pod mode not enabled' });
+    }
+    const [podKeys, locks] = await Promise.all([
+      collectionLock.listAllPodKeys(),
+      collectionLock.listAllLocks(),
+    ]);
+    const alivePodIds = new Set(podKeys.map(p => p.podId));
+    // Find pods referenced in locks but not alive
+    const lockPodIds = [...new Set(locks.map(l => l.podId))];
+    const pods = lockPodIds.map(podId => {
+      const alive = alivePodIds.has(podId);
+      const podLocks = locks.filter(l => l.podId === podId);
+      const podInfo = podKeys.find(p => p.podId === podId);
+      return {
+        podId,
+        alive,
+        lastHeartbeat: podInfo?.lastHeartbeat ?? null,
+        collectionsActive: podInfo?.collectionsActive ?? [],
+        locks: podLocks.map(l => l.collectionName),
+        lockCount: podLocks.length,
+      };
+    });
+    // Add alive pods with no locks
+    for (const pk of podKeys) {
+      if (!lockPodIds.includes(pk.podId)) {
+        pods.push({
+          podId: pk.podId,
+          alive: true,
+          lastHeartbeat: pk.lastHeartbeat,
+          collectionsActive: pk.collectionsActive,
+          locks: [],
+          lockCount: 0,
+        });
+      }
+    }
+    return reply.status(200).send({ ok: true, pods });
+  });
+
+  // POST /control/pods/remove/:podId - remove a dead pod's keys and release its locks
+  app.post('/control/pods/remove/:podId', async (request, reply) => {
+    if (!collectionLock) {
+      return reply.status(400).send({ ok: false, error: 'Multi-pod mode not enabled' });
+    }
+    const { podId } = request.params as { podId: string };
+    await collectionLock.deletePodKey(podId);
+    const released = await collectionLock.releaseLocksForPod(podId);
+    return reply.status(200).send({ ok: true, podId, releasedLocks: released, message: `Pod removed, ${released.length} locks released` });
+  });
+
+  // POST /control/drain - graceful drain for K8s scale-down
+  app.post('/control/drain', async (_request, reply) => {
+    orchestrator.stopAfterBatch();
+    return reply.status(200).send({ ok: true, message: 'Drain initiated — finishing current batch then releasing locks' });
   });
 }

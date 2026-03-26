@@ -350,6 +350,29 @@ export class ManifestStore {
         this._lastWriteLatencyMs = Math.round(performance.now() - start);
     }
 
+    /**
+     * Bulk insert completed batch records (used by async batch writer).
+     */
+    async bulkInsertBatches(batchDocs: Batch[]): Promise<void> {
+        if (batchDocs.length === 0) return;
+        const { batches } = this.ensureConnected();
+        const start = performance.now();
+        await batches.insertMany(batchDocs, { ordered: false });
+        this._lastWriteLatencyMs = Math.round(performance.now() - start);
+    }
+
+    /**
+     * Advance the run cursor to the latest position (used by async batch writer).
+     */
+    async advanceCursor(runId: string, cursor: string): Promise<void> {
+        const { runs } = this.ensureConnected();
+        const now = new Date().toISOString();
+        await runs.updateOne(
+            { run_id: runId },
+            { $set: { last_committed_cursor: cursor, updated_at: now } },
+        );
+    }
+
     async updateBatchDigestMatch(
         runId: string,
         batchSeq: number,

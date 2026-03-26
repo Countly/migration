@@ -1,4 +1,5 @@
 import pino from "pino";
+import { hostname } from "node:os";
 import { configSchema, type Config } from "./schema.ts";
 
 // ---------------------------------------------------------------------------
@@ -32,6 +33,9 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             mongoPageSize: env.MONGO_PAGE_SIZE,
             cursorBatchSize: env.MONGO_CURSOR_BATCH_SIZE,
             maxTimeMs: env.MONGO_MAX_TIME_MS,
+            rangeParallelThreshold: env.RANGE_PARALLEL_THRESHOLD,
+            rangeCount: env.RANGE_COUNT,
+            rangeLeaseTtlSec: env.RANGE_LEASE_TTL_SEC,
         },
 
         transform: {
@@ -78,6 +82,21 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             gcEveryNBatches: env.GC_EVERY_N_BATCHES,
         },
 
+        asyncWrite: {
+            flushIntervalMs: env.ASYNC_WRITE_FLUSH_INTERVAL_MS,
+            flushBatchSize: env.ASYNC_WRITE_FLUSH_BATCH_SIZE,
+        },
+
+        worker: {
+            podId: env.POD_ID,
+            enabled: env.MULTI_POD_ENABLED,
+            lockTtlSec: env.LOCK_TTL_SECONDS,
+            lockRenewMs: env.LOCK_RENEW_MS,
+            progressUpdateMs: env.PROGRESS_UPDATE_MS,
+            podHeartbeatMs: env.POD_HEARTBEAT_MS,
+            podDeadAfterSec: env.POD_DEAD_AFTER_SEC,
+        },
+
         log: {
             level: env.LOG_LEVEL,
         },
@@ -118,6 +137,11 @@ export function loadConfig(): Config {
     const cleaned = stripUndefined(raw);
 
     const config = configSchema.parse(cleaned);
+
+    // Default podId to hostname if not set
+    if (!config.worker.podId) {
+        config.worker.podId = hostname();
+    }
 
     // Semantic validation
     const { memory, target } = config;

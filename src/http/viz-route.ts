@@ -262,6 +262,65 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Cluster (multi-pod, hidden when single-pod) -->
+<div class="card full" style="margin-top:12px;display:none" id="cluster-card">
+  <h3>Cluster <span id="cluster-summary" style="font-weight:400;color:var(--text2)"></span></h3>
+  <div class="controls" style="margin-bottom:10px">
+    <button class="btn btn-pause" id="btn-global-pause">Global Pause</button>
+    <button class="btn btn-resume" id="btn-global-resume">Global Resume</button>
+    <button class="btn btn-stop" id="btn-global-stop">Global Stop</button>
+  </div>
+  <!-- Cluster progress bar -->
+  <div style="margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px">
+      <span id="cluster-progress-label">0 / 0 collections</span>
+      <span id="cluster-progress-pct" style="font-weight:600">0%</span>
+    </div>
+    <div class="progress-outer" style="height:20px">
+      <div class="progress-fill" id="cluster-bar" style="width:0%">
+        <span class="progress-text" style="font-size:10px" id="cluster-bar-text">0%</span>
+      </div>
+    </div>
+    <div class="stat-row" style="margin-top:8px">
+      <div class="stat"><div class="stat-val sm" id="cl-docs">-</div><div class="stat-label">Cluster Docs Read</div></div>
+      <div class="stat"><div class="stat-val sm" id="cl-rows">-</div><div class="stat-label">Cluster Rows</div></div>
+      <div class="stat"><div class="stat-val sm" id="cl-processing">-</div><div class="stat-label">Processing</div></div>
+      <div class="stat"><div class="stat-val sm" id="cl-pending">-</div><div class="stat-label">Pending</div></div>
+    </div>
+  </div>
+  <!-- Pods -->
+  <h3 style="margin-top:4px">Pods</h3>
+  <div id="cluster-pods" style="font-size:12px"></div>
+  <!-- Active Ranges -->
+  <div id="ranges-panel" style="display:none;margin-top:12px">
+    <h3>Active Ranges <span id="ranges-summary" style="font-weight:400;color:var(--text2)"></span></h3>
+    <div id="ranges-content"></div>
+  </div>
+  <!-- Live Batches -->
+  <div id="batches-panel" style="margin-top:12px">
+    <h3>Live Batches <span id="batches-summary" style="font-weight:400;color:var(--text2)"></span></h3>
+    <div class="coll-scroll" style="max-height:200px">
+      <table class="coll-table">
+        <thead><tr><th>Collection</th><th>Pod</th><th>Batch#</th><th>Docs</th><th>Rows</th><th>Elapsed</th><th>Phase</th></tr></thead>
+        <tbody id="batches-body"></tbody>
+      </table>
+    </div>
+  </div>
+  <!-- Active Locks -->
+  <h3 style="margin-top:12px">Active Locks <span id="lock-count" style="font-weight:400;color:var(--text2)"></span></h3>
+  <div class="coll-scroll" style="max-height:160px">
+    <table class="coll-table">
+      <thead><tr><th>Collection</th><th>Pod</th><th>Acquired</th><th>Action</th></tr></thead>
+      <tbody id="lock-body"></tbody>
+    </table>
+  </div>
+  <!-- Stale Pods -->
+  <div id="stale-pods-section" style="display:none;margin-top:12px">
+    <h3>Stale Pods <span style="font-weight:400;color:var(--red)">(locks held by dead pods)</span></h3>
+    <div id="stale-pods-list" style="font-size:12px"></div>
+  </div>
+</div>
+
 <!-- Index Status -->
 <div class="card full" style="margin-top:12px">
   <h3>Index Status <span id="idx-summary" style="font-weight:400;color:var(--text2)"></span></h3>
@@ -279,7 +338,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   </div>
   <div class="coll-scroll">
     <table class="coll-table">
-      <thead><tr><th>Collection</th><th>Status</th><th>Estimated</th><th>Read</th><th>Inserted</th><th>Action</th></tr></thead>
+      <thead><tr><th>Collection</th><th>Status</th><th>Pod</th><th>Estimated</th><th>Read</th><th>Inserted</th><th>Action</th></tr></thead>
       <tbody id="coll-body"></tbody>
     </table>
   </div>
@@ -321,6 +380,9 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   $('btn-resume').addEventListener('click', function() { doControl('resume'); });
   $('btn-stop').addEventListener('click', function() { doControl('stop-after-batch'); });
   $('btn-gc').addEventListener('click', function() { doControl('gc'); });
+  $('btn-global-pause').addEventListener('click', function() { doControl('global/pause'); });
+  $('btn-global-resume').addEventListener('click', function() { doControl('global/resume'); });
+  $('btn-global-stop').addEventListener('click', function() { doControl('global/stop'); });
 
   function statusClass(s) {
     if (s === 'running' || s === 'stopping') return 'status-running';
@@ -366,7 +428,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     if (filtered.length === 0) {
       var emptyRow = document.createElement('tr');
       var emptyCell = document.createElement('td');
-      emptyCell.setAttribute('colspan', '6');
+      emptyCell.setAttribute('colspan', '7');
       emptyCell.className = 'muted';
       emptyCell.style.textAlign = 'center';
       emptyCell.style.padding = '20px';
@@ -399,6 +461,12 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       span.textContent = isCurrent ? 'running' : c.status;
       td2.appendChild(span);
       tr.appendChild(td2);
+
+      // Pod
+      var tdPod = document.createElement('td');
+      tdPod.style.cssText = 'font-size:10px;color:var(--text2);max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+      tdPod.textContent = c.podId || '-';
+      tr.appendChild(tdPod);
 
       // Estimated
       var td3 = document.createElement('td');
@@ -689,6 +757,222 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           detRow.appendChild(detRight);
           idxContainer.appendChild(detRow);
         }
+      }
+
+      // Cluster (multi-pod)
+      var cluster = d.cluster;
+      var clp = d.clusterProgress;
+      if (cluster) {
+        $('cluster-card').style.display = 'block';
+        $('cluster-summary').textContent = '(' + cluster.podCount + ' pods, ' + cluster.locks.length + ' locks)';
+        var gcmds = cluster.globalCommands || {};
+        $('btn-global-pause').disabled = gcmds.pause;
+        $('btn-global-resume').disabled = !gcmds.pause;
+        $('btn-global-stop').disabled = gcmds.stop;
+
+        // Cluster progress bar
+        if (clp) {
+          var cpct = clp.pct || 0;
+          $('cluster-bar').style.width = cpct + '%';
+          $('cluster-bar-text').textContent = cpct + '%';
+          if (cpct >= 100) $('cluster-bar').classList.add('green');
+          else $('cluster-bar').classList.remove('green');
+          $('cluster-progress-label').textContent = clp.done + ' / ' + clp.total + ' collections done';
+          $('cluster-progress-pct').textContent = cpct + '%';
+          $('cl-docs').textContent = fmt(clp.docsRead);
+          $('cl-rows').textContent = fmt(clp.rowsInserted);
+          $('cl-processing').textContent = String(clp.processing || 0);
+          $('cl-pending').textContent = String(clp.pending || 0);
+        }
+
+        // Pods (compact rows with progress bars)
+        var podContainer = $('cluster-pods');
+        while (podContainer.firstChild) podContainer.removeChild(podContainer.firstChild);
+        var pods = cluster.pods || [];
+        for (var pi = 0; pi < pods.length; pi++) {
+          var pod = pods[pi];
+          var ps = pod.stats || {};
+          var podDocsRead = ps.docsRead || 0;
+          var podPct = clp && clp.estimated > 0 ? Math.min(100, Math.round((podDocsRead / clp.estimated) * 100)) : 0;
+          var podActive = (pod.collectionsActive || []);
+          var podRow = document.createElement('div');
+          podRow.style.cssText = 'background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:6px';
+          podRow.innerHTML = '<div style="display:flex;align-items:center;gap:8px">'
+            + '<span class="health-dot dot-green" style="width:6px;height:6px"></span>'
+            + '<span style="font-weight:600;font-size:12px;min-width:60px">' + pod.podId + '</span>'
+            + '<div class="progress-outer" style="flex:1;height:8px"><div class="progress-fill" style="width:' + podPct + '%"></div></div>'
+            + '<span style="font-size:10px;font-weight:600;min-width:28px">' + podPct + '%</span>'
+            + '<span style="font-size:10px;color:var(--text2)">'
+              + fmt(podDocsRead) + ' docs · '
+              + fmt(ps.rowsInserted || 0) + ' rows · '
+              + podActive.length + ' active'
+            + '</span>'
+            + '</div>';
+          podContainer.appendChild(podRow);
+        }
+        if (pods.length === 0) {
+          var noPods = document.createElement('span');
+          noPods.className = 'muted';
+          noPods.textContent = 'No pods reporting';
+          podContainer.appendChild(noPods);
+        }
+
+        // Active Locks table
+        var locks = cluster.locks || [];
+        $('lock-count').textContent = '(' + locks.length + ')';
+        var lockBody = $('lock-body');
+        while (lockBody.firstChild) lockBody.removeChild(lockBody.firstChild);
+        if (locks.length === 0) {
+          var noLockRow = document.createElement('tr');
+          var noLockCell = document.createElement('td');
+          noLockCell.setAttribute('colspan', '4');
+          noLockCell.className = 'muted';
+          noLockCell.style.textAlign = 'center';
+          noLockCell.textContent = 'No active locks';
+          noLockRow.appendChild(noLockCell);
+          lockBody.appendChild(noLockRow);
+        } else {
+          for (var li = 0; li < locks.length; li++) {
+            var lk = locks[li];
+            var lkRow = document.createElement('tr');
+            var lkTd1 = document.createElement('td');
+            lkTd1.style.cssText = 'font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+            lkTd1.textContent = truncHash(lk.collectionName);
+            lkTd1.setAttribute('title', lk.collectionName);
+            lkRow.appendChild(lkTd1);
+            var lkTd2 = document.createElement('td');
+            lkTd2.style.fontSize = '11px';
+            lkTd2.textContent = lk.podId;
+            lkRow.appendChild(lkTd2);
+            var lkTd3 = document.createElement('td');
+            lkTd3.style.cssText = 'font-size:10px;color:var(--text2)';
+            lkTd3.textContent = lk.acquiredAt ? new Date(lk.acquiredAt).toLocaleTimeString() : '-';
+            lkRow.appendChild(lkTd3);
+            var lkTd4 = document.createElement('td');
+            var relBtn = document.createElement('button');
+            relBtn.className = 'btn';
+            relBtn.style.cssText = 'padding:2px 8px;font-size:10px;border-color:var(--red);color:var(--red)';
+            relBtn.textContent = 'Release';
+            relBtn.setAttribute('data-lock-coll', lk.collectionName);
+            relBtn.addEventListener('click', function() {
+              var coll = this.getAttribute('data-lock-coll');
+              fetch('/control/locks/release/' + encodeURIComponent(coll), { method: 'POST' });
+            });
+            lkTd4.appendChild(relBtn);
+            lkRow.appendChild(lkTd4);
+            lockBody.appendChild(lkRow);
+          }
+        }
+
+        // Stale Pods
+        var stalePods = cluster.stalePods || [];
+        var staleSection = $('stale-pods-section');
+        if (stalePods.length > 0) {
+          staleSection.style.display = 'block';
+          var staleList = $('stale-pods-list');
+          while (staleList.firstChild) staleList.removeChild(staleList.firstChild);
+          for (var si = 0; si < stalePods.length; si++) {
+            var sp = stalePods[si];
+            var staleLocks = locks.filter(function(l) { return l.podId === sp; });
+            var staleRow = document.createElement('div');
+            staleRow.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)';
+            var staleLeft = document.createElement('span');
+            staleLeft.style.cssText = 'display:flex;align-items:center;gap:6px';
+            var staleDot = document.createElement('span');
+            staleDot.className = 'health-dot dot-red';
+            staleDot.style.cssText = 'width:6px;height:6px';
+            staleLeft.appendChild(staleDot);
+            var staleName = document.createElement('span');
+            staleName.style.cssText = 'font-weight:600;color:var(--red)';
+            staleName.textContent = sp;
+            staleLeft.appendChild(staleName);
+            var staleLockCount = document.createElement('span');
+            staleLockCount.style.color = 'var(--text2)';
+            staleLockCount.textContent = ' (' + staleLocks.length + ' locks)';
+            staleLeft.appendChild(staleLockCount);
+            staleRow.appendChild(staleLeft);
+            var removeBtn = document.createElement('button');
+            removeBtn.className = 'btn';
+            removeBtn.style.cssText = 'padding:4px 12px;font-size:11px;border-color:var(--red);color:var(--red)';
+            removeBtn.textContent = 'Remove Pod';
+            removeBtn.setAttribute('data-stale-pod', sp);
+            removeBtn.addEventListener('click', function() {
+              var pid = this.getAttribute('data-stale-pod');
+              fetch('/control/pods/remove/' + encodeURIComponent(pid), { method: 'POST' });
+            });
+            staleRow.appendChild(removeBtn);
+            staleList.appendChild(staleRow);
+          }
+        } else {
+          staleSection.style.display = 'none';
+        }
+
+        // Live Batches
+        var liveBatches = d.liveBatches || [];
+        $('batches-summary').textContent = '(' + liveBatches.length + ' inflight)';
+        var batchesBody = $('batches-body');
+        while (batchesBody.firstChild) batchesBody.removeChild(batchesBody.firstChild);
+        if (liveBatches.length === 0) {
+          var noBatchRow = document.createElement('tr');
+          var noBatchCell = document.createElement('td');
+          noBatchCell.setAttribute('colspan', '7');
+          noBatchCell.className = 'muted';
+          noBatchCell.style.textAlign = 'center';
+          noBatchCell.textContent = 'No active batches';
+          noBatchRow.appendChild(noBatchCell);
+          batchesBody.appendChild(noBatchRow);
+        } else {
+          var phaseColors = { READING: 'var(--blue)', TRANSFORMING: 'var(--cyan)', WRITING: 'var(--yellow)', COMMITTING: 'var(--green)' };
+          for (var bi = 0; bi < liveBatches.length; bi++) {
+            var lb = liveBatches[bi];
+            var elapsed = Math.round((Date.now() - lb.startedAt) / 1000);
+            var elStr = elapsed >= 60 ? Math.floor(elapsed / 60) + 'm ' + (elapsed % 60) + 's' : elapsed + 's';
+            var phColor = phaseColors[lb.phase] || 'var(--text2)';
+            var batchTr = document.createElement('tr');
+            batchTr.style.borderBottom = '1px solid var(--border)';
+            batchTr.innerHTML = '<td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + lb.collection + '">' + truncHash(lb.collection) + '</td>'
+              + '<td style="font-size:11px">' + lb.podId + '</td>'
+              + '<td style="font-size:11px">#' + lb.batchSeq + '</td>'
+              + '<td style="font-size:11px">' + fmt(lb.docsRead) + '</td>'
+              + '<td style="font-size:11px">' + (lb.rowsToInsert ? fmt(lb.rowsToInsert) : '—') + '</td>'
+              + '<td style="font-size:11px">' + elStr + '</td>'
+              + '<td><span style="color:' + phColor + ';font-size:9px;background:var(--bg3);padding:1px 4px;border-radius:2px">' + lb.phase + '</span></td>';
+            batchesBody.appendChild(batchTr);
+          }
+        }
+
+        // Ranges panel - show only if any live batches have rangeIdx
+        var hasRanges = liveBatches.some(function(b) { return b.rangeIdx !== undefined && b.rangeIdx !== null; });
+        var rangesPanel = $('ranges-panel');
+        if (hasRanges) {
+          rangesPanel.style.display = 'block';
+          var rangeCollections = {};
+          for (var ri = 0; ri < liveBatches.length; ri++) {
+            if (liveBatches[ri].rangeIdx !== undefined) {
+              rangeCollections[liveBatches[ri].collection] = true;
+            }
+          }
+          var rcNames = Object.keys(rangeCollections);
+          $('ranges-summary').textContent = '(' + rcNames.length + ' collection' + (rcNames.length > 1 ? 's' : '') + ' in range-parallel mode)';
+          var rangesContent = $('ranges-content');
+          while (rangesContent.firstChild) rangesContent.removeChild(rangesContent.firstChild);
+          for (var rci = 0; rci < rcNames.length; rci++) {
+            var rcName = rcNames[rci];
+            var rcBatches = liveBatches.filter(function(b) { return b.collection === rcName && b.rangeIdx !== undefined; });
+            var rcDiv = document.createElement('div');
+            rcDiv.style.cssText = 'background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:8px';
+            rcDiv.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
+              + '<span style="font-weight:600;font-size:12px">' + truncHash(rcName) + ' <span style="font-size:9px;color:var(--purple);background:var(--bg3);padding:1px 4px;border-radius:2px">RANGE-PARALLEL</span></span>'
+              + '<span style="font-size:10px;color:var(--text2)">' + rcBatches.length + ' ranges processing</span>'
+              + '</div>';
+            rangesContent.appendChild(rcDiv);
+          }
+        } else {
+          rangesPanel.style.display = 'none';
+        }
+
+      } else {
+        $('cluster-card').style.display = 'none';
       }
 
       // Collections

@@ -3,7 +3,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Logger } from "pino";
 
 import type { ManifestStore, Batch, BatchStatus, RunSummary, CompactError } from "../state/manifest-store.ts";
-import type { RedisHotState, VerboseError } from "../state/redis-hot-state.ts";
+import type { RedisHotState, VerboseError, BatchPhase, LiveBatchData } from "../state/redis-hot-state.ts";
+import type { AsyncBatchWriter } from "../state/async-batch-writer.ts";
 import type { MongoReader } from "../source/mongo-reader.ts";
 import type { ClickHouseWriter } from "../target/clickhouse-writer.ts";
 import type { ClickHousePressure, BackpressureConfig } from "../target/clickhouse-pressure.ts";
@@ -32,11 +33,16 @@ export interface BatchRunnerConfig {
   table: string;
   snapshotInterval: number;
   collectionDefaults?: CollectionDefaults;
+  batchSeqOffset?: number;
+  collectionName?: string;
+  podId?: string;
+  rangeIdx?: number;
 }
 
 export interface BatchRunnerDeps {
   manifestStore: ManifestStore;
   redisState: RedisHotState;
+  asyncBatchWriter?: AsyncBatchWriter;
   mongoReader: MongoReader;
   chWriter: ClickHouseWriter;
   chPressure: ClickHousePressure;
@@ -137,7 +143,7 @@ function computePayloadDigest(rows: OutputRow[]): string {
  */
 export class BatchRunner {
   private status: RunnerStatus = "idle";
-  private batchSeq = 0;
+  private batchSeq: number;
   private lastCommittedId: string | null = null;
   private skipCounter: SkipCounter;
   private totalRowsInserted = 0;
@@ -152,19 +158,22 @@ export class BatchRunner {
 
   private readonly deps: BatchRunnerDeps;
   private readonly logger: Logger;
+  private phaseHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private currentPhaseData: LiveBatchData | null = null;
 
   constructor(deps: BatchRunnerDeps) {
     this.deps = deps;
     this.logger = deps.logger.child({ component: "BatchRunner" });
     this.skipCounter = new SkipCounter();
+    this.batchSeq = deps.config.batchSeqOffset ?? 0;
   }
 
   // -----------------------------------------------------------------------
   // Public API
   // -----------------------------------------------------------------------
 
-  /** Start the batch processing loop. */
-  async run(): Promise<void> {
+  /** Start the batch processing loop. Optional startCursor for range-parallel mode. */
+  async run(startCursor?: string): Promise<void> {
     if (this.status === "running") {
       throw new Error("BatchRunner is already running");
     }
@@ -180,6 +189,11 @@ export class BatchRunner {
       // 1. Resume check: look for interrupted batches
       // ------------------------------------------------------------------
       await this.resumeFromInterruption();
+
+      // If a startCursor was provided (range mode) and no resume state exists, use it
+      if (startCursor && !this.lastCommittedId) {
+        this.lastCommittedId = startCursor;
+      }
 
       // ------------------------------------------------------------------
       // 2. Main loop
@@ -206,6 +220,7 @@ export class BatchRunner {
         }
 
         // (c) Accumulate multiple MongoDB pages into one ClickHouse write batch
+        await this.setPhase("READING", { docsRead: 0, rowsToInsert: 0 });
         const { batchRowsTarget, mongoPageSize } = this.deps.config;
         const accRows: OutputRow[] = [];
         const accSkipSamples: Array<{ _id: string; reason: SkipReason }> = [];
@@ -274,6 +289,7 @@ export class BatchRunner {
           break;
         }
 
+        await this.setPhase("TRANSFORMING", { docsRead: accDocsRead, rowsToInsert: 0 });
         this.totalDocsRead += accDocsRead;
         this.batchSeq++;
 
@@ -338,6 +354,8 @@ export class BatchRunner {
 
         // (h) Insert into ClickHouse (no pre-write to manifest — single write on success)
         try {
+          await this.setPhase("WRITING", { docsRead: accDocsRead, rowsToInsert: rows.length });
+          this.startPhaseHeartbeat();
           const currentBatchSeq = this.batchSeq;
           const result = await this.deps.retryPolicy.execute(
             () =>
@@ -374,8 +392,14 @@ export class BatchRunner {
             },
           );
 
-          // (i) On success: insert completed batch + advance cursor (single MongoDB write)
-          await this.deps.manifestStore.insertCompletedBatch(batch, upperInclusiveId);
+          // (i) On success: commit via async writer (Redis hot-path) or fall back to manifest
+          this.stopPhaseHeartbeat();
+          await this.setPhase("COMMITTING", { docsRead: accDocsRead, rowsToInsert: rows.length });
+          if (this.deps.asyncBatchWriter) {
+            await this.deps.asyncBatchWriter.commitBatch(this.deps.config.runId, batch, upperInclusiveId);
+          } else {
+            await this.deps.manifestStore.insertCompletedBatch(batch, upperInclusiveId);
+          }
           this.lastCommittedId = upperInclusiveId;
           this.totalRowsInserted += result.rowsInserted;
 
@@ -425,6 +449,14 @@ export class BatchRunner {
             );
           }
 
+          // Clear live batch phase
+          if (this.deps.config.collectionName) {
+            await this.bestEffortRedis(
+              () => this.deps.redisState.clearLiveBatch(this.deps.config.collectionName!),
+              "Redis clearLiveBatch failed",
+            );
+          }
+
           this.logger.info(
             {
               batchSeq: this.batchSeq,
@@ -436,6 +468,7 @@ export class BatchRunner {
           );
         } catch (err) {
           // Insert failed after all retries — write batch record as failed
+          this.stopPhaseHeartbeat();
           const error = toError(err);
           batch.status = "failed" as any;
           batch.last_error = error.message;
@@ -505,6 +538,7 @@ export class BatchRunner {
         this.setTerminalStatus("stopped");
       }
     } catch (err) {
+      this.stopPhaseHeartbeat();
       const error = toError(err);
       this.logger.error({ error: error.message }, "BatchRunner fatal error");
       this.setTerminalStatus("failed");
@@ -681,7 +715,9 @@ export class BatchRunner {
       return;
     }
 
-    this.lastCommittedId = run.last_committed_cursor;
+    // Check Redis first for last committed cursor (hot-path authority)
+    const redisCursor = await this.deps.redisState.getLastCommittedCursor(runId).catch(() => null);
+    this.lastCommittedId = redisCursor ?? run.last_committed_cursor;
 
     // Derive cursor from highest done batch as fallback (handles crash between
     // updateBatchStatus("done") and updateRunLastCommittedCursor)
@@ -842,6 +878,44 @@ export class BatchRunner {
       },
       "Resuming from last committed position",
     );
+  }
+
+  /** Update the live batch phase in Redis with heartbeat. */
+  private async setPhase(phase: BatchPhase, stats: { docsRead: number; rowsToInsert: number }): Promise<void> {
+    const { collectionName, podId, rangeIdx } = this.deps.config;
+    if (!collectionName) return;
+
+    this.currentPhaseData = {
+      collection: collectionName,
+      podId: podId ?? "unknown",
+      batchSeq: this.batchSeq,
+      phase,
+      docsRead: stats.docsRead,
+      rowsToInsert: stats.rowsToInsert,
+      startedAt: Date.now(),
+      rangeIdx,
+    };
+
+    await this.bestEffortRedis(
+      () => this.deps.redisState.setLiveBatch(collectionName, this.currentPhaseData!),
+      "Redis setLiveBatch failed",
+    );
+  }
+
+  private startPhaseHeartbeat(): void {
+    this.stopPhaseHeartbeat();
+    this.phaseHeartbeatTimer = setInterval(() => {
+      if (this.currentPhaseData && this.deps.config.collectionName) {
+        this.deps.redisState.setLiveBatch(this.deps.config.collectionName, this.currentPhaseData).catch(() => {});
+      }
+    }, 10_000);
+  }
+
+  private stopPhaseHeartbeat(): void {
+    if (this.phaseHeartbeatTimer) {
+      clearInterval(this.phaseHeartbeatTimer);
+      this.phaseHeartbeatTimer = null;
+    }
   }
 
   /**

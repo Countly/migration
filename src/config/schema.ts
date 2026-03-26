@@ -59,6 +59,9 @@ export const configSchema = z.object({
         mongoPageSize: positiveIntFromEnv.default(10_000),
         cursorBatchSize: positiveIntFromEnv.default(10_000),
         maxTimeMs: positiveIntFromEnv.default(600_000),
+        rangeParallelThreshold: intFromEnv.default(500_000),
+        rangeCount: positiveIntFromEnv.default(100),
+        rangeLeaseTtlSec: positiveIntFromEnv.default(300),
     }),
 
     // ── Transform ────────────────────────────────────────────────────────
@@ -108,6 +111,23 @@ export const configSchema = z.object({
         gcRssHardLimitMb: intFromEnv.default(6_144),
         gcHeapUsedRatio: numberFromEnv.default(0.70),
         gcEveryNBatches: intFromEnv.default(50),
+    }),
+
+    // ── Worker / Multi-Pod ──────────────────────────────────────────────
+    worker: z.object({
+        podId: z.string().default(""),
+        enabled: booleanFromEnv.default(true),
+        lockTtlSec: positiveIntFromEnv.default(300),
+        lockRenewMs: positiveIntFromEnv.default(60_000),
+        progressUpdateMs: positiveIntFromEnv.default(5_000),
+        podHeartbeatMs: positiveIntFromEnv.default(30_000),
+        podDeadAfterSec: positiveIntFromEnv.default(180),
+    }),
+
+    // ── Async Write ──────────────────────────────────────────────────────
+    asyncWrite: z.object({
+        flushIntervalMs: positiveIntFromEnv.default(5_000),
+        flushBatchSize: positiveIntFromEnv.default(10),
     }),
 
     // ── Logging ──────────────────────────────────────────────────────────

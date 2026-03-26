@@ -4,9 +4,11 @@ import type { Run } from '../state/manifest-store.ts';
 import type { RunnerStatus } from '../runtime/batch-runner.ts';
 import type { GcTelemetry } from '../runtime/gc-controller.ts';
 import type { ProcessMetricsSnapshot } from '../runtime/process-metrics.ts';
-import type { CommandFlags } from '../state/redis-hot-state.ts';
+import type { CommandFlags, LiveBatchData, RangeLiveStats } from '../state/redis-hot-state.ts';
 import type { Config } from '../config/schema.ts';
 import type { CollectionOrchestrator, OrchestratorProgress } from '../runtime/collection-orchestrator.ts';
+import type { GlobalProgress, CollectionProgress, PodInfo } from '../state/global-progress.ts';
+import type { CollectionLock, LockInfo } from '../state/collection-lock.ts';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Formatting helpers
@@ -46,6 +48,8 @@ export interface StatsDeps {
     getBitmapCount(runId: string): Promise<number>;
     getCommands(runId: string): Promise<CommandFlags>;
     getMetrics(): { lastStateWriteMs: number; lastError: string | null };
+    getAllLiveBatches(): Promise<LiveBatchData[]>;
+    getRangeLiveStats(collection: string): Promise<RangeLiveStats[]>;
   };
   gcController: { getTelemetry(): GcTelemetry };
   processMetrics: { snapshot(): ProcessMetricsSnapshot };
@@ -53,6 +57,8 @@ export interface StatsDeps {
   config: Config;
   startedAt: Date;
   version: string;
+  globalProgress?: GlobalProgress;
+  collectionLock?: CollectionLock;
 }
 
 export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void {
@@ -142,6 +148,96 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
 
     const redisMetrics = redisState.getMetrics();
 
+    // ── Cluster data (multi-pod mode) ─────────────────────────────────
+    let clusterData: {
+      podCount: number;
+      pods: PodInfo[];
+      locks: LockInfo[];
+      globalCommands: { pause: boolean; stop: boolean };
+      collectionProgress: CollectionProgress[];
+    } | null = null;
+
+    if (deps.globalProgress) {
+      try {
+        const [allProgress, allPods, allLocks, globalCmds] = await Promise.all([
+          deps.globalProgress.getAllCollectionProgress(),
+          deps.globalProgress.getAllPods(),
+          deps.collectionLock?.listAllLocks() ?? Promise.resolve([]),
+          deps.globalProgress.getGlobalCommands(),
+        ]);
+        clusterData = {
+          podCount: allPods.length,
+          pods: allPods,
+          locks: allLocks,
+          globalCommands: globalCmds,
+          collectionProgress: allProgress,
+        };
+      } catch {
+        // best-effort
+      }
+    }
+
+    // ── Live batches from Redis ──────────────────────────────────────
+    let liveBatches: LiveBatchData[] = [];
+    try {
+      liveBatches = await redisState.getAllLiveBatches();
+    } catch {
+      // best-effort
+    }
+
+    // Merge cluster progress with local data for comprehensive collection status
+    const mergedCollectionProgress = progress.collections.map(collection => {
+      const localResult = progress.results.find(r => r.collection === collection);
+      const remote = clusterData?.collectionProgress.find(p => p.collectionName === collection);
+
+      // Local "skipped" means another pod completed it — use remote data for attribution
+      if (localResult && localResult.status === 'skipped' && remote) {
+        return {
+          collection,
+          status: remote.status as string,
+          runId: remote.runId || null,
+          estimated: remote.estimatedTotal ?? estimatedCounts.get(collection) ?? null,
+          docsRead: remote.docsRead ?? null,
+          rowsInserted: remote.rowsInserted ?? null,
+          podId: remote.podId,
+        };
+      }
+      // Local result takes priority for non-skipped statuses
+      if (localResult) {
+        return {
+          collection,
+          status: localResult.status,
+          runId: localResult.runId || null,
+          estimated: estimatedCounts.get(collection) ?? null,
+          docsRead: localResult.docsRead ?? null,
+          rowsInserted: localResult.rowsInserted ?? null,
+          podId: config.worker.podId,
+        };
+      }
+      // Check cluster progress from other pods
+      if (remote) {
+        return {
+          collection,
+          status: remote.status,
+          runId: remote.runId || null,
+          estimated: remote.estimatedTotal ?? null,
+          docsRead: remote.docsRead ?? null,
+          rowsInserted: remote.rowsInserted ?? null,
+          podId: remote.podId,
+        };
+      }
+      // No data yet
+      return {
+        collection,
+        status: "pending" as const,
+        runId: null,
+        estimated: estimatedCounts.get(collection) ?? null,
+        docsRead: null,
+        rowsInserted: null,
+        podId: null,
+      };
+    });
+
     const payload = {
       // ── Quick-glance summary ──────────────────────────────────────────
       summary: {
@@ -192,14 +288,7 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
         skippedCollections: progress.skippedCollections,
         currentCollection: progress.currentCollection,
         collections: progress.collections,
-        collectionProgress: progress.results.map(r => ({
-          collection: r.collection,
-          status: r.status,
-          runId: r.runId || null,
-          estimated: estimatedCounts.get(r.collection) ?? null,
-          docsRead: r.docsRead ?? null,
-          rowsInserted: r.rowsInserted ?? null,
-        })),
+        collectionProgress: mergedCollectionProgress,
       },
       run: {
         sourceNs: runRecord?.source_ns ?? null,
@@ -259,6 +348,39 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
         stopAfterBatchRequested: !!(commands.abort ?? commands.stopAfterBatch),
         gcRequested: !!(commands.gc),
       },
+      // ── Live batches + range progress ───────────────────────────────
+      liveBatches,
+      cluster: clusterData ? {
+        ...clusterData,
+        pods: clusterData.pods.map(pod => {
+          // Aggregate per-pod stats from merged collection progress
+          const podCollections = mergedCollectionProgress.filter(c => c.podId === pod.podId);
+          return {
+            ...pod,
+            stats: {
+              collectionsCompleted: podCollections.filter(c => c.status === 'completed' || c.status === 'skipped').length,
+              docsRead: podCollections.reduce((s, c) => s + (c.docsRead ?? 0), 0),
+              rowsInserted: podCollections.reduce((s, c) => s + (c.rowsInserted ?? 0), 0),
+            },
+          };
+        }),
+        stalePods: clusterData.locks
+          .map(l => l.podId)
+          .filter(podId => !clusterData!.pods.some(p => p.podId === podId))
+          .filter((v, i, a) => a.indexOf(v) === i),
+      } : null,
+      clusterProgress: clusterData ? (() => {
+        const done = mergedCollectionProgress.filter(c => c.status === 'completed' || c.status === 'skipped').length;
+        const failed = mergedCollectionProgress.filter(c => c.status === 'failed').length;
+        const processing = mergedCollectionProgress.filter(c => c.status === 'processing').length;
+        const pending = mergedCollectionProgress.filter(c => c.status === 'pending').length;
+        const total = progress.totalCollections || mergedCollectionProgress.length;
+        const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+        const docsRead = mergedCollectionProgress.reduce((s, c) => s + (c.docsRead ?? 0), 0);
+        const rowsInserted = mergedCollectionProgress.reduce((s, c) => s + (c.rowsInserted ?? 0), 0);
+        const estimated = mergedCollectionProgress.reduce((s, c) => s + (c.estimated ?? 0), 0);
+        return { total, done, failed, processing, pending, pct, docsRead, rowsInserted, estimated };
+      })() : null,
     };
 
     return reply.status(200).send(payload);

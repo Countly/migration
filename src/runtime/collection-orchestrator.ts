@@ -11,6 +11,10 @@ import { resolveRun } from "./resolve-run.ts";
 import { discoverCollections } from "../source/discover-collections.ts";
 import type { HashResolver } from "../transform/hash-resolver.ts";
 import type { Config } from "../config/schema.ts";
+import type { CollectionLock } from "../state/collection-lock.ts";
+import type { GlobalProgress, CollectionProgress } from "../state/global-progress.ts";
+import type { AsyncBatchWriter } from "../state/async-batch-writer.ts";
+import { RangeCoordinator } from "./range-coordinator.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -64,6 +68,9 @@ export interface OrchestratorDeps {
     hashResolver: HashResolver;
     logger: Logger;
     config: Config;
+    collectionLock?: CollectionLock;
+    globalProgress?: GlobalProgress;
+    asyncBatchWriter?: AsyncBatchWriter;
 }
 
 // ---------------------------------------------------------------------------
@@ -96,40 +103,66 @@ export class CollectionOrchestrator {
     // -----------------------------------------------------------------------
 
     async run(): Promise<OrchestratorResult> {
-        const { mongoReader, manifestStore, config } = this.deps;
+        const { mongoReader, manifestStore, config, collectionLock, globalProgress } = this.deps;
 
         // 1. Discover collections
         const db = mongoReader.getDatabase();
         this.discoveredCollections = await discoverCollections(db, config.source.collectionPrefix, this.logger);
 
         this.logger.info(
-            { totalCollections: this.discoveredCollections.length },
+            { totalCollections: this.discoveredCollections.length, multiPod: !!collectionLock },
             "Starting migration with index-aware scheduling",
         );
 
-        // 2. Start all index checks in background (non-blocking)
+        // 2. Start lock heartbeat (multi-pod mode)
+        collectionLock?.startHeartbeat();
+
+        // 3. Start all index checks in background (non-blocking)
         this.startBackgroundIndexInit();
 
         this.orchestratorStatus = "running";
 
-        // 3. Process loop: pick ready collections, wait for building ones
+        // 4. Process loop: pick ready collections, wait for building ones
         while (!this.stopping) {
+            // Check global commands (multi-pod mode)
+            if (globalProgress) {
+                try {
+                    const globalCmds = await globalProgress.getGlobalCommands();
+                    if (globalCmds.stop) {
+                        this.logger.info("Global stop command received");
+                        this.stopping = true;
+                        break;
+                    }
+                    if (globalCmds.pause) {
+                        this.currentBatchRunner?.pause();
+                    }
+                } catch {
+                    // best-effort
+                }
+            }
+
             const completed = new Set(this.results.map(r => r.collection));
 
-            // Find next collection with index ready and not yet processed
-            const next = this.findNextReadyCollection(completed);
+            // Find next collection with index ready, not yet processed, and not locked by another pod
+            const next = await this.findNextReadyCollection(completed);
 
             if (next) {
                 this.orchestratorStatus = "running";
                 const sourceNs = `${config.source.db}.${next}`;
                 const targetTable = `${config.target.db}.${config.target.table}`;
 
-                // Check if already completed (resume mode)
-                const alreadyCompleted = await manifestStore.existsCompletedRun(sourceNs, targetTable);
-                if (alreadyCompleted) {
-                    this.logger.info({ collection: next, sourceNs }, "Collection already migrated, skipping");
-                    this.results.push({ collection: next, sourceNs, runId: "", status: "skipped" });
-                    continue;
+                // Check if range-parallel (uses cached estimate from isRangeParallelCandidate or fresh query)
+                const isRangeParallel = await this.isRangeParallelCandidate(next);
+
+                // For range-parallel: check if ranges are all done (not existsCompletedRun)
+                // For standard: check if already completed
+                if (!isRangeParallel) {
+                    const alreadyCompleted = await manifestStore.existsCompletedRun(sourceNs, targetTable);
+                    if (alreadyCompleted) {
+                        this.logger.info({ collection: next, sourceNs }, "Collection already migrated, skipping");
+                        this.results.push({ collection: next, sourceNs, runId: "", status: "skipped" });
+                        continue;
+                    }
                 }
 
                 // Process this collection
@@ -149,6 +182,11 @@ export class CollectionOrchestrator {
                     const error = err instanceof Error ? err.message : String(err);
                     this.logger.error({ collection: next, error }, "Unexpected error migrating collection");
                     this.results.push({ collection: next, sourceNs, runId: "", status: "failed", error });
+                } finally {
+                    // Explicitly release collection lock (normal path, only for non-range-parallel)
+                    if (!isRangeParallel) {
+                        await collectionLock?.release(next).catch(() => {});
+                    }
                 }
                 continue;
             }
@@ -161,11 +199,26 @@ export class CollectionOrchestrator {
                 this.orchestratorStatus = "waiting_for_index";
                 this.logger.info(
                     { checking: counts.checking, building: counts.building, ready: counts.ready },
-                    "Waiting for index creation — rechecking in 60s",
+                    "Waiting for index creation — rechecking in 10s",
                 );
                 await this.interruptibleSleep(10_000);
                 await this.recheckBuildingIndexes();
                 continue;
+            }
+
+            // In multi-pod mode, remaining collections may be locked by other pods — wait and retry
+            if (collectionLock) {
+                const remaining = this.discoveredCollections.filter(
+                    name => !completed.has(name) && this.indexStatus.get(name) === "ready",
+                );
+                if (remaining.length > 0) {
+                    this.logger.info(
+                        { lockedByOthers: remaining.length },
+                        "Remaining collections locked by other pods, waiting 10s",
+                    );
+                    await this.interruptibleSleep(10_000);
+                    continue;
+                }
             }
 
             // All done (or all failed/skipped)
@@ -176,6 +229,10 @@ export class CollectionOrchestrator {
         this.currentRunId = null;
         this.currentBatchRunner = null;
         this.orchestratorStatus = "completed";
+
+        // Cleanup multi-pod resources
+        collectionLock?.stopHeartbeat();
+        await collectionLock?.releaseAll().catch(() => {});
 
         // Summary
         const summary: OrchestratorResult = {
@@ -375,20 +432,47 @@ export class CollectionOrchestrator {
         return { ready, building, failed, checking, total: this.discoveredCollections.length };
     }
 
-    private findNextReadyCollection(completed: Set<string>): string | null {
+    private async findNextReadyCollection(completed: Set<string>): Promise<string | null> {
         const prefix = this.deps.config.source.collectionPrefix;
+        const { collectionLock, config, mongoReader } = this.deps;
+        const rpThreshold = config.source.rangeParallelThreshold;
 
         // Always prefer the base collection (drill_events) when it becomes ready
         if (!completed.has(prefix) && this.indexStatus.get(prefix) === "ready") {
-            return prefix;
+            // Check if range-parallel (skip locking — RangeCoordinator handles atomicity)
+            if (await this.isRangeParallelCandidate(prefix)) return prefix;
+            if (!collectionLock || (await collectionLock.tryAcquire(prefix)) !== "locked") {
+                return prefix;
+            }
         }
 
-        // Otherwise pick any ready collection in discovery order
+        // Otherwise pick any ready, unlocked collection in discovery order
         for (const name of this.discoveredCollections) {
             if (completed.has(name)) continue;
-            if (this.indexStatus.get(name) === "ready") return name;
+            if (this.indexStatus.get(name) !== "ready") continue;
+            // Range-parallel collections skip locking
+            if (await this.isRangeParallelCandidate(name)) return name;
+            if (collectionLock && (await collectionLock.tryAcquire(name)) === "locked") continue;
+            return name;
         }
         return null;
+    }
+
+    /** Check if a collection qualifies for range-parallel (cached or fresh query).
+     *  Uses getDatabase() directly to avoid mutating the shared MongoReader cursor. */
+    private async isRangeParallelCandidate(collectionName: string): Promise<boolean> {
+        const rpThreshold = this.deps.config.source.rangeParallelThreshold;
+        let est = this.estimatedCounts.get(collectionName);
+        if (est === undefined) {
+            try {
+                const db = this.deps.mongoReader.getDatabase();
+                est = await db.collection(collectionName).estimatedDocumentCount();
+                this.estimatedCounts.set(collectionName, est);
+            } catch {
+                return false;
+            }
+        }
+        return est >= rpThreshold;
     }
 
     private getCollectionsWithStatus(status: IndexBuildStatus): string[] {
@@ -441,8 +525,8 @@ export class CollectionOrchestrator {
         // Switch MongoReader to this collection (index already confirmed ready)
         await mongoReader.switchCollection(collectionName);
 
-        // Get estimated document count for progress tracking
-        const estimatedCount = await mongoReader.getEstimatedCount();
+        // Use cached estimated count (populated by main loop or isRangeParallelCandidate)
+        const estimatedCount = this.estimatedCounts.get(collectionName) ?? await mongoReader.getEstimatedCount();
         this.estimatedCounts.set(collectionName, estimatedCount);
         this.logger.info({ collection: collectionName, estimatedCount }, "Estimated document count");
 
@@ -463,6 +547,104 @@ export class CollectionOrchestrator {
                 "No hash match found for collection — documents missing a/e will be skipped",
             );
         }
+
+        // ── Range-parallel mode for large collections ─────────────────
+        if (estimatedCount >= config.source.rangeParallelThreshold) {
+            this.logger.info(
+                { collection: collectionName, estimatedCount, threshold: config.source.rangeParallelThreshold },
+                "Collection exceeds range-parallel threshold — using range splitting",
+            );
+
+            const redisClient = this.deps.redisState.getRedisClient();
+            const coordinator = new RangeCoordinator({
+                redis: redisClient,
+                manifestStore,
+                redisState: this.deps.redisState,
+                asyncBatchWriter: this.deps.asyncBatchWriter,
+                mongoReader,
+                chWriter,
+                chPressure,
+                gcController,
+                retryPolicy,
+                logger: this.deps.logger,
+                config: {
+                    collectionName,
+                    sourceNs,
+                    targetTable,
+                    transformVersion: config.transform.version,
+                    rangeCount: config.source.rangeCount,
+                    rangeLeaseTtlSec: config.source.rangeLeaseTtlSec,
+                    batchRowsTarget: config.source.batchRowsTarget,
+                    mongoPageSize: config.source.mongoPageSize,
+                    backpressure: config.backpressure,
+                    useDedupToken: config.target.useDedupToken,
+                    database: config.target.db,
+                    table: config.target.table,
+                    snapshotInterval: config.state.timelineSnapshotInterval,
+                    collectionDefaults: collectionDefaults ?? undefined,
+                    podId: config.worker.podId,
+                    redisKeyPrefix: config.state.redisKeyPrefix,
+                },
+            });
+
+            // Progress updates for range-parallel mode
+            const rpStartedAt = new Date().toISOString();
+            const rpGlobalProgress = this.deps.globalProgress;
+            const rpProgressInterval = rpGlobalProgress
+                ? setInterval(async () => {
+                    const status = await coordinator.getRangeStatus().catch(() => ({ pending: 0, processing: 0, done: 0, failed: 0 }));
+                    rpGlobalProgress.updateCollectionProgress({
+                        collectionName,
+                        podId: config.worker.podId,
+                        status: "processing",
+                        runId: "",
+                        docsRead: 0,
+                        rowsInserted: 0,
+                        estimatedTotal: estimatedCount,
+                        batchSeq: status.done,
+                        startedAt: rpStartedAt,
+                        updatedAt: new Date().toISOString(),
+                        isRangeParallel: true,
+                        rangeCount: config.source.rangeCount,
+                    }).catch(() => {});
+                }, config.worker.progressUpdateMs)
+                : null;
+
+            try {
+                const rangeResult = await coordinator.run();
+
+                if (rpProgressInterval) clearInterval(rpProgressInterval);
+                const rpStatus = rangeResult.failedRanges > 0 ? "failed" as const : "completed" as const;
+                await rpGlobalProgress?.updateCollectionProgress({
+                    collectionName,
+                    podId: config.worker.podId,
+                    status: rpStatus,
+                    runId: rangeResult.runId,
+                    docsRead: rangeResult.totalDocsRead,
+                    rowsInserted: rangeResult.totalRowsInserted,
+                    estimatedTotal: estimatedCount,
+                    batchSeq: rangeResult.completedRanges,
+                    startedAt: rpStartedAt,
+                    updatedAt: new Date().toISOString(),
+                    isRangeParallel: true,
+                    rangeCount: config.source.rangeCount,
+                }).catch(() => {});
+
+                return {
+                    collection: collectionName,
+                    sourceNs,
+                    runId: rangeResult.runId,
+                    status: rangeResult.failedRanges > 0 ? "failed" : "completed",
+                    docsRead: rangeResult.totalDocsRead,
+                    rowsInserted: rangeResult.totalRowsInserted,
+                    error: rangeResult.failedRanges > 0 ? `${rangeResult.failedRanges} ranges failed` : undefined,
+                };
+            } finally {
+                if (rpProgressInterval) clearInterval(rpProgressInterval);
+            }
+        }
+
+        // ── Standard single-pod mode ─────────────────────────────────
 
         // Create per-collection RedisHotState with isolated key prefix
         const redisClient = this.deps.redisState.getRedisClient();
@@ -500,6 +682,7 @@ export class CollectionOrchestrator {
         const batchRunner = new BatchRunner({
             manifestStore,
             redisState,
+            asyncBatchWriter: this.deps.asyncBatchWriter,
             mongoReader,
             chWriter,
             chPressure,
@@ -520,10 +703,33 @@ export class CollectionOrchestrator {
                 table: config.target.table,
                 snapshotInterval: config.state.timelineSnapshotInterval,
                 collectionDefaults: collectionDefaults ?? undefined,
+                collectionName,
+                podId: config.worker.podId,
             },
         });
 
         this.currentBatchRunner = batchRunner;
+
+        // Start periodic progress updates (multi-pod mode)
+        const { globalProgress } = this.deps;
+        const progressStartedAt = new Date().toISOString();
+        const progressInterval = globalProgress
+            ? setInterval(() => {
+                const stats = batchRunner.getStats();
+                globalProgress.updateCollectionProgress({
+                    collectionName,
+                    podId: config.worker.podId,
+                    status: "processing",
+                    runId,
+                    docsRead: stats.totalDocsRead,
+                    rowsInserted: stats.totalRowsInserted,
+                    estimatedTotal: estimatedCount,
+                    batchSeq: stats.batchSeq,
+                    startedAt: progressStartedAt,
+                    updatedAt: new Date().toISOString(),
+                }).catch(() => {}); // best-effort
+            }, config.worker.progressUpdateMs)
+            : null;
 
         // Run the batch processing
         try {
@@ -531,6 +737,22 @@ export class CollectionOrchestrator {
 
             const finalStatus = batchRunner.getStatus();
             const finalStats = batchRunner.getStats();
+
+            // Write final progress to Redis
+            const terminalStatus = finalStatus === "completed" ? "completed" as const : "failed" as const;
+            await globalProgress?.updateCollectionProgress({
+                collectionName,
+                podId: config.worker.podId,
+                status: terminalStatus,
+                runId,
+                docsRead: finalStats.totalDocsRead,
+                rowsInserted: finalStats.totalRowsInserted,
+                estimatedTotal: estimatedCount,
+                batchSeq: finalStats.batchSeq,
+                startedAt: progressStartedAt,
+                updatedAt: new Date().toISOString(),
+            }).catch(() => {});
+
             if (finalStatus === "completed") {
                 return {
                     collection: collectionName, sourceNs, runId, status: "completed",
@@ -553,6 +775,19 @@ export class CollectionOrchestrator {
             };
         } catch (err) {
             const error = err instanceof Error ? err.message : String(err);
+            await globalProgress?.updateCollectionProgress({
+                collectionName,
+                podId: config.worker.podId,
+                status: "failed",
+                runId,
+                docsRead: 0,
+                rowsInserted: 0,
+                estimatedTotal: estimatedCount,
+                batchSeq: 0,
+                startedAt: progressStartedAt,
+                updatedAt: new Date().toISOString(),
+                error,
+            }).catch(() => {});
             await manifestStore.insertEvent({
                 run_id: runId,
                 event_type: "collection_migration_failed",
@@ -561,6 +796,8 @@ export class CollectionOrchestrator {
                 created_at: new Date().toISOString(),
             });
             return { collection: collectionName, sourceNs, runId, status: "failed", error };
+        } finally {
+            if (progressInterval) clearInterval(progressInterval);
         }
     }
 }

@@ -9,6 +9,9 @@ import { ClickHouseWriter } from './target/clickhouse-writer.ts';
 import { ClickHousePressure } from './target/clickhouse-pressure.ts';
 import { CollectionOrchestrator } from './runtime/collection-orchestrator.ts';
 import { HashResolver } from './transform/hash-resolver.ts';
+import { CollectionLock } from './state/collection-lock.ts';
+import { GlobalProgress } from './state/global-progress.ts';
+import { AsyncBatchWriter } from './state/async-batch-writer.ts';
 import { RetryPolicy } from './runtime/retry-policy.ts';
 import { GcController, type GcConfig } from './runtime/gc-controller.ts';
 import { ProcessMetricsCollector } from './runtime/process-metrics.ts';
@@ -126,7 +129,48 @@ async function main(): Promise<void> {
   }
   logger.info('All external services connected');
 
-  // ── 4b. Build hash resolver for drill_events* collection defaults ────
+  // ── 4b. Multi-pod coordination (optional) ────────────────────────────
+  let collectionLock: CollectionLock | undefined;
+  let globalProgress: GlobalProgress | undefined;
+
+  if (config.worker.enabled) {
+    const redisClient = redisState.getRedisClient();
+    const podId = config.worker.podId;
+
+    collectionLock = new CollectionLock(
+      redisClient,
+      podId,
+      {
+        lockTtlSec: config.worker.lockTtlSec,
+        renewIntervalMs: config.worker.lockRenewMs,
+        podHeartbeatMs: config.worker.podHeartbeatMs,
+        podDeadAfterSec: config.worker.podDeadAfterSec,
+        keyPrefix: config.state.redisKeyPrefix,
+      },
+      logger,
+    );
+
+    globalProgress = new GlobalProgress(
+      redisClient,
+      podId,
+      config.state.redisKeyPrefix,
+      logger,
+    );
+
+    logger.info({ podId, multiPod: true }, 'Multi-pod mode enabled');
+  }
+
+  // ── 4b2. Async batch writer ──────────────────────────────────────────
+  const asyncBatchWriter = new AsyncBatchWriter(
+    manifestStore,
+    redisState,
+    config.asyncWrite,
+    logger,
+  );
+  asyncBatchWriter.startPeriodicFlush();
+  logger.info({ flushIntervalMs: config.asyncWrite.flushIntervalMs, flushBatchSize: config.asyncWrite.flushBatchSize }, 'AsyncBatchWriter started');
+
+  // ── 4c. Build hash resolver for drill_events* collection defaults ────
   const hashResolver = new HashResolver(
     { uri: config.source.uri, countlyDb: config.source.countlyDb },
     logger,
@@ -146,6 +190,9 @@ async function main(): Promise<void> {
     hashResolver,
     logger,
     config,
+    collectionLock,
+    globalProgress,
+    asyncBatchWriter,
   });
 
   // ── 6. Create Fastify HTTP server and register routes ───────────────
@@ -171,6 +218,8 @@ async function main(): Promise<void> {
     config,
     startedAt,
     version: SERVICE_VERSION,
+    globalProgress,
+    collectionLock,
   });
 
   registerControlRoutes(app, {
@@ -179,6 +228,8 @@ async function main(): Promise<void> {
     manifestStore,
     mongoReader,
     chWriter,
+    globalProgress,
+    collectionLock,
   });
 
   registerRunRoutes(app, {
@@ -243,6 +294,11 @@ async function main(): Promise<void> {
       catch (err) { logger.warn({ err }, `Error closing ${name}`); }
     }
 
+    if (collectionLock) {
+      collectionLock.stopHeartbeat();
+      await closeResource('CollectionLocks', () => collectionLock!.releaseAll());
+    }
+    await closeResource('AsyncBatchWriter', () => asyncBatchWriter.drainAndStop());
     await closeResource('HTTP server', () => app.close());
     await closeResource('MongoDB', () => mongoReader.close());
     await closeResource('ClickHouse', async () => { await chWriter.close(); await pressureClient.close(); });

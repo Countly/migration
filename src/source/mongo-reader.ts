@@ -154,6 +154,27 @@ export class MongoReader {
     return upperBound;
   }
 
+  async getLowerBound(): Promise<Cursor | null> {
+    this.ensureConnected();
+
+    const result = await this.collection!
+      .find({})
+      .sort({ cd: 1, _id: 1 })
+      .hint({ cd: 1, _id: 1 })
+      .limit(1)
+      .project({ cd: 1, _id: 1 })
+      .maxTimeMS(this.config.maxTimeMs)
+      .toArray();
+
+    if (result.length === 0) {
+      return null;
+    }
+
+    const lowerBound: Cursor = { cd: cdToEpoch(result[0].cd), id: String(result[0]._id) };
+    this.logger.info({ lowerBound }, "Determined lower bound cursor");
+    return lowerBound;
+  }
+
   async getEstimatedCount(): Promise<number> {
     this.ensureConnected();
 
