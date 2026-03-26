@@ -149,7 +149,7 @@ export class AsyncBatchWriter {
         }
 
         try {
-            // Bulk insert batch records
+            // Bulk upsert batch records (handles duplicates via update)
             await this.manifestStore.bulkInsertBatches(batchDocs);
 
             // Advance cursor to latest position
@@ -160,6 +160,7 @@ export class AsyncBatchWriter {
                 "Async flush completed",
             );
         } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
             // Re-queue failed items (capped to prevent unbounded growth)
             const maxDepth = this.config.maxQueueDepth ?? 1000;
             const totalAfterRequeue = this.queue.length + items.length;
@@ -174,7 +175,7 @@ export class AsyncBatchWriter {
                 );
             }
             this.logger.warn(
-                { error: err instanceof Error ? err.message : String(err), count: items.length, queueDepth: this.queue.length },
+                { error: errMsg, count: items.length, queueDepth: this.queue.length },
                 "Async flush to MongoDB failed, re-queued",
             );
         } finally {

@@ -111,6 +111,9 @@ export async function resolveRun(opts: ResolveRunOpts): Promise<ResolvedRun> {
         const upperBoundId = serializeCursor(upperBound);
         const activeRun = await manifestStore.getActiveRun(sourceNs, targetTable);
         if (activeRun) {
+            // Clean old run data before starting fresh
+            const deleted = await manifestStore.deleteRunData(activeRun.run_id);
+            logger.info({ oldRunId: activeRun.run_id, deletedRecords: deleted }, 'Cleaned old run data for fresh start');
             await manifestStore.updateRunStatus(activeRun.run_id, 'completed');
         }
         await createNewRun(runId, upperBoundId);
@@ -123,6 +126,9 @@ export async function resolveRun(opts: ResolveRunOpts): Promise<ResolvedRun> {
         if (!activeRun) throw new Error('No existing run to clone from');
         const runId = randomUUID();
         const upperBoundId = activeRun.upper_bound_cursor;
+        // Clean old run data before starting fresh
+        const deleted = await manifestStore.deleteRunData(activeRun.run_id);
+        logger.info({ oldRunId: activeRun.run_id, deletedRecords: deleted }, 'Cleaned old run data for fresh start');
         await manifestStore.updateRunStatus(activeRun.run_id, 'completed');
         await createNewRun(runId, upperBoundId);
         logger.info({ runId, upperBoundId, sourceNs, targetTable }, 'Created new migration run (clone-run mode)');

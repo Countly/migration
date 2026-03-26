@@ -11,6 +11,7 @@ export interface LockInfo {
     collectionName: string;
     podId: string;
     acquiredAt: string;
+    ttlSec: number;
 }
 
 export interface CollectionLockConfig {
@@ -224,12 +225,20 @@ export class CollectionLock {
         }
         if (keys.length === 0) return [];
 
-        const values = await this.redis.mget(...keys);
+        // Fetch values and TTLs in parallel via pipeline
+        const pipeline = this.redis.pipeline();
+        for (const key of keys) {
+            pipeline.get(key);
+            pipeline.ttl(key);
+        }
+        const results = await pipeline.exec();
+
         const prefix = `${this.config.keyPrefix}:lock:`;
         const locks: LockInfo[] = [];
 
         for (let i = 0; i < keys.length; i++) {
-            const val = values[i];
+            const val = results?.[i * 2]?.[1] as string | null;
+            const ttl = results?.[i * 2 + 1]?.[1] as number ?? -1;
             if (!val) continue;
             try {
                 const data = JSON.parse(val) as { podId: string; acquiredAt: string };
@@ -237,6 +246,7 @@ export class CollectionLock {
                     collectionName: keys[i].slice(prefix.length),
                     podId: data.podId,
                     acquiredAt: data.acquiredAt,
+                    ttlSec: ttl,
                 });
             } catch {
                 // skip malformed entries

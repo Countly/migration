@@ -6,6 +6,7 @@ import type { MongoReader } from '../source/mongo-reader.ts';
 import type { ClickHouseWriter } from '../target/clickhouse-writer.ts';
 import type { GlobalProgress } from '../state/global-progress.ts';
 import type { CollectionLock } from '../state/collection-lock.ts';
+import type { RedisHotState } from '../state/redis-hot-state.ts';
 import { transformBatch } from '../transform/normalize.ts';
 import { SkipCounter } from '../transform/skip-reasons.ts';
 import { deserializeCursor } from '../types/cursor.ts';
@@ -28,6 +29,7 @@ export interface ControlDeps {
   chWriter: ClickHouseWriter;
   globalProgress?: GlobalProgress;
   collectionLock?: CollectionLock;
+  redisState?: RedisHotState;
 }
 
 interface GcRequestBody {
@@ -302,5 +304,57 @@ export function registerControlRoutes(app: FastifyInstance, deps: ControlDeps): 
   app.post('/control/drain', async (_request, reply) => {
     orchestrator.stopAfterBatch();
     return reply.status(200).send({ ok: true, message: 'Drain initiated — finishing current batch then releasing locks' });
+  });
+
+  // ── DANGER ZONE ────────────────────────────────────────────────────
+
+  // POST /control/danger/clear-mongodb - drop all migration state from MongoDB
+  app.post('/control/danger/clear-mongodb', async (_request, reply) => {
+    const { manifestStore: ms } = deps;
+    try {
+      const runs = await ms.listRuns({ limit: 1000 });
+      let totalDeleted = 0;
+      for (const run of runs.runs) {
+        totalDeleted += await ms.deleteRunData(run.run_id);
+      }
+      // Also delete the run records themselves
+      const db = (ms as any).client.db((ms as any).dbName);
+      const runResult = await db.collection('mig_runs').deleteMany({});
+      totalDeleted += runResult.deletedCount ?? 0;
+      return reply.status(200).send({
+        ok: true,
+        message: `Cleared MongoDB migration state: ${totalDeleted} records deleted`,
+        deletedRecords: totalDeleted,
+      });
+    } catch (err) {
+      return reply.status(500).send({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // POST /control/danger/clear-redis - flush all migration keys from Redis
+  app.post('/control/danger/clear-redis', async (_request, reply) => {
+    const { redisState: rs } = deps;
+    if (!rs) {
+      return reply.status(400).send({ ok: false, error: 'Redis not available' });
+    }
+    try {
+      const redis = rs.getRedisClient();
+      const keys = await (async () => {
+        const found: string[] = [];
+        const stream = redis.scanStream({ match: 'mig:*', count: 500 });
+        for await (const batch of stream) found.push(...(batch as string[]));
+        return found;
+      })();
+      if (keys.length > 0) {
+        await redis.unlink(...keys);
+      }
+      return reply.status(200).send({
+        ok: true,
+        message: `Cleared Redis migration state: ${keys.length} keys deleted`,
+        deletedKeys: keys.length,
+      });
+    } catch (err) {
+      return reply.status(500).send({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
   });
 }

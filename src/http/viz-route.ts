@@ -295,7 +295,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   <h3 style="margin-top:12px">Active Locks <span id="lock-count" style="font-weight:400;color:var(--text2)"></span></h3>
   <div class="coll-scroll" style="max-height:160px">
     <table class="coll-table">
-      <thead><tr><th>Collection</th><th>Pod</th><th>Acquired</th><th>Action</th></tr></thead>
+      <thead><tr><th>Collection</th><th>Pod</th><th>Acquired</th><th>Expires In</th><th>Action</th></tr></thead>
       <tbody id="lock-body"></tbody>
     </table>
   </div>
@@ -346,6 +346,17 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Danger Zone -->
+<div class="card full" style="margin-top:24px;border-color:var(--red)">
+  <h3 style="color:var(--red)">Danger Zone</h3>
+  <p style="font-size:11px;color:var(--text2);margin-bottom:12px">These actions are irreversible and will destroy migration state. Use with caution.</p>
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <button class="btn" id="btn-clear-mongo" style="padding:6px 16px;font-size:12px;border-color:var(--red);color:var(--red)">Clear MongoDB State</button>
+    <button class="btn" id="btn-clear-redis" style="padding:6px 16px;font-size:12px;border-color:var(--red);color:var(--red)">Clear Redis State</button>
+  </div>
+  <div id="danger-msg" style="margin-top:8px;font-size:11px"></div>
+</div>
+
 <script>
 (function() {
   'use strict';
@@ -386,6 +397,30 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   $('btn-global-resume').addEventListener('click', function() { doControl('global/resume'); });
   $('btn-global-stop').addEventListener('click', function() { doControl('global/stop'); });
 
+  // Danger zone buttons
+  $('btn-clear-mongo').addEventListener('click', function() {
+    if (!confirm('WARNING: This will permanently delete ALL migration runs, batches, and events from MongoDB. This cannot be undone. Continue?')) return;
+    var msg = $('danger-msg');
+    fetch('/control/danger/clear-mongodb', { method: 'POST' })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        msg.textContent = d.ok ? 'MongoDB cleared: ' + d.deletedRecords + ' records deleted' : 'Error: ' + d.error;
+        msg.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+      })
+      .catch(function(e) { msg.textContent = 'Error: ' + e.message; msg.style.color = 'var(--red)'; });
+  });
+  $('btn-clear-redis').addEventListener('click', function() {
+    if (!confirm('WARNING: This will permanently delete ALL migration keys from Redis (cursors, bitmaps, live state, locks, heartbeats). This cannot be undone. Continue?')) return;
+    var msg = $('danger-msg');
+    fetch('/control/danger/clear-redis', { method: 'POST' })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        msg.textContent = d.ok ? 'Redis cleared: ' + d.deletedKeys + ' keys deleted' : 'Error: ' + d.error;
+        msg.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+      })
+      .catch(function(e) { msg.textContent = 'Error: ' + e.message; msg.style.color = 'var(--red)'; });
+  });
+
   function statusClass(s) {
     if (s === 'running' || s === 'stopping') return 'status-running';
     if (s === 'waiting_for_index') return 'status-waiting_for_index';
@@ -402,7 +437,6 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   }
 
   function truncHash(name) {
-    if (name && name.length > 50) return name.slice(0, 20) + '...' + name.slice(-8);
     return name || '-';
   }
 
@@ -421,6 +455,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       filtered = cp;
     }
 
+    filtered.sort(function(a, b) { return (b.estimated || 0) - (a.estimated || 0); });
     if (filtered.length > 200) filtered = filtered.slice(0, 200);
 
     var tbody = $('coll-body');
@@ -447,13 +482,9 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 
       // Collection name
       var td1 = document.createElement('td');
-      td1.style.maxWidth = '200px';
-      td1.style.overflow = 'hidden';
-      td1.style.textOverflow = 'ellipsis';
-      td1.style.whiteSpace = 'nowrap';
       td1.style.fontSize = '11px';
-      td1.setAttribute('title', c.collection || '');
-      td1.textContent = truncHash(c.collection);
+      td1.style.wordBreak = 'break-all';
+      td1.textContent = c.collection || '-';
       tr.appendChild(td1);
 
       // Status tag
@@ -841,7 +872,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
         if (locks.length === 0) {
           var noLockRow = document.createElement('tr');
           var noLockCell = document.createElement('td');
-          noLockCell.setAttribute('colspan', '4');
+          noLockCell.setAttribute('colspan', '5');
           noLockCell.className = 'muted';
           noLockCell.style.textAlign = 'center';
           noLockCell.textContent = 'No active locks';
@@ -864,6 +895,20 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
             lkTd3.style.cssText = 'font-size:10px;color:var(--text2)';
             lkTd3.textContent = lk.acquiredAt ? new Date(lk.acquiredAt).toLocaleTimeString() : '-';
             lkRow.appendChild(lkTd3);
+            var lkTdTtl = document.createElement('td');
+            lkTdTtl.style.cssText = 'font-size:10px;color:var(--text2)';
+            var ttl = lk.ttlSec;
+            if (ttl > 0) {
+              var ttlMin = Math.floor(ttl / 60);
+              var ttlSec = ttl % 60;
+              lkTdTtl.textContent = ttlMin > 0 ? ttlMin + 'm ' + ttlSec + 's' : ttlSec + 's';
+              if (ttl < 60) lkTdTtl.style.color = 'var(--red)';
+              else if (ttl < 120) lkTdTtl.style.color = 'var(--yellow)';
+            } else {
+              lkTdTtl.textContent = 'no TTL';
+              lkTdTtl.style.color = 'var(--red)';
+            }
+            lkRow.appendChild(lkTdTtl);
             var lkTd4 = document.createElement('td');
             var relBtn = document.createElement('button');
             relBtn.className = 'btn';

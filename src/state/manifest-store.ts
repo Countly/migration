@@ -357,7 +357,15 @@ export class ManifestStore {
         if (batchDocs.length === 0) return;
         const { batches } = this.ensureConnected();
         const start = performance.now();
-        await batches.insertMany(batchDocs, { ordered: false });
+        // Use upsert to handle duplicates — if (run_id, batch_seq) exists, update it
+        const ops = batchDocs.map(doc => ({
+            updateOne: {
+                filter: { run_id: doc.run_id, batch_seq: doc.batch_seq },
+                update: { $set: doc },
+                upsert: true,
+            },
+        }));
+        await batches.bulkWrite(ops, { ordered: false });
         this._lastWriteLatencyMs = Math.round(performance.now() - start);
     }
 
@@ -461,6 +469,20 @@ export class ManifestStore {
         if (samples.length === 0) return;
         const { skipSamples } = this.ensureConnected();
         await skipSamples.insertMany(samples);
+    }
+
+    /**
+     * Delete all batch records and skip samples for a given run.
+     * Used when starting a fresh (non-resume) run to prevent stale data.
+     */
+    async deleteRunData(runId: string): Promise<number> {
+        const { batches, skipSamples, events } = this.ensureConnected();
+        const [bResult, sResult, eResult] = await Promise.all([
+            batches.deleteMany({ run_id: runId }),
+            skipSamples.deleteMany({ run_id: runId }),
+            events.deleteMany({ run_id: runId }),
+        ]);
+        return (bResult.deletedCount ?? 0) + (sResult.deletedCount ?? 0) + (eResult.deletedCount ?? 0);
     }
 
     // -----------------------------------------------------------------------

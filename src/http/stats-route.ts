@@ -133,10 +133,8 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
     const overallPct = totalEstimated > 0
       ? Math.min(100, Math.round((overallDocsRead / totalEstimated) * 100)) : 0;
 
-    // ETA based on elapsed time and progress percentage
-    const etaMs = overallPct > 0 && overallPct < 100 && elapsedMs > 0
-      ? Math.round(((Date.now() - startedAt.getTime()) / overallPct) * (100 - overallPct))
-      : null;
+    // ETA computed later using cluster-wide data
+    let etaMs: number | null = null;
 
     // Commands from Redis (best-effort)
     let commands: CommandFlags = {};
@@ -240,20 +238,58 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
       };
     });
 
+    // ── Compute cluster-wide aggregates for summary ─────────────────
+    const clusterDocsRead = clusterData
+      ? mergedCollectionProgress.reduce((s, c) => s + (c.docsRead ?? 0), 0)
+      : overallDocsRead;
+    const clusterEstimated = clusterData
+      ? mergedCollectionProgress.reduce((s, c) => s + (c.estimated ?? 0), 0) || totalEstimated
+      : totalEstimated;
+    const clusterPct = clusterEstimated > 0
+      ? Math.min(100, Math.round((clusterDocsRead / clusterEstimated) * 100))
+      : overallPct;
+    const clusterDone = clusterData
+      ? mergedCollectionProgress.filter(c => c.status === 'completed' || c.status === 'skipped').length
+      : progress.completedCollections + progress.skippedCollections;
+    const clusterFailed = clusterData
+      ? mergedCollectionProgress.filter(c => c.status === 'failed').length
+      : progress.failedCollections;
+    const clusterProcessing = clusterData
+      ? mergedCollectionProgress.filter(c => c.status === 'processing').length
+      : (progress.currentCollection ? 1 : 0);
+    const clusterTotal = clusterData
+      ? (progress.totalCollections || mergedCollectionProgress.length)
+      : progress.totalCollections;
+
+    // ETA based on cluster-wide progress
+    const serviceElapsedMs = Date.now() - startedAt.getTime();
+    etaMs = clusterPct > 0 && clusterPct < 100 && serviceElapsedMs > 0
+      ? Math.round((serviceElapsedMs / clusterPct) * (100 - clusterPct))
+      : null;
+
     const payload = {
-      // ── Quick-glance summary ──────────────────────────────────────────
+      // ── Quick-glance summary (cluster-wide when multi-pod) ──────────
       summary: {
-        overall: progressBar(overallPct),
-        overallPct,
+        overall: progressBar(clusterPct),
+        overallPct: clusterPct,
         currentCollection: progress.currentCollection
           ? `${progress.currentCollection}  ${progressBar(currentCollPct)}`
           : 'idle',
         currentCollectionPct: currentCollPct,
-        collections: `${progress.completedCollections}/${progress.totalCollections} done`
-          + (progress.failedCollections > 0 ? `, ${progress.failedCollections} failed` : '')
-          + (progress.skippedCollections > 0 ? `, ${progress.skippedCollections} skipped` : ''),
-        docsProgress: `${fmtNum(overallDocsRead)} / ~${fmtNum(totalEstimated)} docs`,
-        throughput: `${fmtNum(Math.round(batchStats?.docsPerSecond ?? 0))} docs/s`,
+        collections: `${clusterDone}/${clusterTotal} done`
+          + (clusterFailed > 0 ? `, ${clusterFailed} failed` : '')
+          + (clusterProcessing > 0 ? `, ${clusterProcessing} processing` : ''),
+        docsProgress: `${fmtNum(clusterDocsRead)} / ~${fmtNum(clusterEstimated)} docs`,
+        throughput: (() => {
+          // In multi-pod mode, compute cluster-wide throughput from total docs / uptime
+          const clusterDocs = clusterData
+            ? mergedCollectionProgress.reduce((s, c) => s + (c.docsRead ?? 0), 0)
+            : 0;
+          if (clusterDocs > 0 && uptimeSec > 0) {
+            return `${fmtNum(Math.round(clusterDocs / uptimeSec))} docs/s`;
+          }
+          return `${fmtNum(Math.round(batchStats?.docsPerSecond ?? 0))} docs/s`;
+        })(),
         elapsed: (() => {
           const isTerminal = runnerStatus === 'completed' || runnerStatus === 'failed' || runnerStatus === 'stopped';
           if (isTerminal && frozenElapsedMs === null) {

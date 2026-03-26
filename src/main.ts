@@ -229,6 +229,7 @@ async function main(): Promise<void> {
     chWriter,
     globalProgress,
     collectionLock,
+    redisState,
   });
 
   registerRunRoutes(app, {
