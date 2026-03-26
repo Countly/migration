@@ -82,6 +82,7 @@ export class CollectionOrchestrator {
     private readonly logger: Logger;
 
     private discoveredCollections: string[] = [];
+    private skippedApmCollections: Set<string> = new Set();
     private results: CollectionResult[] = [];
     private estimatedCounts: Map<string, number> = new Map();
     private indexStatus: Map<string, IndexBuildStatus> = new Map();
@@ -110,6 +111,33 @@ export class CollectionOrchestrator {
         // 1. Discover collections
         const db = mongoReader.getDatabase();
         this.discoveredCollections = await discoverCollections(db, config.source.collectionPrefix, this.logger);
+
+        // Filter out APM collections by resolved event name
+        const skipEventNames = new Set(['[CLY]_apm_device', '[CLY]_apm_network']);
+        this.discoveredCollections = this.discoveredCollections.filter(name => {
+            const defaults = this.deps.hashResolver.resolveCollectionName(
+                name, config.source.collectionPrefix,
+            );
+            if (defaults && skipEventNames.has(defaults.e)) {
+                this.skippedApmCollections.add(name);
+                this.results.push({
+                    collection: name,
+                    sourceNs: `${config.source.db}.${name}`,
+                    runId: '',
+                    status: 'skipped',
+                    error: `APM event "${defaults.e}" excluded from migration`,
+                });
+                this.logger.info({ collection: name, event: defaults.e }, 'Skipping APM collection');
+                return false;
+            }
+            return true;
+        });
+        if (this.skippedApmCollections.size > 0) {
+            this.logger.info(
+                { skipped: this.skippedApmCollections.size, remaining: this.discoveredCollections.length },
+                'Filtered APM collections from discovery',
+            );
+        }
 
         this.logger.info(
             { totalCollections: this.discoveredCollections.length, multiPod: !!collectionLock },
@@ -247,10 +275,11 @@ export class CollectionOrchestrator {
 
         this.logger.info(
             {
-                totalCollections: this.discoveredCollections.length,
+                totalCollections: this.discoveredCollections.length + this.skippedApmCollections.size,
                 completed: summary.totalCompleted,
                 failed: summary.totalFailed,
                 skipped: summary.totalSkipped,
+                skippedApm: this.skippedApmCollections.size,
             },
             "Migration orchestration complete",
         );
@@ -260,7 +289,7 @@ export class CollectionOrchestrator {
 
     getProgress(): OrchestratorProgress {
         return {
-            totalCollections: this.discoveredCollections.length,
+            totalCollections: this.discoveredCollections.length + this.skippedApmCollections.size,
             completedCollections: this.results.filter((r) => r.status === "completed").length,
             failedCollections: this.results.filter((r) => r.status === "failed").length,
             skippedCollections: this.results.filter((r) => r.status === "skipped").length,
@@ -310,7 +339,7 @@ export class CollectionOrchestrator {
         if (this.orchestratorStatus === "completed") {
             return "completed";
         }
-        if (this.discoveredCollections.length > 0 && this.results.length === this.discoveredCollections.length) {
+        if (this.discoveredCollections.length > 0 && this.results.length >= this.discoveredCollections.length) {
             return "completed";
         }
         return "idle";
@@ -391,6 +420,10 @@ export class CollectionOrchestrator {
     }
 
     retryCollection(collectionName: string): void {
+        if (this.skippedApmCollections.has(collectionName)) {
+            this.logger.warn({ collection: collectionName }, "Cannot retry APM collection — permanently excluded");
+            return;
+        }
         this.results = this.results.filter(r => r.collection !== collectionName);
         this.logger.info({ collection: collectionName }, "Collection queued for retry");
     }
