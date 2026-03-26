@@ -160,6 +160,7 @@ export class BatchRunner {
 
   private readonly deps: BatchRunnerDeps;
   private readonly logger: Logger;
+  private readonly isRangeMode: boolean;
   private phaseHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private currentPhaseData: LiveBatchData | null = null;
 
@@ -168,6 +169,7 @@ export class BatchRunner {
     this.logger = deps.logger.child({ component: "BatchRunner" });
     this.skipCounter = new SkipCounter();
     this.batchSeq = deps.config.batchSeqOffset ?? 0;
+    this.isRangeMode = deps.config.rangeIdx !== undefined;
   }
 
   // -----------------------------------------------------------------------
@@ -268,8 +270,11 @@ export class BatchRunner {
             "All documents processed, run complete",
           );
 
-          const summary = this.buildSummary("completed");
-          await this.deps.manifestStore.writeSummary(runId, "completed", summary);
+          // In range mode, only the RangeCoordinator finalizes the shared run status
+          if (!this.isRangeMode) {
+            const summary = this.buildSummary("completed");
+            await this.deps.manifestStore.writeSummary(runId, "completed", summary);
+          }
 
           await this.bestEffortRedis(
             () => this.deps.redisState.setState(runId, {
@@ -503,8 +508,10 @@ export class BatchRunner {
           );
 
           this.batchesFailed++;
-          const summary = this.buildSummary("failed");
-          await this.deps.manifestStore.writeSummary(runId, "failed", summary);
+          if (!this.isRangeMode) {
+            const summary = this.buildSummary("failed");
+            await this.deps.manifestStore.writeSummary(runId, "failed", summary);
+          }
           this.setTerminalStatus("failed");
           break;
         }
@@ -530,8 +537,10 @@ export class BatchRunner {
 
       // Handle graceful stop
       if ((this.status as RunnerStatus) === "stopping") {
-        const summary = this.buildSummary("stopped");
-        await this.deps.manifestStore.writeSummary(runId, "stopped", summary);
+        if (!this.isRangeMode) {
+          const summary = this.buildSummary("stopped");
+          await this.deps.manifestStore.writeSummary(runId, "stopped", summary);
+        }
         await this.bestEffortRedis(
           () => this.deps.redisState.setState(runId, {
             runId,
@@ -555,16 +564,18 @@ export class BatchRunner {
       this.logger.error({ error: error.message }, "BatchRunner fatal error");
       this.setTerminalStatus("failed");
 
-      try {
-        const summary = this.buildSummary("failed");
-        await this.deps.manifestStore.writeSummary(
-          this.deps.config.runId, "failed", summary,
-        );
-      } catch (summaryErr) {
-        this.logger.warn(
-          { error: toError(summaryErr).message },
-          "Failed to write run summary on fatal error (continuing with throw)",
-        );
+      if (!this.isRangeMode) {
+        try {
+          const summary = this.buildSummary("failed");
+          await this.deps.manifestStore.writeSummary(
+            this.deps.config.runId, "failed", summary,
+          );
+        } catch (summaryErr) {
+          this.logger.warn(
+            { error: toError(summaryErr).message },
+            "Failed to write run summary on fatal error (continuing with throw)",
+          );
+        }
       }
 
       try {

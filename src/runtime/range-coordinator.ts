@@ -122,6 +122,7 @@ return nil
 // ---------------------------------------------------------------------------
 
 const BATCH_SEQ_SLOTS_PER_RANGE = 10_000;
+const MAX_RANGE_RETRIES = 3;
 
 export class RangeCoordinator {
     private readonly deps: RangeCoordinatorDeps;
@@ -131,6 +132,8 @@ export class RangeCoordinator {
     private readonly runIdKey: string;
     private readonly metaKey: string;
     private stopping = false;
+    private activeBatchRunner: BatchRunner | null = null;
+    private readonly rangeRetryCounts = new Map<number, number>();
 
     /** Accumulated docs read across all completed ranges (updated live). */
     totalDocsRead = 0;
@@ -161,42 +164,63 @@ export class RangeCoordinator {
         let completedRanges = 0;
         let failedRanges = 0;
 
-        // 2. Claim and process ranges
-        while (!this.stopping) {
-            const range = await this.claimNextRange();
+        // 2. Claim and process ranges (with self-healing retry for failed ranges)
+        for (let retryRound = 0; retryRound <= MAX_RANGE_RETRIES; retryRound++) {
+            if (this.stopping) break;
 
-            if (range) {
-                this.logger.info(
-                    { rangeIdx: range.idx, startCd: new Date(range.startCd).toISOString(), endCd: new Date(range.endCd).toISOString() },
-                    "Claimed range",
-                );
+            if (retryRound > 0) {
+                this.logger.info({ retryRound }, "Starting retry round for failed ranges");
+            }
 
-                try {
-                    const result = await this.processRange(range, runId);
-                    this.totalDocsRead += result.docsRead;
-                    this.totalRowsInserted += result.rowsInserted;
-                    await this.markRangeDone(range.idx);
-                    completedRanges++;
-                    this.logger.info({ rangeIdx: range.idx, docsRead: result.docsRead, rowsInserted: result.rowsInserted }, "Range completed");
-                } catch (err) {
-                    const error = err instanceof Error ? err.message : String(err);
-                    await this.markRangeFailed(range.idx);
-                    failedRanges++;
-                    this.logger.error({ rangeIdx: range.idx, error }, "Range failed");
+            // Inner claim loop: claim and process until no pending ranges remain
+            while (!this.stopping) {
+                const range = await this.claimNextRange();
+
+                if (range) {
+                    this.logger.info(
+                        { rangeIdx: range.idx, startCd: new Date(range.startCd).toISOString(), endCd: new Date(range.endCd).toISOString(), retryRound },
+                        "Claimed range",
+                    );
+
+                    try {
+                        const result = await this.processRange(range, runId);
+                        this.totalDocsRead += result.docsRead;
+                        this.totalRowsInserted += result.rowsInserted;
+                        await this.markRangeDone(range.idx);
+                        completedRanges++;
+                        this.logger.info({ rangeIdx: range.idx, docsRead: result.docsRead, rowsInserted: result.rowsInserted }, "Range completed");
+                    } catch (err) {
+                        const error = err instanceof Error ? err.message : String(err);
+                        await this.markRangeFailed(range.idx);
+                        failedRanges++;
+                        this.logger.error({ rangeIdx: range.idx, error, retryRound }, "Range failed");
+                    }
+                    continue;
                 }
-                continue;
+
+                // No pending range — check if any are still processing by other pods
+                const status = await this.getRangeStatus();
+                if (status.processing > 0) {
+                    this.logger.info({ processing: status.processing, done: status.done }, "Waiting for other pods to finish ranges");
+                    await new Promise(r => setTimeout(r, 10_000));
+                    continue;
+                }
+
+                // All ranges terminal (done or failed)
+                break;
             }
 
-            // No pending range — check if any are still processing by other pods
-            const status = await this.getRangeStatus();
-            if (status.processing > 0) {
-                this.logger.info({ processing: status.processing, done: status.done }, "Waiting for other pods to finish ranges");
-                await new Promise(r => setTimeout(r, 10_000));
-                continue;
-            }
+            // Check if any failed ranges can be retried
+            if (this.stopping) break;
+            if (retryRound >= MAX_RANGE_RETRIES) break;
 
-            // All done
-            break;
+            const resetCount = await this.resetFailedRanges();
+            if (resetCount === 0) break; // no failed ranges or all exhausted retries
+
+            this.logger.info(
+                { resetCount, retryRound: retryRound + 1, maxRetries: MAX_RANGE_RETRIES },
+                "Re-queued failed ranges for retry",
+            );
         }
 
         // 3. Mark run complete if all ranges are terminal (only one pod finalizes via SETNX)
@@ -207,7 +231,7 @@ export class RangeCoordinator {
             if (acquired) {
                 const runStatus = finalStatus.failed > 0 ? "failed" as const : "completed" as const;
                 await manifestStore.updateRunStatus(runId, runStatus);
-                this.logger.info({ runId, runStatus }, "Run finalized by this pod");
+                this.logger.info({ runId, runStatus, failedRanges: finalStatus.failed }, "Run finalized by this pod");
             }
         }
 
@@ -223,6 +247,15 @@ export class RangeCoordinator {
 
     stop(): void {
         this.stopping = true;
+        this.activeBatchRunner?.stopAfterBatch();
+    }
+
+    pause(): void {
+        this.activeBatchRunner?.pause();
+    }
+
+    resume(): void {
+        this.activeBatchRunner?.resume();
     }
 
     async getRangeStatus(): Promise<{ pending: number; processing: number; done: number; failed: number }> {
@@ -241,6 +274,38 @@ export class RangeCoordinator {
     // -----------------------------------------------------------------------
     // Private
     // -----------------------------------------------------------------------
+
+    /**
+     * Reset eligible failed ranges back to "pending" for retry.
+     * Tracks per-range retry counts to cap retries at MAX_RANGE_RETRIES.
+     * Returns the number of ranges reset.
+     */
+    private async resetFailedRanges(): Promise<number> {
+        const all = await this.deps.redis.hgetall(this.rangesKey);
+        let resetCount = 0;
+
+        for (const [key, val] of Object.entries(all)) {
+            const entry = JSON.parse(val) as RangeEntry;
+            if (entry.status !== "failed") continue;
+
+            const retries = this.rangeRetryCounts.get(entry.idx) ?? 0;
+            if (retries >= MAX_RANGE_RETRIES) continue;
+
+            entry.status = "pending";
+            entry.podId = null as any;
+            entry.claimedAt = null as any;
+            await this.deps.redis.hset(this.rangesKey, key, JSON.stringify(entry));
+            this.rangeRetryCounts.set(entry.idx, retries + 1);
+            resetCount++;
+
+            this.logger.info(
+                { rangeIdx: entry.idx, retryCount: retries + 1, maxRetries: MAX_RANGE_RETRIES },
+                "Reset failed range for retry",
+            );
+        }
+
+        return resetCount;
+    }
 
     private async initRanges(): Promise<string> {
         const { redis, mongoReader, manifestStore, config } = this.deps;
@@ -416,7 +481,12 @@ export class RangeCoordinator {
             },
         });
 
-        await batchRunner.run(startCursorStr);
+        this.activeBatchRunner = batchRunner;
+        try {
+          await batchRunner.run(startCursorStr);
+        } finally {
+          this.activeBatchRunner = null;
+        }
 
         const stats = batchRunner.getStats();
 

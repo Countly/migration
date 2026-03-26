@@ -171,6 +171,7 @@ export class CollectionOrchestrator {
                     }
                     if (globalCmds.pause) {
                         this.currentBatchRunner?.pause();
+                        this.currentRangeCoordinator?.pause();
                     }
                 } catch {
                     // best-effort
@@ -336,15 +337,18 @@ export class CollectionOrchestrator {
 
     pause(): void {
         this.currentBatchRunner?.pause();
+        this.currentRangeCoordinator?.pause();
     }
 
     resume(): void {
         this.currentBatchRunner?.resume();
+        this.currentRangeCoordinator?.resume();
     }
 
     stopAfterBatch(): void {
         this.stopping = true;
         this.currentBatchRunner?.stopAfterBatch();
+        this.currentRangeCoordinator?.stop();
     }
 
     async waitForStop(): Promise<void> {
@@ -780,7 +784,17 @@ export class CollectionOrchestrator {
                 const rangeResult = await coordinator.run();
 
                 if (rpProgressInterval) clearInterval(rpProgressInterval);
-                const rpStatus = rangeResult.failedRanges > 0 ? "failed" as const : "completed" as const;
+
+                // Use GLOBAL range status (not just this pod's local counters)
+                // to prevent marking a collection as "completed" while other pods have failed ranges
+                const globalRangeStatus = await coordinator.getRangeStatus().catch(() => ({
+                    pending: 0, processing: 0, done: 0, failed: rangeResult.failedRanges,
+                }));
+                const allGloballyDone = globalRangeStatus.failed === 0
+                    && globalRangeStatus.pending === 0
+                    && globalRangeStatus.processing === 0;
+
+                const rpStatus = allGloballyDone ? "completed" as const : "failed" as const;
                 await rpGlobalProgress?.updateCollectionProgress({
                     collectionName,
                     podId: config.worker.podId,
@@ -800,10 +814,12 @@ export class CollectionOrchestrator {
                     collection: collectionName,
                     sourceNs,
                     runId: rangeResult.runId,
-                    status: rangeResult.failedRanges > 0 ? "failed" : "completed",
+                    status: rpStatus,
                     docsRead: rangeResult.totalDocsRead,
                     rowsInserted: rangeResult.totalRowsInserted,
-                    error: rangeResult.failedRanges > 0 ? `${rangeResult.failedRanges} ranges failed` : undefined,
+                    error: !allGloballyDone
+                        ? `${globalRangeStatus.failed} ranges failed, ${globalRangeStatus.pending} pending globally`
+                        : undefined,
                 };
             } finally {
                 if (rpProgressInterval) clearInterval(rpProgressInterval);
