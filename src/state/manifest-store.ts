@@ -88,9 +88,15 @@ export interface EventRecord {
     created_at: string;
 }
 
+export interface BatchSeqRange {
+    min: number;  // inclusive
+    max: number;  // exclusive
+}
+
 export interface GetBatchesOptions {
     status?: BatchStatus;
     limit?: number;
+    batchSeqRange?: BatchSeqRange;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,19 +414,27 @@ export class ManifestStore {
         );
     }
 
-    async getLastBatch(runId: string): Promise<Batch | null> {
+    async getLastBatch(runId: string, batchSeqRange?: BatchSeqRange): Promise<Batch | null> {
         const { batches } = this.ensureConnected();
+        const filter: Record<string, unknown> = { run_id: runId };
+        if (batchSeqRange) {
+            filter.batch_seq = { $gte: batchSeqRange.min, $lt: batchSeqRange.max };
+        }
         const doc = await batches.findOne(
-            { run_id: runId },
+            filter,
             { sort: { batch_seq: -1 }, projection: { _id: 0 } },
         );
         return doc ?? null;
     }
 
-    async getLastDoneBatch(runId: string): Promise<Batch | null> {
+    async getLastDoneBatch(runId: string, batchSeqRange?: BatchSeqRange): Promise<Batch | null> {
         const { batches } = this.ensureConnected();
+        const filter: Record<string, unknown> = { run_id: runId, status: "done" };
+        if (batchSeqRange) {
+            filter.batch_seq = { $gte: batchSeqRange.min, $lt: batchSeqRange.max };
+        }
         const doc = await batches.findOne(
-            { run_id: runId, status: "done" },
+            filter,
             { sort: { batch_seq: -1 }, projection: { _id: 0 } },
         );
         return doc ?? null;
@@ -445,11 +459,15 @@ export class ManifestStore {
         return (doc as Run | null) ?? null;
     }
 
-    /** Sum source_docs_read and rows_to_insert from all done batches for a run. */
-    async sumCompletedBatchStats(runId: string): Promise<{ docsRead: number; rowsInserted: number }> {
+    /** Sum source_docs_read and rows_to_insert from all done batches for a run (optionally scoped to a batchSeq range). */
+    async sumCompletedBatchStats(runId: string, batchSeqRange?: BatchSeqRange): Promise<{ docsRead: number; rowsInserted: number }> {
         const { batches } = this.ensureConnected();
+        const match: Record<string, unknown> = { run_id: runId, status: "done" };
+        if (batchSeqRange) {
+            match.batch_seq = { $gte: batchSeqRange.min, $lt: batchSeqRange.max };
+        }
         const pipeline = [
-            { $match: { run_id: runId, status: "done" } },
+            { $match: match },
             { $group: { _id: null, docsRead: { $sum: "$source_docs_read" }, rowsInserted: { $sum: "$rows_to_insert" } } },
         ];
         const result = await batches.aggregate(pipeline).toArray();
@@ -459,9 +477,12 @@ export class ManifestStore {
 
     async getBatches(runId: string, opts: GetBatchesOptions = {}): Promise<Batch[]> {
         const { batches } = this.ensureConnected();
-        const filter: { run_id: string; status?: BatchStatus } = { run_id: runId };
+        const filter: Record<string, unknown> = { run_id: runId };
         if (opts.status !== undefined) {
             filter.status = opts.status;
+        }
+        if (opts.batchSeqRange) {
+            filter.batch_seq = { $gte: opts.batchSeqRange.min, $lt: opts.batchSeqRange.max };
         }
         let cursor = batches.find(filter, { projection: { _id: 0 } }).sort({ batch_seq: 1 });
         if (opts.limit !== undefined) {

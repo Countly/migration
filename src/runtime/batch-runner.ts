@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Logger } from "pino";
 
-import type { ManifestStore, Batch, BatchStatus, RunSummary, CompactError } from "../state/manifest-store.ts";
+import type { ManifestStore, Batch, BatchStatus, RunSummary, CompactError, BatchSeqRange } from "../state/manifest-store.ts";
 import type { RedisHotState, VerboseError, BatchPhase, LiveBatchData } from "../state/redis-hot-state.ts";
 import type { AsyncBatchWriter } from "../state/async-batch-writer.ts";
 import type { MongoReader } from "../source/mongo-reader.ts";
@@ -37,6 +37,7 @@ export interface BatchRunnerConfig {
   collectionName?: string;
   podId?: string;
   rangeIdx?: number;
+  batchSeqMax?: number;
 }
 
 export interface BatchRunnerDeps {
@@ -189,7 +190,7 @@ export class BatchRunner {
       // ------------------------------------------------------------------
       // 1. Resume check: look for interrupted batches
       // ------------------------------------------------------------------
-      await this.resumeFromInterruption();
+      await this.resumeFromInterruption(startCursor);
 
       // If a startCursor was provided (range mode) and no resume state exists, use it
       if (startCursor && !this.lastCommittedId) {
@@ -717,7 +718,7 @@ export class BatchRunner {
    *  - §15.1: Crash before insert (batch is prepared or inflight, insert never ack'd)
    *  - §15.2: Crash after CH success but before checkpoint (CH dedup ignores the retry)
    */
-  private async resumeFromInterruption(): Promise<void> {
+  private async resumeFromInterruption(startCursor?: string): Promise<void> {
     const { runId, upperBoundId } = this.deps.config;
     const run = await this.deps.manifestStore.getRun(runId);
 
@@ -726,23 +727,55 @@ export class BatchRunner {
       return;
     }
 
-    // Check Redis first for last committed cursor (hot-path authority)
-    const redisCursor = await this.deps.redisState.getLastCommittedCursor(runId).catch(() => null);
-    this.lastCommittedId = redisCursor ?? run.last_committed_cursor;
+    // Compute range-scoped batch filter (undefined in standard mode)
+    const { rangeIdx, batchSeqOffset, batchSeqMax } = this.deps.config;
+    const batchSeqRange: BatchSeqRange | undefined =
+      rangeIdx !== undefined && batchSeqOffset !== undefined && batchSeqMax !== undefined
+        ? { min: batchSeqOffset, max: batchSeqMax }
+        : undefined;
 
-    // Derive cursor from highest done batch as fallback (handles crash between
-    // updateBatchStatus("done") and updateRunLastCommittedCursor)
-    const lastDoneBatch = await this.deps.manifestStore.getLastDoneBatch(runId);
+    // ── Cursor recovery ──────────────────────────────────────────────────
+    // Redis per-range cursor (hot-path authority, already isolated by prefix)
+    const redisCursor = await this.deps.redisState.getLastCommittedCursor(runId).catch(() => null);
+
+    if (redisCursor) {
+      this.lastCommittedId = redisCursor;
+    } else if (rangeIdx === undefined) {
+      // Standard (non-range) mode: fall back to run-level cursor
+      this.lastCommittedId = run.last_committed_cursor;
+    }
+    // Range mode with no Redis cursor: lastCommittedId stays null
+    // (will be set from batch-derived cursor or startCursor in run())
+
+    // ── Batch-derived cursor (scoped to this range's slot) ───────────────
+    const lastDoneBatch = await this.deps.manifestStore.getLastDoneBatch(runId, batchSeqRange);
     if (lastDoneBatch?.upper_inclusive_cursor) {
       this.lastCommittedId = lastDoneBatch.upper_inclusive_cursor;
     }
 
-    // Find batches that need recovery (inflight or prepared)
+    // ── Bounds guard (Layer 2) ───────────────────────────────────────────
+    if (this.lastCommittedId && rangeIdx !== undefined && startCursor) {
+      const recovered = deserializeCursor(this.lastCommittedId);
+      const rangeStart = deserializeCursor(startCursor);
+      const rangeEnd = deserializeCursor(upperBoundId);
+
+      if (recovered.cd < rangeStart.cd || recovered.cd > rangeEnd.cd) {
+        this.logger.warn(
+          { recoveredCd: recovered.cd, rangeStartCd: rangeStart.cd, rangeEndCd: rangeEnd.cd, rangeIdx },
+          "Recovered cursor outside range bounds — discarding, will use startCursor",
+        );
+        this.lastCommittedId = null;
+      }
+    }
+
+    // ── Recover interrupted batches (scoped to range slot) ───────────────
     const inflightBatches = await this.deps.manifestStore.getBatches(runId, {
       status: "inflight",
+      batchSeqRange,
     });
     const preparedBatches = await this.deps.manifestStore.getBatches(runId, {
       status: "prepared",
+      batchSeqRange,
     });
     const recoverableBatches = [...preparedBatches, ...inflightBatches]
       .sort((a, b) => a.batch_seq - b.batch_seq);
@@ -754,21 +787,20 @@ export class BatchRunner {
       );
 
       try {
-        // Step 1: Re-read the exact source range (use full batchRowsTarget since
-        // a batch may span multiple pages worth of documents)
+        // Re-read the exact source range
         const page = await this.deps.mongoReader.readPage(
           batch.lower_exclusive_cursor ? deserializeCursor(batch.lower_exclusive_cursor) : null,
           deserializeCursor(batch.upper_inclusive_cursor),
           this.deps.config.batchRowsTarget,
         );
 
-        // Step 2: Re-transform
+        // Re-transform
         const { rows } = transformBatch(page.docs, this.skipCounter, this.deps.config.collectionDefaults);
 
-        // Step 3: Recompute digest
+        // Recompute digest
         const newDigest = computePayloadDigest(rows);
 
-        // Step 4: Compare with stored digest (lenient mode)
+        // Compare with stored digest (lenient mode)
         const digestMatched = newDigest === batch.payload_digest;
 
         if (newDigest !== batch.payload_digest) {
@@ -815,10 +847,9 @@ export class BatchRunner {
             },
             "Digest mismatch on recovery — continuing (lenient mode, CH dedup will handle)",
           );
-          // Continue — do NOT return or fail the run
         }
 
-        // Step 5: Retry the insert with the same dedup token (CH dedup ignores duplicates)
+        // Retry the insert with the same dedup token (CH dedup ignores duplicates)
         if (rows.length > 0) {
           await this.deps.manifestStore.updateBatchStatus(runId, batch.batch_seq, "inflight");
 
@@ -834,7 +865,7 @@ export class BatchRunner {
           );
         }
 
-        // Step 6: Mark done + advance cursor, then set digest_match
+        // Mark done + advance cursor, then set digest_match
         await this.deps.manifestStore.completeBatch(runId, batch.batch_seq, batch.upper_inclusive_cursor);
         await this.deps.manifestStore.updateBatchDigestMatch(runId, batch.batch_seq, digestMatched);
         this.lastCommittedId = batch.upper_inclusive_cursor;
@@ -874,14 +905,13 @@ export class BatchRunner {
       }
     }
 
-    // Determine the last completed batch sequence
-    const lastBatch = await this.deps.manifestStore.getLastBatch(runId);
+    // ── Restore batchSeq (scoped to this range's slot) ───────────────────
+    const lastBatch = await this.deps.manifestStore.getLastBatch(runId, batchSeqRange);
     if (lastBatch) {
       this.batchSeq = lastBatch.batch_seq;
     }
 
-    // Recover accumulated doc/row counters from Redis stats (or manifest fallback)
-    // so live progress starts from the correct offset, not 0.
+    // ── Recover accumulated counters ─────────────────────────────────────
     const lastStats = await this.deps.redisState.getStats(runId).catch(() => null);
     if (lastStats && lastStats.docsRead > 0) {
       this.totalDocsRead = lastStats.docsRead;
@@ -891,8 +921,8 @@ export class BatchRunner {
         "Recovered accumulated counters from Redis",
       );
     } else {
-      // Redis stats missing (flushed) — fallback to manifest aggregate
-      const aggregate = await this.deps.manifestStore.sumCompletedBatchStats(runId);
+      // Redis stats missing (flushed) — fallback to manifest aggregate (scoped)
+      const aggregate = await this.deps.manifestStore.sumCompletedBatchStats(runId, batchSeqRange);
       if (aggregate.docsRead > 0) {
         this.totalDocsRead = aggregate.docsRead;
         this.totalRowsInserted = aggregate.rowsInserted;
@@ -909,6 +939,8 @@ export class BatchRunner {
         resumeFromId: this.lastCommittedId,
         resumeFromBatchSeq: this.batchSeq,
         inflightRecovered: inflightBatches.length,
+        rangeIdx,
+        batchSeqRange: batchSeqRange ? `[${batchSeqRange.min}, ${batchSeqRange.max})` : "global",
       },
       "Resuming from last committed position",
     );

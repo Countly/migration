@@ -300,7 +300,12 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
         eta: (runnerStatus === 'completed' || runnerStatus === 'failed' || runnerStatus === 'stopped')
           ? 'done'
           : (etaMs !== null ? `~${fmtDuration(etaMs)}` : 'calculating...'),
-        status: runnerStatus,
+        status: (() => {
+          if (!clusterData) return runnerStatus;
+          if (clusterProcessing > 0) return "running";
+          if ((clusterDone + clusterFailed) >= clusterTotal && clusterTotal > 0) return "completed";
+          return runnerStatus;
+        })(),
       },
 
       // ── Current collection detail ─────────────────────────────────────

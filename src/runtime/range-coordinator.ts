@@ -10,7 +10,7 @@ import type { RetryPolicy } from "./retry-policy.ts";
 import { BatchRunner } from "./batch-runner.ts";
 import type { CollectionDefaults } from "../transform/hash-resolver.ts";
 import type { AsyncBatchWriter } from "../state/async-batch-writer.ts";
-import { serializeCursor } from "../types/cursor.ts";
+import { serializeCursor, deserializeCursor } from "../types/cursor.ts";
 import { randomUUID } from "node:crypto";
 
 // ---------------------------------------------------------------------------
@@ -412,12 +412,32 @@ export class RangeCoordinator {
                 collectionName: config.collectionName,
                 podId: config.podId,
                 rangeIdx: range.idx,
+                batchSeqMax: batchSeqOffset + BATCH_SEQ_SLOTS_PER_RANGE,
             },
         });
 
         await batchRunner.run(startCursorStr);
 
         const stats = batchRunner.getStats();
+
+        // Layer 3: Completion guard — detect silent data skips
+        const rangeNewBatches = stats.batchSeq - batchSeqOffset;
+        if (rangeNewBatches === 0 && stats.totalDocsRead === 0) {
+            // Range produced zero work — probe to verify it's genuinely empty
+            const probe = await mongoReader.readPage(
+                deserializeCursor(startCursorStr),
+                deserializeCursor(upperBoundStr),
+                1,
+            );
+            if (probe.docs.length > 0) {
+                throw new Error(
+                    `Range ${range.idx} [${new Date(range.startCd).toISOString()} → ` +
+                    `${new Date(range.endCd).toISOString()}] completed with 0 docs but has data — ` +
+                    `possible cursor bleed or resume bug`,
+                );
+            }
+            this.deps.logger.info({ rangeIdx: range.idx }, "Range is genuinely empty, skipping");
+        }
 
         // Update range live stats on completion
         const elapsedSec = (Date.now() - rangeStartedAt) / 1000;
