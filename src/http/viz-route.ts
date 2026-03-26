@@ -291,21 +291,6 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   <!-- Pods -->
   <h3 style="margin-top:4px">Pods</h3>
   <div id="cluster-pods" style="font-size:12px"></div>
-  <!-- Active Ranges -->
-  <div id="ranges-panel" style="display:none;margin-top:12px">
-    <h3>Active Ranges <span id="ranges-summary" style="font-weight:400;color:var(--text2)"></span></h3>
-    <div id="ranges-content"></div>
-  </div>
-  <!-- Live Batches -->
-  <div id="batches-panel" style="margin-top:12px">
-    <h3>Live Batches <span id="batches-summary" style="font-weight:400;color:var(--text2)"></span></h3>
-    <div class="coll-scroll" style="max-height:200px">
-      <table class="coll-table">
-        <thead><tr><th>Collection</th><th>Pod</th><th>Batch#</th><th>Docs</th><th>Rows</th><th>Elapsed</th><th>Phase</th></tr></thead>
-        <tbody id="batches-body"></tbody>
-      </table>
-    </div>
-  </div>
   <!-- Active Locks -->
   <h3 style="margin-top:12px">Active Locks <span id="lock-count" style="font-weight:400;color:var(--text2)"></span></h3>
   <div class="coll-scroll" style="max-height:160px">
@@ -319,6 +304,23 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <h3>Stale Pods <span style="font-weight:400;color:var(--red)">(locks held by dead pods)</span></h3>
     <div id="stale-pods-list" style="font-size:12px"></div>
   </div>
+</div>
+
+<!-- Live Batches (always available, single or multi-pod) -->
+<div class="card full" style="margin-top:12px;display:none" id="batches-panel">
+  <h3>Live Batches <span id="batches-summary" style="font-weight:400;color:var(--text2)"></span></h3>
+  <div class="coll-scroll" style="max-height:200px">
+    <table class="coll-table">
+      <thead><tr><th>Collection</th><th>Pod</th><th>Batch#</th><th>Docs</th><th>Rows</th><th>Elapsed</th><th>Phase</th></tr></thead>
+      <tbody id="batches-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Active Ranges (shown when range-parallel is active) -->
+<div class="card full" style="margin-top:12px;display:none" id="ranges-panel">
+  <h3>Active Ranges <span id="ranges-summary" style="font-weight:400;color:var(--text2)"></span></h3>
+  <div id="ranges-content"></div>
 </div>
 
 <!-- Index Status -->
@@ -410,7 +412,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     var filtered;
 
     if (currentTab === 'active') {
-      filtered = cp.filter(function(c) { return c.status === 'completed' || c.collection === cur; });
+      filtered = cp.filter(function(c) { return c.status === 'completed' || c.status === 'processing' || c.collection === cur; });
     } else if (currentTab === 'failed') {
       filtered = cp.filter(function(c) { return c.status === 'failed'; });
     } else if (currentTab === 'skipped') {
@@ -596,17 +598,27 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       $('svc-uptime').textContent = (d.summary && d.summary.elapsed) || '-';
       $('svc-version').textContent = (d.service && d.service.version) || '-';
 
-      // Overall progress
-      var op = (d.summary && d.summary.overallPct) || 0;
+      // Overall progress — prefer cluster-wide data when available
+      var clp = d.clusterProgress;
+      var op;
+      if (clp && clp.total > 0) {
+        op = clp.pct || 0;
+        $('s-docs').textContent = fmt(clp.docsRead) + ' / ~' + fmt(clp.estimated) + ' docs';
+        $('s-colls').textContent = clp.done + '/' + clp.total + ' done'
+          + (clp.failed > 0 ? ', ' + clp.failed + ' failed' : '')
+          + (clp.processing > 0 ? ', ' + clp.processing + ' processing' : '');
+      } else {
+        op = (d.summary && d.summary.overallPct) || 0;
+        $('s-docs').textContent = (d.summary && d.summary.docsProgress) || '-';
+        $('s-colls').textContent = (d.summary && d.summary.collections) || '-';
+      }
       $('overall-bar').style.width = op + '%';
       $('overall-pct').textContent = op + '%';
       if (op >= 100) $('overall-bar').classList.add('green');
       else $('overall-bar').classList.remove('green');
-      $('s-docs').textContent = (d.summary && d.summary.docsProgress) || '-';
       $('s-throughput').textContent = (d.summary && d.summary.throughput) || '-';
       $('s-elapsed').textContent = (d.summary && d.summary.elapsed) || '-';
       $('s-eta').textContent = (d.summary && d.summary.eta) || '-';
-      $('s-colls').textContent = (d.summary && d.summary.collections) || '-';
 
       // Current collection
       var cc = d.currentCollectionProgress;
@@ -639,10 +651,11 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       $('h-ch').className = 'health-dot ' + (checks.clickhouse ? 'dot-green' : 'dot-red');
       $('h-redis').className = 'health-dot ' + (checks.redis ? 'dot-green' : 'dot-red');
 
-      // Throughput
+      // Throughput — use cluster totals when available
       var tp = d.throughput || {};
-      $('t-read').textContent = fmt(tp.sourceDocsReadTotal);
-      $('t-inserted').textContent = fmt(tp.rowsInsertedTotal);
+      var clpT = d.clusterProgress;
+      $('t-read').textContent = fmt(clpT ? clpT.docsRead : tp.sourceDocsReadTotal);
+      $('t-inserted').textContent = fmt(clpT ? clpT.rowsInserted : tp.rowsInsertedTotal);
       $('t-skipped').textContent = fmt(tp.docsSkippedTotal);
       var integ = d.integrity || {};
       $('t-digest').textContent = fmt(integ.digestMismatches);
@@ -761,7 +774,6 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 
       // Cluster (multi-pod)
       var cluster = d.cluster;
-      var clp = d.clusterProgress;
       if (cluster) {
         $('cluster-card').style.display = 'block';
         $('cluster-summary').textContent = '(' + cluster.podCount + ' pods, ' + cluster.locks.length + ' locks)';
@@ -789,11 +801,15 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
         var podContainer = $('cluster-pods');
         while (podContainer.firstChild) podContainer.removeChild(podContainer.firstChild);
         var pods = cluster.pods || [];
+        // Total docs across all pods for proportional bars
+        var totalPodDocs = 0;
+        for (var pj = 0; pj < pods.length; pj++) totalPodDocs += (pods[pj].stats || {}).docsRead || 0;
         for (var pi = 0; pi < pods.length; pi++) {
           var pod = pods[pi];
           var ps = pod.stats || {};
           var podDocsRead = ps.docsRead || 0;
-          var podPct = clp && clp.estimated > 0 ? Math.min(100, Math.round((podDocsRead / clp.estimated) * 100)) : 0;
+          // Show pod's share as % of total work done (not total estimated)
+          var podPct = totalPodDocs > 0 ? Math.min(100, Math.round((podDocsRead / totalPodDocs) * 100)) : 0;
           var podActive = (pod.collectionsActive || []);
           var podRow = document.createElement('div');
           podRow.style.cssText = 'background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:6px';
@@ -907,8 +923,15 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           staleSection.style.display = 'none';
         }
 
-        // Live Batches
-        var liveBatches = d.liveBatches || [];
+      } else {
+        $('cluster-card').style.display = 'none';
+      }
+
+      // Live Batches (outside cluster block — works in single-pod mode too)
+      var liveBatches = d.liveBatches || [];
+      var batchesPanel = $('batches-panel');
+      if (batchesPanel) {
+        batchesPanel.style.display = liveBatches.length > 0 ? 'block' : 'none';
         $('batches-summary').textContent = '(' + liveBatches.length + ' inflight)';
         var batchesBody = $('batches-body');
         while (batchesBody.firstChild) batchesBody.removeChild(batchesBody.firstChild);
@@ -931,7 +954,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
             var batchTr = document.createElement('tr');
             batchTr.style.borderBottom = '1px solid var(--border)';
             batchTr.innerHTML = '<td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + lb.collection + '">' + truncHash(lb.collection) + '</td>'
-              + '<td style="font-size:11px">' + lb.podId + '</td>'
+              + '<td style="font-size:11px">' + (lb.podId || '-') + '</td>'
               + '<td style="font-size:11px">#' + lb.batchSeq + '</td>'
               + '<td style="font-size:11px">' + fmt(lb.docsRead) + '</td>'
               + '<td style="font-size:11px">' + (lb.rowsToInsert ? fmt(lb.rowsToInsert) : '—') + '</td>'
@@ -940,10 +963,12 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
             batchesBody.appendChild(batchTr);
           }
         }
+      }
 
-        // Ranges panel - show only if any live batches have rangeIdx
-        var hasRanges = liveBatches.some(function(b) { return b.rangeIdx !== undefined && b.rangeIdx !== null; });
-        var rangesPanel = $('ranges-panel');
+      // Ranges panel (outside cluster block)
+      var hasRanges = liveBatches.some(function(b) { return b.rangeIdx !== undefined && b.rangeIdx !== null; });
+      var rangesPanel = $('ranges-panel');
+      if (rangesPanel) {
         if (hasRanges) {
           rangesPanel.style.display = 'block';
           var rangeCollections = {};
@@ -970,9 +995,6 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
         } else {
           rangesPanel.style.display = 'none';
         }
-
-      } else {
-        $('cluster-card').style.display = 'none';
       }
 
       // Collections
