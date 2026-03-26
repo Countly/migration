@@ -36,14 +36,20 @@ export class AsyncBatchWriter {
     private flushTimer: ReturnType<typeof setInterval> | null = null;
     private flushing = false;
     private stopped = false;
+    private readonly manifestStore: ManifestStore;
+    private readonly redisState: RedisHotState;
+    private readonly config: AsyncBatchWriterConfig;
     private readonly logger: Logger;
 
     constructor(
-        private readonly manifestStore: ManifestStore,
-        private readonly redisState: RedisHotState,
-        private readonly config: AsyncBatchWriterConfig,
+        manifestStore: ManifestStore,
+        redisState: RedisHotState,
+        config: AsyncBatchWriterConfig,
         logger: Logger,
     ) {
+        this.manifestStore = manifestStore;
+        this.redisState = redisState;
+        this.config = config;
         this.logger = logger.child({ component: "AsyncBatchWriter" });
     }
 
