@@ -132,6 +132,11 @@ export class RangeCoordinator {
     private readonly metaKey: string;
     private stopping = false;
 
+    /** Accumulated docs read across all completed ranges (updated live). */
+    totalDocsRead = 0;
+    /** Accumulated rows inserted across all completed ranges (updated live). */
+    totalRowsInserted = 0;
+
     constructor(deps: RangeCoordinatorDeps) {
         this.deps = deps;
         this.logger = deps.logger.child({ component: "RangeCoordinator", collection: deps.config.collectionName });
@@ -151,8 +156,8 @@ export class RangeCoordinator {
 
         this.logger.info({ runId, rangeCount: config.rangeCount }, "Starting range-parallel processing");
 
-        let totalDocsRead = 0;
-        let totalRowsInserted = 0;
+        this.totalDocsRead = 0;
+        this.totalRowsInserted = 0;
         let completedRanges = 0;
         let failedRanges = 0;
 
@@ -168,8 +173,8 @@ export class RangeCoordinator {
 
                 try {
                     const result = await this.processRange(range, runId);
-                    totalDocsRead += result.docsRead;
-                    totalRowsInserted += result.rowsInserted;
+                    this.totalDocsRead += result.docsRead;
+                    this.totalRowsInserted += result.rowsInserted;
                     await this.markRangeDone(range.idx);
                     completedRanges++;
                     this.logger.info({ rangeIdx: range.idx, docsRead: result.docsRead, rowsInserted: result.rowsInserted }, "Range completed");
@@ -210,8 +215,8 @@ export class RangeCoordinator {
             totalRanges: config.rangeCount,
             completedRanges,
             failedRanges,
-            totalDocsRead,
-            totalRowsInserted,
+            totalDocsRead: this.totalDocsRead,
+            totalRowsInserted: this.totalRowsInserted,
             runId,
         };
     }
@@ -381,6 +386,7 @@ export class RangeCoordinator {
         const batchRunner = new BatchRunner({
             manifestStore,
             redisState: rangeRedisState,
+            globalRedisState: this.deps.redisState,
             asyncBatchWriter,
             mongoReader,
             chWriter,

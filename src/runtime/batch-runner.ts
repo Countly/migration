@@ -42,6 +42,7 @@ export interface BatchRunnerConfig {
 export interface BatchRunnerDeps {
   manifestStore: ManifestStore;
   redisState: RedisHotState;
+  globalRedisState?: RedisHotState;
   asyncBatchWriter?: AsyncBatchWriter;
   mongoReader: MongoReader;
   chWriter: ClickHouseWriter;
@@ -392,26 +393,35 @@ export class BatchRunner {
             },
           );
 
-          // (i) On success: commit via async writer (Redis hot-path) or fall back to manifest
+          // (i) On success: write cursor + bitmap to Redis (commit point), then queue MongoDB
           this.stopPhaseHeartbeat();
           await this.setPhase("COMMITTING", { docsRead: accDocsRead, rowsToInsert: rows.length });
+
+          // Redis commit point (uses per-collection/per-range redisState — correct prefix)
+          await this.bestEffortRedis(async () => {
+            await this.deps.redisState.setLastCommittedCursor(runId, upperInclusiveId);
+            await this.deps.redisState.markBatchDone(runId, this.batchSeq);
+          }, "Redis cursor/bitmap commit failed");
+
+          // MongoDB: async queue or direct write
           if (this.deps.asyncBatchWriter) {
-            await this.deps.asyncBatchWriter.commitBatch(this.deps.config.runId, batch, upperInclusiveId);
+            await this.deps.asyncBatchWriter.queueBatch(batch, upperInclusiveId);
           } else {
             await this.deps.manifestStore.insertCompletedBatch(batch, upperInclusiveId);
           }
           this.lastCommittedId = upperInclusiveId;
           this.totalRowsInserted += result.rowsInserted;
 
-          // Redis is rebuildable (continue if Redis fails)
+          const batchSeqOffset = this.deps.config.batchSeqOffset ?? 0;
+
+          // Redis stats (rebuildable, continue if fails)
           await this.bestEffortRedis(
             async () => {
-              await this.deps.redisState.markBatchDone(runId, this.batchSeq);
               await this.deps.redisState.updateStats(runId, {
                 docsRead: this.totalDocsRead,
                 docsSkipped: this.skipCounter.getTotal(),
                 rowsInserted: this.totalRowsInserted,
-                batchesDone: this.batchSeq - this.batchesFailed,
+                batchesDone: (this.batchSeq - batchSeqOffset) - this.batchesFailed,
                 batchesFailed: this.batchesFailed,
                 batchesInflight: 0,
                 elapsedMs: Date.now() - this.startedAt,
@@ -451,8 +461,9 @@ export class BatchRunner {
 
           // Clear live batch phase
           if (this.deps.config.collectionName) {
+            const liveRedis = this.deps.globalRedisState ?? this.deps.redisState;
             await this.bestEffortRedis(
-              () => this.deps.redisState.clearLiveBatch(this.deps.config.collectionName!),
+              () => liveRedis.clearLiveBatch(this.deps.config.collectionName!),
               "Redis clearLiveBatch failed",
             );
           }
@@ -896,17 +907,19 @@ export class BatchRunner {
       rangeIdx,
     };
 
+    const liveRedis = this.deps.globalRedisState ?? this.deps.redisState;
     await this.bestEffortRedis(
-      () => this.deps.redisState.setLiveBatch(collectionName, this.currentPhaseData!),
+      () => liveRedis.setLiveBatch(collectionName, this.currentPhaseData!),
       "Redis setLiveBatch failed",
     );
   }
 
   private startPhaseHeartbeat(): void {
     this.stopPhaseHeartbeat();
+    const liveRedis = this.deps.globalRedisState ?? this.deps.redisState;
     this.phaseHeartbeatTimer = setInterval(() => {
       if (this.currentPhaseData && this.deps.config.collectionName) {
-        this.deps.redisState.setLiveBatch(this.deps.config.collectionName, this.currentPhaseData).catch(() => {});
+        liveRedis.setLiveBatch(this.deps.config.collectionName, this.currentPhaseData).catch(() => {});
       }
     }, 10_000);
   }

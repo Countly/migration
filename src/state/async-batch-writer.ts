@@ -1,6 +1,5 @@
 import type { Logger } from "pino";
 import type { ManifestStore, Batch, BatchStatus } from "./manifest-store.ts";
-import type { RedisHotState } from "./redis-hot-state.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -37,36 +36,31 @@ export class AsyncBatchWriter {
     private flushing = false;
     private stopped = false;
     private readonly manifestStore: ManifestStore;
-    private readonly redisState: RedisHotState;
     private readonly config: AsyncBatchWriterConfig;
     private readonly logger: Logger;
 
     constructor(
         manifestStore: ManifestStore,
-        redisState: RedisHotState,
         config: AsyncBatchWriterConfig,
         logger: Logger,
     ) {
         this.manifestStore = manifestStore;
-        this.redisState = redisState;
         this.config = config;
         this.logger = logger.child({ component: "AsyncBatchWriter" });
     }
 
     /**
-     * Commit a completed batch — fast path via Redis.
-     * MongoDB write is queued for async flush.
+     * Queue a completed batch for async MongoDB flush.
+     *
+     * Caller (BatchRunner) is responsible for writing cursor + bitmap to
+     * the correct per-collection/per-range RedisHotState BEFORE calling this.
+     * This method only handles the MongoDB write queue.
      */
-    async commitBatch(
-        runId: string,
+    async queueBatch(
         batch: Batch,
         upperInclusiveCursor: string,
     ): Promise<void> {
-        // 1. Redis commit point (sync)
-        await this.redisState.setLastCommittedCursor(runId, upperInclusiveCursor);
-        await this.redisState.markBatchDone(runId, batch.batch_seq);
-
-        // 2. Queue MongoDB write (bounded)
+        // Queue MongoDB write (bounded)
         const maxDepth = this.config.maxQueueDepth ?? 1000;
         if (this.queue.length >= maxDepth) {
             this.logger.error(

@@ -89,6 +89,7 @@ export class CollectionOrchestrator {
     private currentCollection: string | null = null;
     private currentRunId: string | null = null;
     private currentBatchRunner: BatchRunner | null = null;
+    private currentRangeCoordinator: RangeCoordinator | null = null;
     private currentRedisState: RedisHotState | null = null;
     private orchestratorStatus: "idle" | "running" | "waiting_for_index" | "completed" = "idle";
     private stopping = false;
@@ -228,6 +229,7 @@ export class CollectionOrchestrator {
         this.currentCollection = null;
         this.currentRunId = null;
         this.currentBatchRunner = null;
+        this.currentRangeCoordinator = null;
         this.orchestratorStatus = "completed";
 
         // Cleanup multi-pod resources
@@ -301,6 +303,9 @@ export class CollectionOrchestrator {
         if (this.currentBatchRunner) {
             return this.currentBatchRunner.getStatus();
         }
+        if (this.currentRangeCoordinator) {
+            return "running";
+        }
         if (this.orchestratorStatus === "completed") {
             return "completed";
         }
@@ -311,7 +316,27 @@ export class CollectionOrchestrator {
     }
 
     getStats(): BatchRunnerStats | null {
-        return this.currentBatchRunner?.getStats() ?? null;
+        if (this.currentBatchRunner) {
+            return this.currentBatchRunner.getStats();
+        }
+        if (this.currentRangeCoordinator) {
+            return {
+                status: "running",
+                batchSeq: 0,
+                lastCommittedId: null,
+                totalDocsRead: this.currentRangeCoordinator.totalDocsRead,
+                totalRowsInserted: this.currentRangeCoordinator.totalRowsInserted,
+                totalDocsSkipped: 0,
+                skipsByReason: {} as Record<string, number>,
+                elapsedMs: 0,
+                docsPerSecond: 0,
+                rowsPerSecond: 0,
+                batchesFailed: 0,
+                digestMismatches: 0,
+                estimatedDuplicateRows: 0,
+            } as BatchRunnerStats;
+        }
+        return null;
     }
 
     getCurrentBatchSeq(): number {
@@ -433,28 +458,27 @@ export class CollectionOrchestrator {
     }
 
     private async findNextReadyCollection(completed: Set<string>): Promise<string | null> {
-        const prefix = this.deps.config.source.collectionPrefix;
-        const { collectionLock, config, mongoReader } = this.deps;
-        const rpThreshold = config.source.rangeParallelThreshold;
+        const { collectionLock } = this.deps;
 
-        // Always prefer the base collection (drill_events) when it becomes ready
-        if (!completed.has(prefix) && this.indexStatus.get(prefix) === "ready") {
-            // Check if range-parallel (skip locking — RangeCoordinator handles atomicity)
-            if (await this.isRangeParallelCandidate(prefix)) return prefix;
-            if (!collectionLock || (await collectionLock.tryAcquire(prefix)) !== "locked") {
-                return prefix;
-            }
-        }
-
-        // Otherwise pick any ready, unlocked collection in discovery order
+        // Priority 1: Any unlocked, ready collection (spread pods across different collections)
         for (const name of this.discoveredCollections) {
             if (completed.has(name)) continue;
             if (this.indexStatus.get(name) !== "ready") continue;
-            // Range-parallel collections skip locking
-            if (await this.isRangeParallelCandidate(name)) return name;
-            if (collectionLock && (await collectionLock.tryAcquire(name)) === "locked") continue;
-            return name;
+            if (!collectionLock || (await collectionLock.tryAcquire(name)) !== "locked") {
+                return name;
+            }
         }
+
+        // Priority 2: All remaining are locked by other pods — join range-parallel
+        // on any large collection that has pending ranges (no lock needed)
+        for (const name of this.discoveredCollections) {
+            if (completed.has(name)) continue;
+            if (this.indexStatus.get(name) !== "ready") continue;
+            if (await this.isRangeParallelCandidate(name)) {
+                return name;
+            }
+        }
+
         return null;
     }
 
@@ -587,6 +611,8 @@ export class CollectionOrchestrator {
                 },
             });
 
+            this.currentRangeCoordinator = coordinator;
+
             // Progress updates for range-parallel mode
             const rpStartedAt = new Date().toISOString();
             const rpGlobalProgress = this.deps.globalProgress;
@@ -598,8 +624,8 @@ export class CollectionOrchestrator {
                         podId: config.worker.podId,
                         status: "processing",
                         runId: "",
-                        docsRead: 0,
-                        rowsInserted: 0,
+                        docsRead: coordinator.totalDocsRead,
+                        rowsInserted: coordinator.totalRowsInserted,
                         estimatedTotal: estimatedCount,
                         batchSeq: status.done,
                         startedAt: rpStartedAt,
@@ -641,6 +667,7 @@ export class CollectionOrchestrator {
                 };
             } finally {
                 if (rpProgressInterval) clearInterval(rpProgressInterval);
+                this.currentRangeCoordinator = null;
             }
         }
 
@@ -682,6 +709,7 @@ export class CollectionOrchestrator {
         const batchRunner = new BatchRunner({
             manifestStore,
             redisState,
+            globalRedisState: this.deps.redisState,
             asyncBatchWriter: this.deps.asyncBatchWriter,
             mongoReader,
             chWriter,

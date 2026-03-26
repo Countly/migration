@@ -163,7 +163,6 @@ async function main(): Promise<void> {
   // ── 4b2. Async batch writer ──────────────────────────────────────────
   const asyncBatchWriter = new AsyncBatchWriter(
     manifestStore,
-    redisState,
     config.asyncWrite,
     logger,
   );
