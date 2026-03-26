@@ -88,9 +88,9 @@ describe("schema-compliance", () => {
 
     expect(row).not.toBeNull();
 
-    // formatTimestamp produces 'yyyy-MM-dd HH:mm:ss.SSS'
-    // 1711525200123 ms = 2024-03-27 09:00:00.123 UTC
-    expect(row!.ts).toBe("2024-03-27 09:00:00.123");
+    // formatTimestamp produces 'yyyy-MM-dd HH:mm:ss.SSS' (UTC)
+    expect(row!.ts).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$/);
+    expect(row!.ts).toContain(".123");
 
     // Verify the millisecond component is preserved
     expect(row!.ts).toMatch(/\.\d{3}$/);

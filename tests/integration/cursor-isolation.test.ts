@@ -334,6 +334,9 @@ describe("cursor-isolation (range-parallel)", () => {
     // Run with startCursor for range 3
     await runner.run(serializeCursor(range3Start));
 
+    // Allow ClickHouse async inserts to flush
+    await new Promise((r) => setTimeout(r, 3000));
+
     // Verify the runner completed
     expect(runner.getStatus()).toBe("completed");
 

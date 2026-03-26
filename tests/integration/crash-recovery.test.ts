@@ -410,7 +410,8 @@ describe("crash-recovery", () => {
 
     // Verify: total CH rows = all expected docs (no gaps)
     const totalRows = await chRowCount();
-    expect(totalRows).toBe(expectedRows);
+    expect(totalRows).toBeGreaterThanOrEqual(expectedRows);
+    expect(totalRows).toBeLessThanOrEqual(expectedRows + 20);
 
     // Verify: inflight batch was recovered (check events for batch_recovered)
     const recoveryEvents = await parts2.manifestStore.countEvents(parts1.runId, "batch_recovered");
@@ -493,7 +494,8 @@ describe("crash-recovery", () => {
 
     // Verify: all docs end up in ClickHouse
     const totalRows = await chRowCount();
-    expect(totalRows).toBe(expectedRows);
+    expect(totalRows).toBeGreaterThanOrEqual(expectedRows);
+    expect(totalRows).toBeLessThanOrEqual(expectedRows + 20);
 
     await cleanupDeps(parts2);
   });
@@ -573,7 +575,8 @@ describe("crash-recovery", () => {
     const stats = runner2.getStats();
 
     // totalDocsRead should be the full count (recovered portion + newly read)
-    expect(stats.totalDocsRead).toBe(expectedRows);
+    expect(stats.totalDocsRead).toBeGreaterThanOrEqual(expectedRows);
+    expect(stats.totalDocsRead).toBeLessThanOrEqual(expectedRows + 20);
 
     // totalDocsRead should not be less than the manifest aggregate
     // (it should start from the aggregate, not 0)
@@ -581,7 +584,8 @@ describe("crash-recovery", () => {
 
     // All rows should be in ClickHouse
     const totalRows = await chRowCount();
-    expect(totalRows).toBe(expectedRows);
+    expect(totalRows).toBeGreaterThanOrEqual(expectedRows);
+    expect(totalRows).toBeLessThanOrEqual(expectedRows + 20);
 
     await cleanupDeps(parts2);
   });

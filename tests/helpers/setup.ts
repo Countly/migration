@@ -67,12 +67,19 @@ export async function getRedis(): Promise<Redis> {
 
 /** Create the ClickHouse test database and drill_events table. */
 export async function setupClickHouse(): Promise<void> {
-  const ch = await getClickHouseClient();
-
-  // Create database
-  await ch.command({
+  // Create DB using a temporary client connected to 'default' (the DB may not exist yet)
+  const adminCh = createClient({
+    url: TEST_CH_URL,
+    username: "default",
+    password: "",
+    database: "default",
+  });
+  await adminCh.command({
     query: `CREATE DATABASE IF NOT EXISTS ${TEST_CH_DB}`,
   });
+  await adminCh.close();
+
+  const ch = await getClickHouseClient();
 
   // Create table matching production schema
   await ch.command({
@@ -108,8 +115,12 @@ export async function setupClickHouse(): Promise<void> {
 
 /** Drop the ClickHouse test table (fresh start). */
 export async function teardownClickHouse(): Promise<void> {
-  const ch = await getClickHouseClient();
-  await ch.command({ query: `DROP TABLE IF EXISTS ${TEST_CH_DB}.${TEST_CH_TABLE}` });
+  try {
+    const ch = await getClickHouseClient();
+    await ch.command({ query: `DROP TABLE IF EXISTS ${TEST_CH_DB}.${TEST_CH_TABLE}` });
+  } catch {
+    // DB may not exist yet — ignore
+  }
 }
 
 /** Drop the MongoDB test database. */
@@ -152,8 +163,15 @@ export async function closeAll(): Promise<void> {
   }
 }
 
+/** Flush ClickHouse async insert queue to ensure all data is visible. */
+export async function flushClickHouse(): Promise<void> {
+  const ch = await getClickHouseClient();
+  await ch.command({ query: "SYSTEM FLUSH ASYNC INSERT QUEUE" }).catch(() => {});
+}
+
 /** Query ClickHouse row count for the test table. */
 export async function chRowCount(where?: string): Promise<number> {
+  await flushClickHouse();
   const ch = await getClickHouseClient();
   const q = where
     ? `SELECT count() AS cnt FROM ${TEST_CH_TABLE} WHERE ${where}`
@@ -165,6 +183,7 @@ export async function chRowCount(where?: string): Promise<number> {
 
 /** Query ClickHouse for specific rows. */
 export async function chQuery<T = Record<string, unknown>>(query: string): Promise<T[]> {
+  await flushClickHouse();
   const ch = await getClickHouseClient();
   const result = await ch.query({ query, format: "JSONEachRow" });
   return result.json<T[]>();

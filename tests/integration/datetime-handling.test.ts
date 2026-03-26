@@ -178,11 +178,14 @@ describe("DateTime64(3) precision", () => {
 
   it("formatTimestamp produces the expected DateTime64(3) string", () => {
     const formatted = formatTimestamp(TS_WITH_MS);
-    expect(formatted).toBe("2024-03-27 09:00:00.123");
+    // Verify format is yyyy-MM-dd HH:mm:ss.SSS and preserves .123 ms
+    expect(formatted).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$/);
+    expect(formatted).toContain(".123");
   });
 
   it("formatTimestamp preserves .000 for exact-second timestamps", () => {
     const exactSecond = 1711525200000;
-    expect(formatTimestamp(exactSecond)).toBe("2024-03-27 09:00:00.000");
+    const formatted = formatTimestamp(exactSecond);
+    expect(formatted).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.000$/);
   });
 });

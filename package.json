@@ -7,7 +7,10 @@
   "scripts": {
     "start": "node --experimental-strip-types --expose-gc --max-old-space-size=2048 src/main.ts",
     "lint": "eslint src/",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:file": "vitest run --reporter=verbose"
   },
   "dependencies": {
     "@clickhouse/client": "^1.8.0",

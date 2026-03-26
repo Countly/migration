@@ -490,6 +490,15 @@ export class RangeCoordinator {
 
         const stats = batchRunner.getStats();
 
+        // If the BatchRunner ended in a failed state (batch failed after all retries),
+        // propagate as an error so the range is marked failed and can be retried.
+        if (stats.status === "failed") {
+            throw new Error(
+                `Range ${range.idx} BatchRunner ended with status "failed" ` +
+                `(${stats.batchesFailed} batch(es) failed after retries)`,
+            );
+        }
+
         // Layer 3: Completion guard — detect silent data skips
         const rangeNewBatches = stats.batchSeq - batchSeqOffset;
         if (rangeNewBatches === 0 && stats.totalDocsRead === 0) {
