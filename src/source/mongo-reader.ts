@@ -1,4 +1,4 @@
-import { MongoClient, ReadPreference, type Collection, type Db, type Document, type Filter } from "mongodb";
+import { MongoClient, ReadPreference, type Collection, type Db, type Document } from "mongodb";
 import type { Logger } from "pino";
 import { type Cursor, cdToEpoch } from '../types/cursor.ts';
 import type { SourceDocument } from '../transform/normalize.ts';
@@ -190,38 +190,24 @@ export class MongoReader {
     const pageLimit = limit ?? this.config.batchRowsTarget;
 
     const ucd = new Date(upperBound.cd);
-    const upperFilter = {
-      $or: [
-        { cd: { $lt: ucd } },
-        { cd: ucd, _id: { $lte: upperBound.id } }
-      ]
-    };
-
-    let filter: Filter<Document>;
-    if (lastCursor === null) {
-      filter = upperFilter as Filter<Document>;
-    } else {
-      const lcd = new Date(lastCursor.cd);
-      const lowerFilter = {
-        $or: [
-          { cd: { $gt: lcd } },
-          { cd: lcd, _id: { $gt: lastCursor.id } }
-        ]
-      };
-      filter = { $and: [lowerFilter, upperFilter] } as Filter<Document>;
-    }
-
     const startMs = performance.now();
 
-    const docs = await this.collection!
-      .find(filter)
+    let query = this.collection!
+      .find({})
       .sort({ cd: 1, _id: 1 })
       .hint({ cd: 1, _id: 1 })
+      .max({ cd: ucd, _id: upperBound.id })
       .limit(pageLimit)
       .batchSize(cursorBatchSize)
       .project(PROJECTION)
-      .maxTimeMS(maxTimeMs)
-      .toArray();
+      .maxTimeMS(maxTimeMs);
+
+    if (lastCursor !== null) {
+      const lcd = new Date(lastCursor.cd);
+      query = query.min({ cd: lcd, _id: lastCursor.id });
+    }
+
+    const docs = await query.toArray();
 
     const fetchMs = Math.round(performance.now() - startMs);
 
@@ -229,6 +215,15 @@ export class MongoReader {
     const lastCursorResult: Cursor | null = docs.length > 0
       ? { cd: cdToEpoch(lastDoc.cd), id: String(lastDoc._id) }
       : null;
+
+    // Guard: min() is inclusive, so the first doc may equal lastCursor.
+    // If it's the only doc returned, lastCursorResult === lastCursor → infinite loop.
+    // Signal "done" to the caller instead.
+    if (lastCursor !== null && lastCursorResult !== null
+        && lastCursorResult.cd === lastCursor.cd
+        && lastCursorResult.id === lastCursor.id) {
+      return { docs: [], lastCursor: null, fetchMs: Math.round(performance.now() - startMs) };
+    }
 
     this.logger.debug(
       { docsRead: docs.length, lastCursor: lastCursorResult, fetchMs },
