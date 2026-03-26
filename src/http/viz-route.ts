@@ -56,6 +56,16 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   .status-failed { background: rgba(239,68,68,0.15); color: var(--red); }
   .status-stopped { background: rgba(234,179,8,0.15); color: var(--yellow); }
   .status-idle { background: rgba(92,96,116,0.15); color: var(--text3); }
+  .status-waiting_for_index { background: rgba(249,115,22,0.15); color: var(--orange); }
+
+  /* Light theme */
+  body.light {
+    --bg: #f5f5f7; --bg2: #ffffff; --bg3: #e8e8ed; --border: #d1d1d6;
+    --text: #1d1d1f; --text2: #6e6e73; --text3: #aeaeb2;
+    --bar-bg: #e8e8ed;
+  }
+  body.light .btn { background: #f0f0f5; }
+  body.light .btn:hover:not(:disabled) { background: #e0e0e5; }
 
   /* Progress bars */
   .progress-outer { background: var(--bar-bg); border-radius: 6px; height: 24px; overflow: hidden; position: relative; }
@@ -145,6 +155,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <span id="svc-host" class="muted"></span>
     <span id="svc-uptime"></span>
     <span>v<span id="svc-version">-</span></span>
+    <button class="btn" id="btn-theme" style="padding:4px 8px;font-size:11px">Theme</button>
     <div class="heartbeat" id="heartbeat"></div>
   </div>
 </div>
@@ -251,6 +262,12 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Index Status -->
+<div class="card full" style="margin-top:12px">
+  <h3>Index Status <span id="idx-summary" style="font-weight:400;color:var(--text2)"></span></h3>
+  <div id="idx-details" style="font-size:12px"></div>
+</div>
+
 <!-- Collections Table -->
 <div class="card full" style="margin-top:12px">
   <h3>Collections <span id="coll-summary" style="font-weight:400;color:var(--text2)"></span></h3>
@@ -278,7 +295,15 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   function $(id) { return document.getElementById(id); }
   function fmt(n) { return n == null ? '-' : Number(n).toLocaleString('en-US'); }
   function mb(b) { return b ? (b / 1024 / 1024).toFixed(0) + ' MB' : '-'; }
-  function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.textContent; }
+
+  // Theme toggle
+  var theme = localStorage.getItem('viz-theme') || 'dark';
+  if (theme === 'light') document.body.classList.add('light');
+  $('btn-theme').addEventListener('click', function() {
+    document.body.classList.toggle('light');
+    theme = document.body.classList.contains('light') ? 'light' : 'dark';
+    localStorage.setItem('viz-theme', theme);
+  });
 
   // Tab switching
   $('tab-bar').addEventListener('click', function(e) {
@@ -299,6 +324,7 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 
   function statusClass(s) {
     if (s === 'running' || s === 'stopping') return 'status-running';
+    if (s === 'waiting_for_index') return 'status-waiting_for_index';
     if (s === 'paused') return 'status-paused';
     if (s === 'completed') return 'status-completed';
     if (s === 'failed') return 'status-failed';
@@ -574,6 +600,39 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
         ['Bitmap Bits Set', String(redis.bitmapBitsSet || 0)],
         ['Redis Error', redis.lastError || 'none', redis.lastError ? 'var(--red)' : 'var(--text3)'],
       ]);
+
+      // Index status
+      var idx = d.indexStatus || { ready: 0, building: 0, failed: 0, details: [] };
+      $('idx-summary').textContent = '(' + idx.ready + ' ready, ' + idx.building + ' building' + (idx.failed > 0 ? ', ' + idx.failed + ' failed' : '') + ')';
+      var idxContainer = $('idx-details');
+      while (idxContainer.firstChild) idxContainer.removeChild(idxContainer.firstChild);
+      if (idx.building === 0 && idx.failed === 0) {
+        var allReady = document.createElement('span');
+        allReady.style.color = 'var(--green)';
+        allReady.textContent = 'All indexes ready';
+        idxContainer.appendChild(allReady);
+      } else {
+        for (var ii = 0; ii < idx.details.length; ii++) {
+          var det = idx.details[ii];
+          var detRow = document.createElement('div');
+          detRow.style.cssText = 'display:flex;justify-content:space-between;padding:2px 0';
+          var detName = document.createElement('span');
+          detName.style.cssText = 'max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px';
+          detName.textContent = det.collection.length > 50 ? det.collection.slice(0, 20) + '...' + det.collection.slice(-8) : det.collection;
+          detRow.appendChild(detName);
+          var detStatus = document.createElement('span');
+          detStatus.style.fontWeight = '600';
+          if (det.status === 'building') {
+            detStatus.style.color = 'var(--orange)';
+            detStatus.textContent = 'building' + (det.elapsedSec ? ' (' + Math.round(det.elapsedSec / 60) + 'm)' : '');
+          } else {
+            detStatus.style.color = 'var(--red)';
+            detStatus.textContent = 'failed';
+          }
+          detRow.appendChild(detStatus);
+          idxContainer.appendChild(detRow);
+        }
+      }
 
       // Collections
       var orch = d.orchestrator || {};

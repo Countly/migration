@@ -76,6 +76,7 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
     const runnerStatus = orchestrator.getStatus();
     const currentBatchSeq = orchestrator.getCurrentBatchSeq();
     const estimatedCounts = orchestrator.getEstimatedCounts();
+    const indexStatus = orchestrator.getIndexStatus();
 
     // Find the current run ID from the orchestrator's progress
     const currentResult = progress.results.find(
@@ -172,6 +173,8 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
         skipRate: currentCollDocsRead > 0
           ? `${((totalDocsSkipped / currentCollDocsRead) * 100).toFixed(1)}%` : '0%',
       } : null,
+
+      indexStatus,
 
       service: {
         name: config.service.name,

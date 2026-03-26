@@ -55,9 +55,9 @@ export const configSchema = z.object({
         readConcern: z.string().default("majority"),
         retryReads: booleanFromEnv.default(true),
         appName: z.string().optional(),
-        batchRowsTarget: positiveIntFromEnv.default(10_000),
+        batchRowsTarget: positiveIntFromEnv.default(50_000),
         mongoPageSize: positiveIntFromEnv.default(2_000),
-        cursorBatchSize: positiveIntFromEnv.default(2_000),
+        cursorBatchSize: positiveIntFromEnv.default(10_000),
         maxTimeMs: positiveIntFromEnv.default(600_000),
     }),
 

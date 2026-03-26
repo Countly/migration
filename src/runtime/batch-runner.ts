@@ -50,6 +50,7 @@ export interface BatchRunnerDeps {
 export type RunnerStatus =
   | "idle"
   | "running"
+  | "waiting_for_index"
   | "paused"
   | "stopping"
   | "stopped"

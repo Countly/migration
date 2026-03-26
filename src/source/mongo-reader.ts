@@ -80,8 +80,37 @@ export class MongoReader {
   }
 
   /**
+   * Check if a collection has the required { cd: 1, _id: 1 } compound index.
+   */
+  async hasRequiredIndex(collectionName: string): Promise<boolean> {
+    if (!this.connected || !this.db) {
+      throw new Error("MongoReader is not connected. Call connect() first.");
+    }
+    const coll = this.db.collection(collectionName);
+    const indexes = await coll.indexes();
+    return indexes.some(idx => {
+      const key = idx.key as Record<string, unknown>;
+      return key['cd'] !== undefined && key['_id'] !== undefined;
+    });
+  }
+
+  /**
+   * Start index creation for a collection. This may take a long time for
+   * large collections. The returned promise resolves when the index is built.
+   */
+  async startIndexCreation(collectionName: string): Promise<void> {
+    if (!this.connected || !this.db) {
+      throw new Error("MongoReader is not connected. Call connect() first.");
+    }
+    const coll = this.db.collection(collectionName);
+    this.logger.info({ collection: collectionName }, "Starting index creation { cd: 1, _id: 1 }");
+    await coll.createIndex({ cd: 1, _id: 1 });
+    this.logger.info({ collection: collectionName }, "Index creation completed");
+  }
+
+  /**
    * Switch to a different collection within the same database.
-   * Creates the { cd: 1, _id: 1 } compound index if it doesn't exist.
+   * Caller is responsible for ensuring the required index exists.
    */
   async switchCollection(collectionName: string): Promise<void> {
     if (!this.connected || !this.db) {
@@ -90,19 +119,6 @@ export class MongoReader {
 
     this.collection = this.db.collection(collectionName);
     this.currentCollectionName = collectionName;
-
-    const indexes = await this.collection.indexes();
-    const hasCompoundIndex = indexes.some(idx => {
-      const key = idx.key as Record<string, unknown>;
-      return key['cd'] !== undefined && key['_id'] !== undefined;
-    });
-
-    if (!hasCompoundIndex) {
-      this.logger.info({ collection: collectionName }, "Creating compound index { cd: 1, _id: 1 }");
-      await this.collection.createIndex({ cd: 1, _id: 1 });
-      this.logger.info({ collection: collectionName }, "Compound index created");
-    }
-
     this.logger.info({ collection: collectionName }, "Switched to collection");
   }
 
@@ -122,6 +138,7 @@ export class MongoReader {
     const result = await this.collection!
       .find({})
       .sort({ cd: -1, _id: -1 })
+      .hint({ cd: 1, _id: 1 })
       .limit(1)
       .project({ cd: 1, _id: 1 })
       .maxTimeMS(this.config.maxTimeMs)

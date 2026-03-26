@@ -16,6 +16,15 @@ import type { Config } from "../config/schema.ts";
 // Types
 // ---------------------------------------------------------------------------
 
+export type IndexBuildStatus = "checking" | "building" | "ready" | "failed";
+
+export interface IndexStatusSummary {
+    ready: number;
+    building: number;
+    failed: number;
+    details: Array<{ collection: string; status: IndexBuildStatus; elapsedSec?: number }>;
+}
+
 export interface CollectionResult {
     collection: string;
     sourceNs: string;
@@ -67,10 +76,13 @@ export class CollectionOrchestrator {
     private discoveredCollections: string[] = [];
     private results: CollectionResult[] = [];
     private estimatedCounts: Map<string, number> = new Map();
+    private indexStatus: Map<string, IndexBuildStatus> = new Map();
+    private indexBuildStarted: Map<string, number> = new Map();
     private currentCollection: string | null = null;
     private currentRunId: string | null = null;
     private currentBatchRunner: BatchRunner | null = null;
     private currentRedisState: RedisHotState | null = null;
+    private orchestratorStatus: "idle" | "running" | "waiting_for_index" | "completed" = "idle";
     private stopping = false;
 
     constructor(deps: OrchestratorDeps) {
@@ -91,64 +103,99 @@ export class CollectionOrchestrator {
 
         this.logger.info(
             { totalCollections: this.discoveredCollections.length },
-            "Starting sequential migration across collections",
+            "Starting migration with index-aware scheduling",
         );
 
-        // 2. Process each collection sequentially
-        for (const collectionName of this.discoveredCollections) {
-            if (this.stopping) {
-                this.logger.info({ collection: collectionName }, "Orchestrator stopping, skipping remaining collections");
-                break;
-            }
+        // 2. Kick off index checks and background builds for ALL collections
+        await this.initializeIndexes();
 
-            const sourceNs = `${config.source.db}.${collectionName}`;
-            const targetTable = `${config.target.db}.${config.target.table}`;
+        this.orchestratorStatus = "running";
 
-            // Check if a completed run already exists for this collection
-            const alreadyCompleted = await manifestStore.existsCompletedRun(sourceNs, targetTable);
+        // 3. Process loop: pick ready collections, wait for building ones
+        while (!this.stopping) {
+            const completed = new Set(this.results.map(r => r.collection));
 
-            if (alreadyCompleted) {
-                this.logger.info({ collection: collectionName, sourceNs }, "Collection already migrated, skipping");
-                this.results.push({
-                    collection: collectionName,
-                    sourceNs,
-                    runId: "",
-                    status: "skipped",
-                });
+            // Find next collection with index ready and not yet processed
+            const next = this.findNextReadyCollection(completed);
+
+            if (next) {
+                this.orchestratorStatus = "running";
+                const sourceNs = `${config.source.db}.${next}`;
+                const targetTable = `${config.target.db}.${config.target.table}`;
+
+                // Check if already completed (resume mode)
+                const alreadyCompleted = await manifestStore.existsCompletedRun(sourceNs, targetTable);
+                if (alreadyCompleted) {
+                    this.logger.info({ collection: next, sourceNs }, "Collection already migrated, skipping");
+                    this.results.push({ collection: next, sourceNs, runId: "", status: "skipped" });
+                    continue;
+                }
+
+                // Process this collection
+                try {
+                    const result = await this.processCollection(next, sourceNs, targetTable);
+                    this.results.push(result);
+
+                    if (result.status === "completed") {
+                        this.logger.info({ collection: next, runId: result.runId }, "Collection migration completed");
+                    } else if (result.status === "failed") {
+                        this.logger.error(
+                            { collection: next, runId: result.runId, error: result.error },
+                            "Collection migration failed, continuing to next",
+                        );
+                    }
+                } catch (err) {
+                    const error = err instanceof Error ? err.message : String(err);
+                    this.logger.error({ collection: next, error }, "Unexpected error migrating collection");
+                    this.results.push({ collection: next, sourceNs, runId: "", status: "failed", error });
+                }
                 continue;
             }
 
-            // Process this collection
-            try {
-                const result = await this.processCollection(collectionName, sourceNs, targetTable);
-                this.results.push(result);
+            // No ready collection — are some still building?
+            const buildingCount = this.getCollectionsWithStatus("building").length;
+            const allProcessed = completed.size + buildingCount >= this.discoveredCollections.length
+                || this.allCollectionsResolved(completed);
 
-                if (result.status === "completed") {
-                    this.logger.info({ collection: collectionName, runId: result.runId }, "Collection migration completed");
-                } else if (result.status === "failed") {
-                    this.logger.error(
-                        { collection: collectionName, runId: result.runId, error: result.error },
-                        "Collection migration failed, continuing to next",
-                    );
-                }
-            } catch (err) {
-                const error = err instanceof Error ? err.message : String(err);
-                this.logger.error({ collection: collectionName, error }, "Unexpected error migrating collection, continuing to next");
-                this.results.push({
-                    collection: collectionName,
-                    sourceNs,
-                    runId: "",
-                    status: "failed",
-                    error,
-                });
+            if (buildingCount > 0 && !allProcessed) {
+                this.orchestratorStatus = "waiting_for_index";
+                const building = this.getCollectionsWithStatus("building");
+                this.logger.info(
+                    { buildingCount: building.length, first5: building.slice(0, 5).map(n => n.slice(0, 30)) },
+                    "Waiting for index creation — rechecking in 60s",
+                );
+
+                // Interruptible 60s sleep
+                await this.interruptibleSleep(60_000);
+
+                // Recheck building indexes
+                await this.recheckBuildingIndexes();
+                continue;
             }
+
+            // If there are building indexes but all other collections are done, wait for them
+            if (buildingCount > 0) {
+                this.orchestratorStatus = "waiting_for_index";
+                const building = this.getCollectionsWithStatus("building");
+                this.logger.info(
+                    { buildingCount: building.length },
+                    "All other collections done — waiting for remaining index builds (60s)",
+                );
+                await this.interruptibleSleep(60_000);
+                await this.recheckBuildingIndexes();
+                continue;
+            }
+
+            // All done (or all failed/skipped)
+            break;
         }
 
         this.currentCollection = null;
         this.currentRunId = null;
         this.currentBatchRunner = null;
+        this.orchestratorStatus = "completed";
 
-        // 3. Summary
+        // Summary
         const summary: OrchestratorResult = {
             collections: this.results,
             totalCompleted: this.results.filter((r) => r.status === "completed").length,
@@ -209,8 +256,14 @@ export class CollectionOrchestrator {
     }
 
     getStatus(): RunnerStatus {
+        if (this.orchestratorStatus === "waiting_for_index") {
+            return "waiting_for_index";
+        }
         if (this.currentBatchRunner) {
             return this.currentBatchRunner.getStatus();
+        }
+        if (this.orchestratorStatus === "completed") {
+            return "completed";
         }
         if (this.discoveredCollections.length > 0 && this.results.length === this.discoveredCollections.length) {
             return "completed";
@@ -230,8 +283,134 @@ export class CollectionOrchestrator {
         return new Map(this.estimatedCounts);
     }
 
+    getIndexStatus(): IndexStatusSummary {
+        let ready = 0, building = 0, failed = 0;
+        const details: Array<{ collection: string; status: IndexBuildStatus; elapsedSec?: number }> = [];
+
+        for (const [name, status] of this.indexStatus) {
+            if (status === "ready") {
+                ready++;
+            } else if (status === "building") {
+                building++;
+                const elapsed = Math.round((Date.now() - (this.indexBuildStarted.get(name) ?? Date.now())) / 1000);
+                details.push({ collection: name, status, elapsedSec: elapsed });
+            } else if (status === "failed") {
+                failed++;
+                details.push({ collection: name, status });
+            }
+        }
+
+        return { ready, building, failed, details };
+    }
+
     // -----------------------------------------------------------------------
-    // Private
+    // Private: Index Management
+    // -----------------------------------------------------------------------
+
+    private async initializeIndexes(): Promise<void> {
+        const { mongoReader } = this.deps;
+
+        for (const name of this.discoveredCollections) {
+            this.indexStatus.set(name, "checking");
+        }
+
+        // Check all indexes (sequentially to avoid overwhelming MongoDB)
+        for (const name of this.discoveredCollections) {
+            try {
+                const hasIndex = await mongoReader.hasRequiredIndex(name);
+                if (hasIndex) {
+                    this.indexStatus.set(name, "ready");
+                } else {
+                    this.indexStatus.set(name, "building");
+                    this.indexBuildStarted.set(name, Date.now());
+
+                    // Fire and forget — createIndex runs in background
+                    mongoReader.startIndexCreation(name)
+                        .then(() => {
+                            this.indexStatus.set(name, "ready");
+                            const elapsed = Math.round((Date.now() - (this.indexBuildStarted.get(name) ?? Date.now())) / 1000);
+                            this.logger.info({ collection: name, durationSec: elapsed }, "Background index build completed");
+                        })
+                        .catch((err) => {
+                            this.indexStatus.set(name, "failed");
+                            this.logger.error({ collection: name, err: err instanceof Error ? err.message : String(err) }, "Index creation failed");
+                        });
+                }
+            } catch (err) {
+                this.indexStatus.set(name, "failed");
+                this.logger.error({ collection: name, err: err instanceof Error ? err.message : String(err) }, "Failed to check index");
+            }
+        }
+
+        const ready = [...this.indexStatus.values()].filter(s => s === "ready").length;
+        const building = [...this.indexStatus.values()].filter(s => s === "building").length;
+        const failed = [...this.indexStatus.values()].filter(s => s === "failed").length;
+
+        this.logger.info(
+            { ready, building, failed, total: this.discoveredCollections.length },
+            "Index initialization complete",
+        );
+    }
+
+    private findNextReadyCollection(completed: Set<string>): string | null {
+        for (const name of this.discoveredCollections) {
+            if (completed.has(name)) continue;
+            if (this.indexStatus.get(name) === "ready") return name;
+        }
+        return null;
+    }
+
+    private getCollectionsWithStatus(status: IndexBuildStatus): string[] {
+        return [...this.indexStatus.entries()]
+            .filter(([, s]) => s === status)
+            .map(([name]) => name);
+    }
+
+    private allCollectionsResolved(completed: Set<string>): boolean {
+        for (const name of this.discoveredCollections) {
+            if (completed.has(name)) continue;
+            const idx = this.indexStatus.get(name);
+            if (idx === "building" || idx === "checking") return false;
+        }
+        return true;
+    }
+
+    private async recheckBuildingIndexes(): Promise<void> {
+        const { mongoReader } = this.deps;
+
+        for (const [name, status] of this.indexStatus) {
+            if (status !== "building") continue;
+            try {
+                const ready = await mongoReader.hasRequiredIndex(name);
+                if (ready) {
+                    const elapsed = Math.round((Date.now() - (this.indexBuildStarted.get(name) ?? Date.now())) / 1000);
+                    this.indexStatus.set(name, "ready");
+                    this.logger.info({ collection: name, durationSec: elapsed }, "Index build detected as complete");
+                }
+            } catch (err) {
+                this.logger.warn({ collection: name, err: err instanceof Error ? err.message : String(err) }, "Failed to recheck index");
+            }
+        }
+    }
+
+    private async interruptibleSleep(ms: number): Promise<void> {
+        return new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, ms);
+            // Allow stopping to interrupt the sleep
+            const check = setInterval(() => {
+                if (this.stopping) {
+                    clearTimeout(timer);
+                    clearInterval(check);
+                    resolve();
+                }
+            }, 1000);
+            // Ensure interval is cleaned up when timer fires normally
+            setTimeout(() => clearInterval(check), ms + 100);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Private: Collection Processing
     // -----------------------------------------------------------------------
 
     private async processCollection(
@@ -243,7 +422,7 @@ export class CollectionOrchestrator {
 
         this.currentCollection = collectionName;
 
-        // Switch MongoReader to this collection (also ensures index)
+        // Switch MongoReader to this collection (index already confirmed ready)
         await mongoReader.switchCollection(collectionName);
 
         // Get estimated document count for progress tracking
@@ -344,7 +523,6 @@ export class CollectionOrchestrator {
                 };
             }
             if (finalStatus === "stopped" || finalStatus === "stopping") {
-                // Stopped by operator — treat as incomplete, not failed
                 return {
                     collection: collectionName, sourceNs, runId, status: "failed", error: "Stopped by operator",
                     docsRead: finalStats.totalDocsRead,
@@ -352,10 +530,7 @@ export class CollectionOrchestrator {
                 };
             }
             return {
-                collection: collectionName,
-                sourceNs,
-                runId,
-                status: "failed",
+                collection: collectionName, sourceNs, runId, status: "failed",
                 error: `BatchRunner ended with status: ${finalStatus}`,
                 docsRead: finalStats.totalDocsRead,
                 rowsInserted: finalStats.totalRowsInserted,
