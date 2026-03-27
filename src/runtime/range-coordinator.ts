@@ -8,6 +8,7 @@ import type { ClickHousePressure, BackpressureConfig } from "../target/clickhous
 import type { GcController } from "./gc-controller.ts";
 import type { RetryPolicy } from "./retry-policy.ts";
 import { BatchRunner } from "./batch-runner.ts";
+import type { SkipReason } from "../transform/skip-reasons.ts";
 import type { CollectionDefaults } from "../transform/hash-resolver.ts";
 import type { AsyncBatchWriter } from "../state/async-batch-writer.ts";
 import { serializeCursor, deserializeCursor } from "../types/cursor.ts";
@@ -132,13 +133,19 @@ export class RangeCoordinator {
     private readonly runIdKey: string;
     private readonly metaKey: string;
     private stopping = false;
-    private activeBatchRunner: BatchRunner | null = null;
+    activeBatchRunner: BatchRunner | null = null;
     private readonly rangeRetryCounts = new Map<number, number>();
 
     /** Accumulated docs read across all completed ranges (updated live). */
     totalDocsRead = 0;
     /** Accumulated rows inserted across all completed ranges (updated live). */
     totalRowsInserted = 0;
+    /** Accumulated docs skipped across all completed ranges. */
+    totalDocsSkipped = 0;
+    /** Accumulated skip reasons across all completed ranges. */
+    skipsByReason: Record<SkipReason, number> = {} as Record<SkipReason, number>;
+    /** Timestamp when range processing started. */
+    startTime = 0;
 
     constructor(deps: RangeCoordinatorDeps) {
         this.deps = deps;
@@ -161,6 +168,9 @@ export class RangeCoordinator {
 
         this.totalDocsRead = 0;
         this.totalRowsInserted = 0;
+        this.totalDocsSkipped = 0;
+        this.skipsByReason = {} as Record<SkipReason, number>;
+        this.startTime = Date.now();
         let completedRanges = 0;
         let failedRanges = 0;
 
@@ -186,6 +196,10 @@ export class RangeCoordinator {
                         const result = await this.processRange(range, runId);
                         this.totalDocsRead += result.docsRead;
                         this.totalRowsInserted += result.rowsInserted;
+                        this.totalDocsSkipped += result.docsSkipped;
+                        for (const [reason, count] of Object.entries(result.skipsByReason) as Array<[SkipReason, number]>) {
+                            this.skipsByReason[reason] = (this.skipsByReason[reason] ?? 0) + count;
+                        }
                         await this.markRangeDone(range.idx);
                         completedRanges++;
                         this.logger.info({ rangeIdx: range.idx, docsRead: result.docsRead, rowsInserted: result.rowsInserted }, "Range completed");
@@ -417,7 +431,7 @@ export class RangeCoordinator {
         await this.deps.redis.hset(this.rangesKey, String(idx), JSON.stringify(entry));
     }
 
-    private async processRange(range: RangeEntry, runId: string): Promise<{ docsRead: number; rowsInserted: number }> {
+    private async processRange(range: RangeEntry, runId: string): Promise<{ docsRead: number; rowsInserted: number; docsSkipped: number; skipsByReason: Record<SkipReason, number> }> {
         const { manifestStore, asyncBatchWriter, mongoReader, chWriter, chPressure, gcController, retryPolicy, config } = this.deps;
 
         // Cursor bounds: [startCd, endCd) for non-final ranges, [startCd, maxCd] for final
@@ -531,6 +545,11 @@ export class RangeCoordinator {
             startedAt: rangeStartedAt,
         }).catch(() => {});
 
-        return { docsRead: stats.totalDocsRead, rowsInserted: stats.totalRowsInserted };
+        return {
+            docsRead: stats.totalDocsRead,
+            rowsInserted: stats.totalRowsInserted,
+            docsSkipped: stats.totalDocsSkipped,
+            skipsByReason: stats.skipsByReason ?? {},
+        };
     }
 }

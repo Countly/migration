@@ -95,6 +95,7 @@ export class CollectionOrchestrator {
     private currentRedisState: RedisHotState | null = null;
     private orchestratorStatus: "idle" | "running" | "waiting_for_index" | "completed" = "idle";
     private stopping = false;
+    private firstCollectionStartedAt: number | null = null;
 
     constructor(deps: OrchestratorDeps) {
         this.deps = deps;
@@ -215,7 +216,7 @@ export class CollectionOrchestrator {
                         const rowsInserted = completedRun?.summary?.total_rows_inserted ?? 0;
                         const completedRunId = completedRun?.run_id ?? "";
                         this.logger.info({ collection: next, sourceNs, docsRead, rowsInserted }, "Collection already migrated, skipping (manifest fallback)");
-                        this.results.push({ collection: next, sourceNs, runId: completedRunId, status: "skipped", docsRead, rowsInserted });
+                        this.results.push({ collection: next, sourceNs, runId: completedRunId, status: "completed", docsRead, rowsInserted });
 
                         // Backfill Redis for next restart
                         await this.deps.redisState.setCollectionCompleted(next, {
@@ -344,6 +345,10 @@ export class CollectionOrchestrator {
         return this.currentRunId;
     }
 
+    getFirstCollectionStartedAt(): number | null {
+        return this.firstCollectionStartedAt;
+    }
+
     pause(): void {
         this.currentBatchRunner?.pause();
         this.currentRangeCoordinator?.pause();
@@ -392,17 +397,24 @@ export class CollectionOrchestrator {
             return stats;
         }
         if (this.currentRangeCoordinator) {
+            const coord = this.currentRangeCoordinator;
+            const active = coord.activeBatchRunner?.getStats();
+            const totalDocsRead = coord.totalDocsRead + (active?.totalDocsRead ?? 0);
+            const totalRowsInserted = coord.totalRowsInserted + (active?.totalRowsInserted ?? 0);
+            const totalDocsSkipped = coord.totalDocsSkipped + (active?.totalDocsSkipped ?? 0);
+            const elapsedMs = coord.startTime > 0 ? Date.now() - coord.startTime : 0;
+            const elapsedSec = elapsedMs / 1000;
             return {
                 status: "running",
                 batchSeq: 0,
                 lastCommittedId: null,
-                totalDocsRead: this.currentRangeCoordinator.totalDocsRead,
-                totalRowsInserted: this.currentRangeCoordinator.totalRowsInserted,
-                totalDocsSkipped: 0,
-                skipsByReason: {} as Record<string, number>,
-                elapsedMs: 0,
-                docsPerSecond: 0,
-                rowsPerSecond: 0,
+                totalDocsRead,
+                totalRowsInserted,
+                totalDocsSkipped,
+                skipsByReason: { ...coord.skipsByReason },
+                elapsedMs,
+                docsPerSecond: elapsedSec > 0 ? totalDocsRead / elapsedSec : 0,
+                rowsPerSecond: elapsedSec > 0 ? totalRowsInserted / elapsedSec : 0,
                 batchesFailed: 0,
                 digestMismatches: 0,
                 estimatedDuplicateRows: 0,
@@ -529,7 +541,7 @@ export class CollectionOrchestrator {
                 collection,
                 sourceNs: `${config.source.db}.${collection}`,
                 runId: data.runId,
-                status: "skipped",
+                status: "completed",
                 docsRead: data.docsRead,
                 rowsInserted: data.rowsInserted,
             });
@@ -698,6 +710,9 @@ export class CollectionOrchestrator {
         const { mongoReader, manifestStore, chWriter, chPressure, gcController, retryPolicy, config } = this.deps;
 
         this.currentCollection = collectionName;
+        if (!this.firstCollectionStartedAt) {
+            this.firstCollectionStartedAt = Date.now();
+        }
 
         // Switch MongoReader to this collection (index already confirmed ready)
         await mongoReader.switchCollection(collectionName);
