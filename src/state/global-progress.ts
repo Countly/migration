@@ -55,7 +55,7 @@ export class GlobalProgress {
     // -----------------------------------------------------------------------
 
     async updateCollectionProgress(progress: CollectionProgress): Promise<void> {
-        const key = `${this.keyPrefix}:progress:${progress.collectionName}`;
+        const key = `${this.keyPrefix}:progress:${progress.collectionName}:${progress.podId}`;
         await this.redis.set(
             key,
             JSON.stringify(progress),
@@ -65,7 +65,7 @@ export class GlobalProgress {
     }
 
     async getCollectionProgress(collectionName: string): Promise<CollectionProgress | null> {
-        const key = `${this.keyPrefix}:progress:${collectionName}`;
+        const key = `${this.keyPrefix}:progress:${collectionName}:${this.podId}`;
         const raw = await this.redis.get(key);
         if (!raw) return null;
         return JSON.parse(raw) as CollectionProgress;

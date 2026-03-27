@@ -221,47 +221,55 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
     // Merge cluster progress with local data for comprehensive collection status
     const mergedCollectionProgress = progress.collections.map(collection => {
       const localResult = progress.results.find(r => r.collection === collection);
-      const remote = clusterData?.collectionProgress.find(p => p.collectionName === collection);
+      // Sum ALL pods' progress entries for this collection (per-pod keys)
+      const remotes = clusterData?.collectionProgress.filter(p => p.collectionName === collection) ?? [];
+      const remoteDocsRead = remotes.reduce((s, r) => s + (r.docsRead ?? 0), 0);
+      const remoteRowsInserted = remotes.reduce((s, r) => s + (r.rowsInserted ?? 0), 0);
+      const remoteAnyCompleted = remotes.some(r => r.status === 'completed');
+      const remoteAnyProcessing = remotes.some(r => r.status === 'processing');
+      const remoteStatus = remoteAnyProcessing ? 'processing' : remoteAnyCompleted ? 'completed' : remotes[0]?.status;
+      const remoteRunId = remotes[0]?.runId || null;
+      const remoteEstimated = remotes[0]?.estimatedTotal ?? null;
+      const remotePodId = remotes[0]?.podId ?? null;
 
       // Local "skipped" means another pod completed it — use remote data for attribution
-      if (localResult && localResult.status === 'skipped' && remote) {
+      if (localResult && localResult.status === 'skipped' && remotes.length > 0) {
         return {
           collection,
-          status: remote.status as string,
-          runId: remote.runId || null,
-          estimated: remote.estimatedTotal ?? estimatedCounts.get(collection) ?? null,
-          docsRead: remote.docsRead ?? null,
-          rowsInserted: remote.rowsInserted ?? null,
-          podId: remote.podId,
+          status: remoteStatus as string,
+          runId: remoteRunId,
+          estimated: remoteEstimated ?? estimatedCounts.get(collection) ?? null,
+          docsRead: remoteDocsRead || null,
+          rowsInserted: remoteRowsInserted || null,
+          podId: remotePodId,
         };
       }
-      // Local result takes priority — overlay persistent completion data for best counts
+      // Local result — overlay persistent completion and remote aggregate for best counts
       if (localResult) {
         const completedAgg = completedAggregates.get(collection);
-        const remoteCompleted = remote && remote.status === 'completed';
-        const isCompleted = remoteCompleted || !!completedAgg || localResult.status === 'completed';
-        const bestDocsRead = Math.max(localResult.docsRead ?? 0, remote?.docsRead ?? 0, completedAgg?.docsRead ?? 0);
-        const bestRowsInserted = Math.max(localResult.rowsInserted ?? 0, remote?.rowsInserted ?? 0, completedAgg?.rowsInserted ?? 0);
+        const isCompleted = remoteAnyCompleted || !!completedAgg || localResult.status === 'completed';
+        const bestDocsRead = Math.max(localResult.docsRead ?? 0, remoteDocsRead, completedAgg?.docsRead ?? 0);
+        const bestRowsInserted = Math.max(localResult.rowsInserted ?? 0, remoteRowsInserted, completedAgg?.rowsInserted ?? 0);
         return {
           collection,
           status: isCompleted ? 'completed' : localResult.status,
-          runId: localResult.runId || completedAgg?.runId || remote?.runId || null,
+          runId: localResult.runId || completedAgg?.runId || remoteRunId || null,
           estimated: estimatedCounts.get(collection) ?? null,
           docsRead: isCompleted ? (bestDocsRead || null) : (localResult.docsRead ?? null),
           rowsInserted: isCompleted ? (bestRowsInserted || null) : (localResult.rowsInserted ?? null),
-          podId: remoteCompleted ? remote.podId : config.worker.podId,
+          podId: remoteAnyCompleted ? remotePodId : config.worker.podId,
         };
       }
       // Check cluster progress from other pods
-      if (remote) {
+      if (remotes.length > 0) {
         return {
           collection,
-          status: remote.status,
-          runId: remote.runId || null,
-          estimated: remote.estimatedTotal ?? null,
-          docsRead: remote.docsRead ?? null,
-          rowsInserted: remote.rowsInserted ?? null,
-          podId: remote.podId,
+          status: remoteStatus as string,
+          runId: remoteRunId,
+          estimated: remoteEstimated ?? null,
+          docsRead: remoteDocsRead || null,
+          rowsInserted: remoteRowsInserted || null,
+          podId: remotePodId,
         };
       }
       // Check persistent completion data (survives TTL expiry of progress:* keys)
