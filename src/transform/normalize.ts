@@ -27,7 +27,7 @@ import type { CollectionDefaults } from './hash-resolver.ts';
  */
 const KNOWN_FIELDS = new Set<string>([
   'a', 'e', 'n', 'uid', 'uid_canon', 'did', 'lsid',
-  '_id', 'ts', 'up', 'custom', 'cmp', 'sg', 'c', 's', 'dur', 'lu', 'cd',
+  '_id', 'ts', 'up', 'custom', 'cmp', 'sg', 'c', 's', 'dur', 'lu',
 ]);
 
 const CLY_PREFIX = '[CLY]_';
@@ -81,7 +81,6 @@ export interface OutputRow {
   s: number;
   dur: number;
   lu?: string;
-  cd?: string;
 }
 
 export interface TransformResult {
@@ -259,13 +258,6 @@ function doTransform(doc: SourceDocument, defaults?: CollectionDefaults): Transf
     row['lu'] = formatTimestamp(luMillis);
   } else {
     delete row['lu'];
-  }
-
-  const cdMillis = toEpochMillis(doc.cd);
-  if (cdMillis !== null) {
-    row['cd'] = formatTimestamp(cdMillis);
-  } else {
-    delete row['cd'];
   }
 
   return { row: row as unknown as OutputRow, skipReason: null };
