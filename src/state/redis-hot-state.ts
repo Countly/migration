@@ -469,16 +469,17 @@ export class RedisHotState {
     // Persistent collection completion aggregates (no TTL)
     // -----------------------------------------------------------------------
 
-    /** Write completion aggregate for one collection (SET, no TTL). */
+    /** Write completion aggregate for one collection per pod (SET, no TTL). */
     async setCollectionCompleted(
         collection: string,
+        podId: string,
         data: { docsRead: number; rowsInserted: number; runId: string; completedAt: string },
     ): Promise<void> {
-        const key = k(this.prefix, "completed", collection);
+        const key = k(this.prefix, "completed", collection, podId);
         await this.redis.set(key, JSON.stringify(data));
     }
 
-    /** Read all completion aggregates (SCAN + MGET). */
+    /** Read all completion aggregates (SCAN + MGET), summing per-pod entries per collection. */
     async getAllCollectionCompleted(): Promise<Map<string, { docsRead: number; rowsInserted: number; runId: string; completedAt: string }>> {
         const pattern = k(this.prefix, "completed", "*");
         const keys = await this.scanKeys(pattern);
@@ -491,8 +492,23 @@ export class RedisHotState {
             const val = values[i];
             if (val !== null) {
                 try {
-                    const collection = keys[i].slice(prefix.length);
-                    result.set(collection, JSON.parse(val));
+                    const parsed = JSON.parse(val) as { docsRead: number; rowsInserted: number; runId: string; completedAt: string };
+                    // Key format: {prefix}:completed:{collection}:{podId}
+                    // Extract collection name by stripping prefix and last :podId segment
+                    const suffix = keys[i].slice(prefix.length);
+                    const lastColon = suffix.lastIndexOf(":");
+                    const collection = lastColon > 0 ? suffix.slice(0, lastColon) : suffix;
+
+                    const existing = result.get(collection);
+                    if (existing) {
+                        existing.docsRead += parsed.docsRead;
+                        existing.rowsInserted += parsed.rowsInserted;
+                        if (parsed.completedAt > existing.completedAt) {
+                            existing.completedAt = parsed.completedAt;
+                        }
+                    } else {
+                        result.set(collection, { ...parsed });
+                    }
                 } catch {
                     // skip malformed
                 }

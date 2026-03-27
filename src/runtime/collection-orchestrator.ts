@@ -219,7 +219,7 @@ export class CollectionOrchestrator {
                         this.results.push({ collection: next, sourceNs, runId: completedRunId, status: "completed", docsRead, rowsInserted });
 
                         // Backfill Redis for next restart
-                        await this.deps.redisState.setCollectionCompleted(next, {
+                        await this.deps.redisState.setCollectionCompleted(next, config.worker.podId, {
                             docsRead, rowsInserted, runId: completedRunId,
                             completedAt: new Date().toISOString(),
                         }).catch(() => {});
@@ -235,24 +235,10 @@ export class CollectionOrchestrator {
 
                     if (result.status === "completed") {
                         this.logger.info({ collection: next, runId: result.runId }, "Collection migration completed");
-                        // Persist completion aggregate to Redis (no TTL)
-                        // For range-parallel, sum all range stats to get cluster-wide total
-                        let completedDocsRead = result.docsRead ?? 0;
-                        let completedRowsInserted = result.rowsInserted ?? 0;
-                        try {
-                            const rangeLive = await this.deps.redisState.getRangeLiveStats(next);
-                            if (rangeLive.length > 0) {
-                                const rangeDocsRead = rangeLive.reduce((s, r) => s + (r.docsRead ?? 0), 0);
-                                const rangeRowsInserted = rangeLive.reduce((s, r) => s + (r.rowsInserted ?? 0), 0);
-                                if (rangeDocsRead > completedDocsRead) {
-                                    completedDocsRead = rangeDocsRead;
-                                    completedRowsInserted = rangeRowsInserted;
-                                }
-                            }
-                        } catch { /* best-effort — fall back to local counts */ }
-                        await this.deps.redisState.setCollectionCompleted(next, {
-                            docsRead: completedDocsRead,
-                            rowsInserted: completedRowsInserted,
+                        // Persist this pod's completion counts (per-pod key, aggregated on read)
+                        await this.deps.redisState.setCollectionCompleted(next, config.worker.podId, {
+                            docsRead: result.docsRead ?? 0,
+                            rowsInserted: result.rowsInserted ?? 0,
                             runId: result.runId,
                             completedAt: new Date().toISOString(),
                         }).catch(() => {});
