@@ -403,11 +403,11 @@ export class BatchRunner {
           this.stopPhaseHeartbeat();
           await this.setPhase("COMMITTING", { docsRead: accDocsRead, rowsToInsert: rows.length });
 
-          // Redis commit point (uses per-collection/per-range redisState — correct prefix)
-          await this.bestEffortRedis(async () => {
-            await this.deps.redisState.setLastCommittedCursor(runId, upperInclusiveId);
-            await this.deps.redisState.markBatchDone(runId, this.batchSeq);
-          }, "Redis cursor/bitmap commit failed");
+          // Redis commit point — atomic MULTI/EXEC for cursor + bitmap
+          await this.bestEffortRedis(
+            () => this.deps.redisState.commitBatch(runId, upperInclusiveId, this.batchSeq),
+            "Redis cursor/bitmap commit failed",
+          );
 
           // MongoDB: async queue or direct write
           if (this.deps.asyncBatchWriter) {
@@ -464,6 +464,15 @@ export class BatchRunner {
               "Redis timeline snapshot failed (continuing)",
             );
           }
+
+          // Throughput sliding window sample (lightweight LPUSH per batch)
+          await this.bestEffortRedis(
+            () => this.deps.redisState.pushThroughputSample(runId, {
+              ts: Date.now(),
+              docsRead: this.totalDocsRead,
+            }),
+            "Redis throughput sample failed",
+          );
 
           // Clear live batch phase
           if (this.deps.config.collectionName) {

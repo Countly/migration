@@ -808,6 +808,15 @@ const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       if (cluster) {
         $('cluster-card').style.display = 'block';
         $('cluster-summary').textContent = '(' + cluster.podCount + ' pods, ' + cluster.locks.length + ' locks)';
+        // Lock summary in cluster card
+        var ls = cluster.lockSummary;
+        if (ls) {
+          var lockInfo = 'Locks: ' + ls.total + ' held';
+          if (ls.stale > 0) {
+            lockInfo += ', <span style="color:#e74c3c">' + ls.stale + ' stale</span>';
+          }
+          $('cluster-summary').innerHTML += '<div style="margin-top:4px;font-size:0.85em;color:#888">' + lockInfo + '</div>';
+        }
         var gcmds = cluster.globalCommands || {};
         $('btn-global-pause').disabled = gcmds.pause;
         $('btn-global-resume').disabled = !gcmds.pause;

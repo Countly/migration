@@ -203,6 +203,17 @@ export class RedisHotState {
         );
     }
 
+    /**
+     * Atomically commit a batch: set cursor + mark bitmap in a single MULTI/EXEC.
+     * Eliminates the crash window between separate SET and SETBIT calls.
+     */
+    async commitBatch(runId: string, cursor: string, batchSeq: number): Promise<void> {
+        const pipeline = this.redis.multi();
+        pipeline.set(k(this.prefix, "run", runId, "cursor"), cursor);
+        pipeline.setbit(k(this.prefix, "run", runId, "done_bitmap"), batchSeq, 1);
+        await pipeline.exec();
+    }
+
     async getBitmapCount(runId: string): Promise<number> {
         return this.redis.bitcount(
             k(this.prefix, "run", runId, "done_bitmap"),
@@ -294,6 +305,25 @@ export class RedisHotState {
             -1,
         );
         return raw.map((entry: string) => JSON.parse(entry) as TimelineSnapshot);
+    }
+
+    // -----------------------------------------------------------------------
+    // Throughput sliding window (5-min window for accurate real-time throughput)
+    // -----------------------------------------------------------------------
+
+    async pushThroughputSample(runId: string, sample: { ts: number; docsRead: number }): Promise<void> {
+        const key = k(this.prefix, "run", runId, "throughput_window");
+        const pipeline = this.redis.multi();
+        pipeline.lpush(key, JSON.stringify(sample));
+        pipeline.ltrim(key, 0, 59);
+        pipeline.expire(key, 600);
+        await pipeline.exec();
+    }
+
+    async getThroughputWindow(runId: string): Promise<Array<{ ts: number; docsRead: number }>> {
+        const key = k(this.prefix, "run", runId, "throughput_window");
+        const raw = await this.redis.lrange(key, 0, -1);
+        return raw.map(r => JSON.parse(r) as { ts: number; docsRead: number });
     }
 
     // -----------------------------------------------------------------------

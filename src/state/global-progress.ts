@@ -60,7 +60,7 @@ export class GlobalProgress {
             key,
             JSON.stringify(progress),
             "EX",
-            300, // 5 minute TTL, renewed on each update
+            1800, // 30 minute TTL, renewed on each update
         );
     }
 

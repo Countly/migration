@@ -116,6 +116,10 @@ export class CollectionLock {
     private readonly heldLocks = new Set<string>();
     private lockRenewTimer: ReturnType<typeof setInterval> | null = null;
     private podHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    private consecutiveHeartbeatFailures = 0;
+    private _heartbeatHealthy = true;
+
+    get heartbeatHealthy(): boolean { return this._heartbeatHealthy; }
 
     constructor(redis: Redis, podId: string, config: CollectionLockConfig, logger: Logger) {
         this.redis = redis;
@@ -190,11 +194,29 @@ export class CollectionLock {
             });
         }, this.config.renewIntervalMs);
 
-        // Pod liveness heartbeat
+        // Pod liveness heartbeat (with failure tracking)
         this.podHeartbeatTimer = setInterval(() => {
-            this.updatePodLiveness().catch(err => {
-                this.logger.warn({ error: err instanceof Error ? err.message : String(err) }, "Pod heartbeat failed");
-            });
+            this.updatePodLiveness()
+                .then(() => {
+                    this.consecutiveHeartbeatFailures = 0;
+                    this._heartbeatHealthy = true;
+                })
+                .catch(err => {
+                    this.consecutiveHeartbeatFailures++;
+                    const msg = err instanceof Error ? err.message : String(err);
+                    if (this.consecutiveHeartbeatFailures >= 3 && this._heartbeatHealthy) {
+                        this._heartbeatHealthy = false;
+                        this.logger.error(
+                            { consecutive: this.consecutiveHeartbeatFailures, error: msg },
+                            "Pod heartbeat failed 3+ consecutive times — lock acquisition paused until recovery",
+                        );
+                    } else {
+                        this.logger.warn(
+                            { error: msg, consecutive: this.consecutiveHeartbeatFailures },
+                            "Pod heartbeat failed",
+                        );
+                    }
+                });
         }, this.config.podHeartbeatMs);
 
         // Initial pod liveness write

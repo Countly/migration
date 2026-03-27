@@ -50,6 +50,7 @@ export interface StatsDeps {
     getMetrics(): { lastStateWriteMs: number; lastError: string | null };
     getAllLiveBatches(): Promise<LiveBatchData[]>;
     getRangeLiveStats(collection: string): Promise<RangeLiveStats[]>;
+    getThroughputWindow(runId: string): Promise<Array<{ ts: number; docsRead: number }>>;
   };
   gcController: { getTelemetry(): GcTelemetry };
   processMetrics: { snapshot(): ProcessMetricsSnapshot };
@@ -177,6 +178,23 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
       }
     }
 
+    // ── Sliding window throughput (best-effort) ──────────────────────
+    let slidingThroughput: number | null = null;
+    if (runId) {
+      try {
+        const throughputWindow = await redisState.getThroughputWindow(runId);
+        if (throughputWindow.length >= 2) {
+          const newest = throughputWindow[0];
+          const oldest = throughputWindow[throughputWindow.length - 1];
+          const durationSec = (newest.ts - oldest.ts) / 1000;
+          const delta = newest.docsRead - oldest.docsRead;
+          slidingThroughput = durationSec > 0 ? Math.round(delta / durationSec) : null;
+        }
+      } catch {
+        // best-effort
+      }
+    }
+
     // ── Live batches from Redis ──────────────────────────────────────
     let liveBatches: LiveBatchData[] = [];
     try {
@@ -202,16 +220,17 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
           podId: remote.podId,
         };
       }
-      // Local result takes priority for non-skipped statuses
+      // Local result takes priority — but if remote says completed, prefer remote attribution
       if (localResult) {
+        const remoteCompleted = remote && remote.status === 'completed';
         return {
           collection,
-          status: localResult.status,
-          runId: localResult.runId || null,
+          status: remoteCompleted ? 'completed' : localResult.status,
+          runId: localResult.runId || remote?.runId || null,
           estimated: estimatedCounts.get(collection) ?? null,
-          docsRead: localResult.docsRead ?? null,
-          rowsInserted: localResult.rowsInserted ?? null,
-          podId: config.worker.podId,
+          docsRead: remoteCompleted ? (remote.docsRead ?? localResult.docsRead ?? null) : (localResult.docsRead ?? null),
+          rowsInserted: remoteCompleted ? (remote.rowsInserted ?? localResult.rowsInserted ?? null) : (localResult.rowsInserted ?? null),
+          podId: remoteCompleted ? remote.podId : config.worker.podId,
         };
       }
       // Check cluster progress from other pods
@@ -239,11 +258,15 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
     });
 
     // ── Compute cluster-wide aggregates for summary ─────────────────
+    // Exclude collections with null docsRead (not yet started) from both numerator AND denominator
+    const activeMerged = clusterData
+      ? mergedCollectionProgress.filter(c => c.docsRead !== null)
+      : [];
     const clusterDocsRead = clusterData
-      ? mergedCollectionProgress.reduce((s, c) => s + (c.docsRead ?? 0), 0)
+      ? activeMerged.reduce((s, c) => s + (c.docsRead ?? 0), 0)
       : overallDocsRead;
     const clusterEstimated = clusterData
-      ? mergedCollectionProgress.reduce((s, c) => s + (c.estimated ?? 0), 0) || totalEstimated
+      ? (activeMerged.reduce((s, c) => s + (c.estimated ?? 0), 0) || totalEstimated)
       : totalEstimated;
     const clusterPct = clusterEstimated > 0
       ? Math.min(100, Math.round((clusterDocsRead / clusterEstimated) * 100))
@@ -261,10 +284,20 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
       ? (progress.totalCollections || mergedCollectionProgress.length)
       : progress.totalCollections;
 
-    // ETA based on cluster-wide progress
-    const serviceElapsedMs = Date.now() - startedAt.getTime();
-    etaMs = clusterPct > 0 && clusterPct < 100 && serviceElapsedMs > 0
-      ? Math.round((serviceElapsedMs / clusterPct) * (100 - clusterPct))
+    // ETA based on cluster-wide progress — use earliest collection start for accuracy
+    const earliestProcessingStart = clusterData
+      ? activeMerged.reduce((earliest, c) => {
+          const started = (c as Record<string, unknown>)['startedAt'];
+          if (typeof started === 'string') {
+            const ms = new Date(started).getTime();
+            return ms > 0 && ms < earliest ? ms : earliest;
+          }
+          return earliest;
+        }, startedAt.getTime())
+      : startedAt.getTime();
+    const processingElapsedMs = Date.now() - earliestProcessingStart;
+    etaMs = clusterPct > 0 && clusterPct < 100 && processingElapsedMs > 0
+      ? Math.round((processingElapsedMs / clusterPct) * (100 - clusterPct))
       : null;
 
     const payload = {
@@ -281,9 +314,13 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
           + (clusterProcessing > 0 ? `, ${clusterProcessing} processing` : ''),
         docsProgress: `${fmtNum(clusterDocsRead)} / ~${fmtNum(clusterEstimated)} docs`,
         throughput: (() => {
-          // In multi-pod mode, compute cluster-wide throughput from total docs / uptime
+          // Prefer sliding window throughput when available
+          if (slidingThroughput !== null && slidingThroughput > 0) {
+            return `${fmtNum(slidingThroughput)} docs/s`;
+          }
+          // Fallback: cluster-wide lifetime throughput
           const clusterDocs = clusterData
-            ? mergedCollectionProgress.reduce((s, c) => s + (c.docsRead ?? 0), 0)
+            ? activeMerged.reduce((s, c) => s + (c.docsRead ?? 0), 0)
             : 0;
           if (clusterDocs > 0 && uptimeSec > 0) {
             return `${fmtNum(Math.round(clusterDocs / uptimeSec))} docs/s`;
@@ -303,7 +340,11 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
         status: (() => {
           if (!clusterData) return runnerStatus;
           if (clusterProcessing > 0) return "running";
-          if ((clusterDone + clusterFailed) >= clusterTotal && clusterTotal > 0) return "completed";
+          const clusterPending = clusterTotal - clusterDone - clusterFailed;
+          if (clusterPending > 0) return "running";
+          if (clusterTotal > 0 && clusterDone + clusterFailed >= clusterTotal) {
+            return clusterFailed > 0 ? "completed_with_errors" : "completed";
+          }
           return runnerStatus;
         })(),
       },
@@ -419,6 +460,21 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
           .map(l => l.podId)
           .filter(podId => !clusterData!.pods.some(p => p.podId === podId))
           .filter((v, i, a) => a.indexOf(v) === i),
+        lockSummary: {
+          total: clusterData.locks.length,
+          byPod: Object.fromEntries(
+            [...new Set(clusterData.locks.map(l => l.podId))].map(pid =>
+              [pid, clusterData!.locks.filter(l => l.podId === pid).length]
+            )
+          ),
+          stale: clusterData.locks.filter(l => {
+            const pod = clusterData!.pods.find(p => p.podId === l.podId);
+            if (!pod) return true;
+            // Pod key exists but heartbeat is stale (>180s old)
+            const heartbeatAge = Date.now() - new Date(pod.lastHeartbeat).getTime();
+            return heartbeatAge > 180_000;
+          }).length,
+        },
       } : null,
       clusterProgress: clusterData ? (() => {
         const done = mergedCollectionProgress.filter(c => c.status === 'completed' || c.status === 'skipped').length;

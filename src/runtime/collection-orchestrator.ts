@@ -180,6 +180,13 @@ export class CollectionOrchestrator {
 
             const completed = new Set(this.results.map(r => r.collection));
 
+            // Gate: if heartbeat is unhealthy, don't acquire new collections
+            if (collectionLock && !collectionLock.heartbeatHealthy) {
+                this.logger.warn("Pod heartbeat unhealthy — skipping collection acquisition, waiting 10s");
+                await this.interruptibleSleep(10_000);
+                continue;
+            }
+
             // Find next collection with index ready, not yet processed, and not locked by another pod
             const next = await this.findNextReadyCollection(completed);
 
@@ -192,7 +199,10 @@ export class CollectionOrchestrator {
                 const isRangeParallel = await this.isRangeParallelCandidate(next);
 
                 // Already recovered from Redis in recoverCompletedCollections? Skip.
-                if (this.results.some(r => r.collection === next)) continue;
+                if (this.results.some(r => r.collection === next)) {
+                    await collectionLock?.release(next).catch(() => {});
+                    continue;
+                }
 
                 // For range-parallel: check if ranges are all done (not existsCompletedRun)
                 // For standard: check if already completed
@@ -212,6 +222,7 @@ export class CollectionOrchestrator {
                             docsRead, rowsInserted, runId: completedRunId,
                             completedAt: new Date().toISOString(),
                         }).catch(() => {});
+                        await collectionLock?.release(next).catch(() => {});
                         continue;
                     }
                 }
@@ -241,10 +252,8 @@ export class CollectionOrchestrator {
                     this.logger.error({ collection: next, error }, "Unexpected error migrating collection");
                     this.results.push({ collection: next, sourceNs, runId: "", status: "failed", error });
                 } finally {
-                    // Explicitly release collection lock (normal path, only for non-range-parallel)
-                    if (!isRangeParallel) {
-                        await collectionLock?.release(next).catch(() => {});
-                    }
+                    // Release collection lock — always, including range-parallel
+                    await collectionLock?.release(next).catch(() => {});
                 }
                 continue;
             }
