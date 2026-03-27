@@ -119,12 +119,11 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
     const elapsedMs = batchStats?.elapsedMs ?? 0;
     const elapsedSec = elapsedMs / 1000;
 
-    // ── Progress calculations ───────────────────────────────────────────
+    // ── Progress calculations (local only; cluster merge happens after clusterData fetch) ──
     const currentCollEstimate = progress.currentCollection
       ? estimatedCounts.get(progress.currentCollection) ?? 0 : 0;
-    const currentCollDocsRead = totalDocsRead;
-    const currentCollPct = currentCollEstimate > 0
-      ? Math.min(100, Math.round((currentCollDocsRead / currentCollEstimate) * 100)) : 0;
+    let currentCollDocsRead = totalDocsRead;
+    let currentCollPct = 0;
 
     // Overall progress — recomputed after mergedCollectionProgress is built
     const totalEstimated = Array.from(estimatedCounts.values()).reduce((a, b) => a + b, 0);
@@ -180,6 +179,19 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
     try {
       completedAggregates = await redisState.getAllCollectionCompleted();
     } catch { /* best-effort */ }
+
+    // ── Finalize current collection progress (merge cluster data) ──
+    if (clusterData && progress.currentCollection) {
+      const remoteProgress = clusterData.collectionProgress
+        .filter(p => p.collectionName === progress.currentCollection);
+      for (const rp of remoteProgress) {
+        if (rp.podId !== config.worker.podId) {
+          currentCollDocsRead += (rp.docsRead ?? 0);
+        }
+      }
+    }
+    currentCollPct = currentCollEstimate > 0
+      ? Math.min(100, Math.round((currentCollDocsRead / currentCollEstimate) * 100)) : 0;
 
     // ── Sliding window throughput (best-effort) ──────────────────────
     let slidingThroughput: number | null = null;
@@ -527,8 +539,15 @@ export function registerStatsRoute(app: FastifyInstance, deps: StatsDeps): void 
         const pending = mergedCollectionProgress.filter(c => c.status === 'pending').length;
         const total = progress.totalCollections || mergedCollectionProgress.length;
         const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
-        const docsRead = mergedCollectionProgress.reduce((s, c) => s + (c.docsRead ?? 0), 0);
-        const rowsInserted = mergedCollectionProgress.reduce((s, c) => s + (c.rowsInserted ?? 0), 0);
+        let docsRead = mergedCollectionProgress.reduce((s, c) => s + (c.docsRead ?? 0), 0);
+        let rowsInserted = mergedCollectionProgress.reduce((s, c) => s + (c.rowsInserted ?? 0), 0);
+        // Include completed collections whose volatile progress:* TTL expired
+        for (const [collection, agg] of completedAggregates) {
+          if (!mergedCollectionProgress.some(c => c.collection === collection)) {
+            docsRead += agg.docsRead;
+            rowsInserted += agg.rowsInserted;
+          }
+        }
         const estimated = mergedCollectionProgress.reduce((s, c) => s + (c.estimated ?? 0), 0);
         return { total, done, failed, processing, pending, pct, docsRead, rowsInserted, estimated };
       })() : null,

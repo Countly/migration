@@ -406,7 +406,7 @@ export class CollectionOrchestrator {
             const elapsedSec = elapsedMs / 1000;
             return {
                 status: "running",
-                batchSeq: 0,
+                batchSeq: active?.batchSeq ?? 0,
                 lastCommittedId: null,
                 totalDocsRead,
                 totalRowsInserted,
