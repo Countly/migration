@@ -44,6 +44,8 @@ export interface Run {
     created_at: string;
     updated_at: string;
     summary: RunSummary | null;
+    phase?: "cursor" | "null_cd";
+    null_cd_upper_bound?: string;
 }
 
 export interface Batch {
@@ -62,6 +64,7 @@ export interface Batch {
     last_error: string | null;
     started_at: string | null;
     finished_at: string | null;
+    phase?: "cursor" | "null_cd";
     error_history?: CompactError[];
     digest_match?: boolean | null;
 }
@@ -253,6 +256,34 @@ export class ManifestStore {
             { run_id: runId },
             { $set: { status, summary, updated_at: now } },
         );
+    }
+
+    async updateRunPhase(
+        runId: string,
+        phase: "cursor" | "null_cd",
+        nullCdUpperBound?: string,
+    ): Promise<void> {
+        const { runs, events } = this.ensureConnected();
+        const now = new Date().toISOString();
+        const $set: Record<string, unknown> = {
+            phase,
+            last_committed_cursor: null,
+            updated_at: now,
+        };
+        if (nullCdUpperBound !== undefined) {
+            $set.null_cd_upper_bound = nullCdUpperBound;
+        }
+        await runs.updateOne(
+            { run_id: runId },
+            { $set },
+        );
+        await events.insertOne({
+            run_id: runId,
+            event_type: "null_cd_sweep_started",
+            message: `Run transitioned to ${phase} phase`,
+            metadata: { phase, null_cd_upper_bound: nullCdUpperBound ?? null },
+            created_at: now,
+        });
     }
 
     // -----------------------------------------------------------------------

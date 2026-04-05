@@ -237,6 +237,64 @@ export class RangeCoordinator {
             );
         }
 
+        // 2.5. Null-cd sweep after all cd-ranges complete
+        const preNullCdStatus = await this.getRangeStatus();
+        if (preNullCdStatus.pending === 0
+            && preNullCdStatus.processing === 0
+            && preNullCdStatus.failed === 0
+            && !this.stopping) {
+
+            const sweepKey = `${this.rangesKey}:null_cd_sweep`;
+            const sweepDoneKey = `${sweepKey}:done`;
+
+            let sweepHandled = false;
+            while (!this.stopping && !sweepHandled) {
+                const alreadyDone = await this.deps.redis.get(sweepDoneKey);
+                if (alreadyDone) { sweepHandled = true; break; }
+
+                const acquired = await this.deps.redis.set(
+                    sweepKey, config.podId, "EX", 3600, "NX",
+                );
+
+                if (acquired) {
+                    sweepHandled = true;
+                    try {
+                        const bounds = await this.deps.mongoReader.getNullCdBounds();
+                        if (bounds) {
+                            await this.deps.manifestStore.updateRunPhase(
+                                runId, "null_cd", bounds.upper,
+                            );
+                            const sweepResult = await this.runNullCdSweep(runId, bounds.upper);
+                            this.totalDocsRead += sweepResult.docsRead;
+                            this.totalRowsInserted += sweepResult.rowsInserted;
+                            this.totalDocsSkipped += sweepResult.docsSkipped;
+                        }
+                        await this.deps.redis.set(sweepDoneKey, "1", "EX", 86400);
+                    } catch (err) {
+                        await this.deps.redis.del(sweepKey);
+                        throw err;
+                    }
+                } else {
+                    const lockHolder = await this.deps.redis.get(sweepKey);
+                    if (lockHolder) {
+                        const podKeyPrefix = `${config.redisKeyPrefix}:pod:`;
+                        const holderAlive = await this.deps.redis.exists(
+                            `${podKeyPrefix}${lockHolder}`,
+                        );
+                        if (!holderAlive) {
+                            await this.deps.redis.del(sweepKey);
+                            this.logger.info(
+                                { stalePod: lockHolder },
+                                "Reclaimed stale null-cd sweep lock from dead pod",
+                            );
+                            continue;
+                        }
+                    }
+                    await new Promise(r => setTimeout(r, 5_000));
+                }
+            }
+        }
+
         // 3. Mark run complete if all ranges are terminal (only one pod finalizes via SETNX)
         const finalStatus = await this.getRangeStatus();
         if (finalStatus.pending === 0 && finalStatus.processing === 0) {
@@ -347,7 +405,24 @@ export class RangeCoordinator {
         const lowerBound = await mongoReader.getLowerBound();
         const upperBound = await mongoReader.getUpperBound();
         if (!lowerBound || !upperBound) {
-            throw new Error("Collection is empty, cannot initialize ranges");
+            const hasNullCd = await mongoReader.hasNullCdDocuments();
+            if (!hasNullCd) {
+                throw new Error("Collection is empty, cannot initialize ranges");
+            }
+            const runId = randomUUID();
+            const now = new Date().toISOString();
+            await manifestStore.createRun({
+                run_id: runId,
+                status: "active",
+                source_ns: config.sourceNs,
+                target_table: config.targetTable,
+                upper_bound_cursor: serializeCursor({ cd: 0, id: "\uffff".repeat(24) }),
+                transform_version: config.transformVersion,
+                created_at: now,
+            });
+            await redis.set(this.runIdKey, runId);
+            this.logger.info({ runId }, "All-null collection — skipping cd-ranges, will sweep via null-cd phase");
+            return runId;
         }
 
         const minCd = lowerBound.cd;
@@ -550,6 +625,75 @@ export class RangeCoordinator {
             rowsInserted: stats.totalRowsInserted,
             docsSkipped: stats.totalDocsSkipped,
             skipsByReason: stats.skipsByReason ?? {},
+        };
+    }
+
+    private async runNullCdSweep(
+        runId: string,
+        nullCdUpperBound: string,
+    ): Promise<{ docsRead: number; rowsInserted: number; docsSkipped: number }> {
+        const { config } = this.deps;
+        const upperBoundStr = serializeCursor({ cd: 0, id: nullCdUpperBound });
+        const batchSeqOffset = config.rangeCount * BATCH_SEQ_SLOTS_PER_RANGE;
+
+        const sweepRedisState = RedisHotState.fromExistingConnection(
+            this.deps.redis,
+            `${config.redisKeyPrefix}:${config.collectionName}:null_cd_sweep`,
+        );
+
+        const batchRunner = new BatchRunner({
+            manifestStore: this.deps.manifestStore,
+            redisState: sweepRedisState,
+            globalRedisState: this.deps.redisState,
+            asyncBatchWriter: this.deps.asyncBatchWriter,
+            mongoReader: this.deps.mongoReader,
+            chWriter: this.deps.chWriter,
+            chPressure: this.deps.chPressure,
+            gcController: this.deps.gcController,
+            retryPolicy: this.deps.retryPolicy,
+            logger: this.deps.logger,
+            config: {
+                runId,
+                nullCdMode: true,
+                nullCdUpperBound,
+                upperBoundId: upperBoundStr,
+                batchSeqOffset,
+                batchSeqMax: batchSeqOffset + BATCH_SEQ_SLOTS_PER_RANGE,
+                transformVersion: config.transformVersion,
+                sourceNs: config.sourceNs,
+                targetTable: config.targetTable,
+                batchRowsTarget: config.batchRowsTarget,
+                mongoPageSize: config.mongoPageSize,
+                backpressure: config.backpressure,
+                useDedupToken: config.useDedupToken,
+                database: config.database,
+                table: config.table,
+                snapshotInterval: config.snapshotInterval,
+                collectionDefaults: config.collectionDefaults,
+                collectionName: config.collectionName,
+                podId: config.podId,
+                rangeIdx: config.rangeCount,
+            },
+        });
+
+        this.activeBatchRunner = batchRunner;
+        try {
+            await batchRunner.run();
+        } finally {
+            this.activeBatchRunner = null;
+        }
+
+        const stats = batchRunner.getStats();
+        if (stats.status === "failed") {
+            throw new Error(
+                `Null-cd sweep failed (${stats.batchesFailed} batch(es) failed after retries)`,
+            );
+        }
+
+        return {
+            docsRead: stats.totalDocsRead,
+            rowsInserted: stats.totalRowsInserted,
+            docsSkipped: stats.totalDocsSkipped,
         };
     }
 }
