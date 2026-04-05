@@ -29,6 +29,8 @@ export interface SeedOptions {
   missingUidFraction?: number;
   /** Whether to create the {cd:1, _id:1} index. Default true. */
   createIndex?: boolean;
+  /** Fraction of docs with cd set to null (0–1). Default 0. */
+  nullCdFraction?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,12 +122,13 @@ export async function seedCollection(opts: SeedOptions): Promise<{
 
     const migrated = Math.random() < migratedFrac;
     const missingUid = !migrated && Math.random() < missingUidFrac;
+    const nullCd = !migrated && !missingUid && Math.random() < (opts.nullCdFraction ?? 0);
 
     docs.push(makeDoc({
       appId,
       eventName,
       ts,
-      cd,
+      cd: nullCd ? null as any : cd,
       idx: i,
       migrated,
       missingUid,
@@ -238,4 +241,47 @@ export async function registerEventHash(
   // For tests, we'll use a simpler approach: the collection name is deterministic
   // from SHA1(eventName + appId), so the resolver should work if it has the app/event data.
   // In practice, tests pass collectionDefaults directly to the transform layer.
+}
+
+/**
+ * Seed a collection where ALL documents have cd: null.
+ */
+export async function seedNullCdCollection(opts: {
+  count: number;
+  appId?: string;
+  eventName?: string;
+}): Promise<{ collName: string; totalDocs: number; expectedRows: number }> {
+  const db = await getMongoDb();
+  const appId = opts.appId ?? DEFAULT_APP_ID;
+  const eventName = opts.eventName ?? "test_null_cd_event";
+  const collName = collectionName(eventName, appId);
+  const coll = db.collection(collName);
+
+  await coll.drop().catch(() => {});
+
+  const docs: Record<string, unknown>[] = [];
+  for (let i = 0; i < opts.count; i++) {
+    docs.push({
+      _id: new ObjectId().toHexString(),
+      a: appId,
+      e: eventName,
+      uid: `user-${(i % 1000).toString().padStart(4, "0")}`,
+      did: `device-${(i % 500).toString().padStart(4, "0")}`,
+      ts: Date.now() - (opts.count - i) * 1000,
+      cd: null,
+      c: 1,
+      s: 0,
+      dur: 0,
+      n: eventName,
+    });
+  }
+
+  const CHUNK = 5000;
+  for (let i = 0; i < docs.length; i += CHUNK) {
+    await coll.insertMany(docs.slice(i, i + CHUNK));
+  }
+
+  await coll.createIndex({ cd: 1, _id: 1 });
+
+  return { collName, totalDocs: opts.count, expectedRows: opts.count };
 }

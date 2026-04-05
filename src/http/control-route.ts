@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type { RunnerStatus } from '../runtime/batch-runner.ts';
 import type { GcMode } from '../runtime/gc-controller.ts';
 import type { Batch, ManifestStore } from '../state/manifest-store.ts';
-import type { MongoReader } from '../source/mongo-reader.ts';
+import type { MongoReader, PageResult } from '../source/mongo-reader.ts';
 import type { ClickHouseWriter } from '../target/clickhouse-writer.ts';
 import type { GlobalProgress } from '../state/global-progress.ts';
 import type { CollectionLock } from '../state/collection-lock.ts';
@@ -106,7 +106,15 @@ export function registerControlRoutes(app: FastifyInstance, deps: ControlDeps): 
       // Re-read the exact MongoDB range
       const lowerCursor = batch.lower_exclusive_cursor ? deserializeCursor(batch.lower_exclusive_cursor) : null;
       const upperCursor = deserializeCursor(batch.upper_inclusive_cursor);
-      const page = await mongoReader.readPage(lowerCursor, upperCursor);
+      const batchPhase = (batch as any).phase ?? "cursor";
+      let page: PageResult;
+      if (batchPhase === "null_cd") {
+        const lowerId = lowerCursor ? lowerCursor.id : null;
+        const upperId = upperCursor.id;
+        page = await mongoReader.readNullCdPage(lowerId, upperId);
+      } else {
+        page = await mongoReader.readPage(lowerCursor, upperCursor);
+      }
 
       if (page.docs.length === 0) {
         return reply.status(200).send({ ok: true, message: 'No documents in range', docsRead: 0, rowsInserted: 0 });
@@ -154,7 +162,15 @@ export function registerControlRoutes(app: FastifyInstance, deps: ControlDeps): 
       for (const batch of batches) {
         const lowerCursor = batch.lower_exclusive_cursor ? deserializeCursor(batch.lower_exclusive_cursor) : null;
         const upperCursor = deserializeCursor(batch.upper_inclusive_cursor);
-        const page = await mongoReader.readPage(lowerCursor, upperCursor);
+        const batchPhase = (batch as any).phase ?? "cursor";
+        let page: PageResult;
+        if (batchPhase === "null_cd") {
+          const lowerId = lowerCursor ? lowerCursor.id : null;
+          const upperId = upperCursor.id;
+          page = await mongoReader.readNullCdPage(lowerId, upperId);
+        } else {
+          page = await mongoReader.readPage(lowerCursor, upperCursor);
+        }
         if (page.docs.length === 0) continue;
 
         const skipCounter = new SkipCounter();

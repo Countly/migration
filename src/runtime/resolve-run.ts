@@ -94,7 +94,14 @@ export async function resolveRun(opts: ResolveRunOpts): Promise<ResolvedRun> {
         const runId = randomUUID();
         const upperBound = await mongoReader.getUpperBound();
         if (!upperBound) {
-            return { runId, upperBoundId: '', isEmpty: true };
+            const hasNullCd = await mongoReader.hasNullCdDocuments();
+            if (!hasNullCd) {
+                return { runId, upperBoundId: '', isEmpty: true };
+            }
+            const upperBoundId = serializeCursor({ cd: 0, id: "\uffff".repeat(24) });
+            await createNewRun(runId, upperBoundId);
+            logger.info({ runId, sourceNs, targetTable }, 'All-null collection — created run for null-cd sweep');
+            return { runId, upperBoundId };
         }
         const upperBoundId = serializeCursor(upperBound);
         await createNewRun(runId, upperBoundId);
@@ -106,7 +113,20 @@ export async function resolveRun(opts: ResolveRunOpts): Promise<ResolvedRun> {
         const runId = randomUUID();
         const upperBound = await mongoReader.getUpperBound();
         if (!upperBound) {
-            return { runId, upperBoundId: '', isEmpty: true };
+            const hasNullCd = await mongoReader.hasNullCdDocuments();
+            if (!hasNullCd) {
+                return { runId, upperBoundId: '', isEmpty: true };
+            }
+            const upperBoundId = serializeCursor({ cd: 0, id: "\uffff".repeat(24) });
+            const activeRun = await manifestStore.getActiveRun(sourceNs, targetTable);
+            if (activeRun) {
+                const deleted = await manifestStore.deleteRunData(activeRun.run_id);
+                logger.info({ oldRunId: activeRun.run_id, deletedRecords: deleted }, 'Cleaned old run data for fresh start');
+                await manifestStore.updateRunStatus(activeRun.run_id, 'completed');
+            }
+            await createNewRun(runId, upperBoundId);
+            logger.info({ runId, sourceNs, targetTable }, 'All-null collection — created run for null-cd sweep (new-run mode)');
+            return { runId, upperBoundId };
         }
         const upperBoundId = serializeCursor(upperBound);
         const activeRun = await manifestStore.getActiveRun(sourceNs, targetTable);

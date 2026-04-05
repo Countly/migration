@@ -38,6 +38,8 @@ export interface BatchRunnerConfig {
   podId?: string;
   rangeIdx?: number;
   batchSeqMax?: number;
+  nullCdMode?: boolean;
+  nullCdUpperBound?: string;
 }
 
 export interface BatchRunnerDeps {
@@ -97,6 +99,7 @@ function buildBatch(
   upperInclusiveId: string,
   docsRead: number,
   docsSkipped: number,
+  phase: "cursor" | "null_cd",
   overrides: Partial<Batch>,
 ): Batch {
   return {
@@ -117,6 +120,7 @@ function buildBatch(
     finished_at: null,
     error_history: [],
     digest_match: null,
+    phase,
     ...overrides,
   };
 }
@@ -157,6 +161,8 @@ export class BatchRunner {
   private batchesSkippedEmpty = 0;
   private digestMismatches = 0;
   private estimatedDuplicateRows = 0;
+  private nullCdPhaseActive = false;
+  private nullCdUpperBound: string | null = null;
 
   private readonly deps: BatchRunnerDeps;
   private readonly logger: Logger;
@@ -170,6 +176,10 @@ export class BatchRunner {
     this.skipCounter = new SkipCounter();
     this.batchSeq = deps.config.batchSeqOffset ?? 0;
     this.isRangeMode = deps.config.rangeIdx !== undefined;
+    if (deps.config.nullCdMode) {
+      this.nullCdPhaseActive = true;
+      this.nullCdUpperBound = deps.config.nullCdUpperBound ?? null;
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -236,7 +246,13 @@ export class BatchRunner {
 
         while (accRows.length < batchRowsTarget) {
           const page = await this.deps.retryPolicy.execute(
-            () => this.deps.mongoReader.readPage(pageCursor, upperBoundCursor, mongoPageSize),
+            () => this.nullCdPhaseActive
+              ? this.deps.mongoReader.readNullCdPage(
+                  pageCursor?.id ?? null,
+                  this.nullCdUpperBound!,
+                  mongoPageSize,
+                )
+              : this.deps.mongoReader.readPage(pageCursor, upperBoundCursor, mongoPageSize),
             `mongo-read-batch-${this.batchSeq + 1}-page`,
             this.logger,
           );
@@ -259,8 +275,32 @@ export class BatchRunner {
           if (page.docs.length < mongoPageSize) break;
         }
 
-        // (d) Empty accumulation = run complete
+        // (d) Empty accumulation = run complete (or transition to null-cd sweep)
         if (accDocsRead === 0) {
+          // Cursor phase exhausted — check for null-cd sweep (standard mode only)
+          if (!this.nullCdPhaseActive && !this.isRangeMode) {
+            const bounds = await this.deps.mongoReader.getNullCdBounds();
+            if (bounds) {
+              this.nullCdUpperBound = bounds.upper;
+              await this.deps.manifestStore.updateRunPhase(
+                runId, "null_cd", bounds.upper,
+              );
+
+              await this.bestEffortRedis(
+                () => this.deps.redisState.setLastCommittedCursor(runId, ""),
+                "Redis cursor clear failed on phase transition",
+              );
+
+              this.nullCdPhaseActive = true;
+              this.lastCommittedId = null;
+              this.logger.info(
+                { nullCdUpperBound: bounds.upper },
+                "Transitioning to null-cd sweep phase",
+              );
+              continue;
+            }
+          }
+
           this.logger.info(
             {
               totalBatches: this.batchSeq,
@@ -326,7 +366,7 @@ export class BatchRunner {
             "All documents in batch were skipped",
           );
 
-          const batch = buildBatch(runId, this.batchSeq, lowerExclusiveId, upperInclusiveId, accDocsRead, docsSkipped, {
+          const batch = buildBatch(runId, this.batchSeq, lowerExclusiveId, upperInclusiveId, accDocsRead, docsSkipped, this.nullCdPhaseActive ? "null_cd" : "cursor", {
             status: "skipped_empty",
             finished_at: new Date().toISOString(),
           });
@@ -352,7 +392,7 @@ export class BatchRunner {
           ? `mig:${runId}:${this.batchSeq}`
           : "";
 
-        const batch = buildBatch(runId, this.batchSeq, lowerExclusiveId, upperInclusiveId, accDocsRead, docsSkipped, {
+        const batch = buildBatch(runId, this.batchSeq, lowerExclusiveId, upperInclusiveId, accDocsRead, docsSkipped, this.nullCdPhaseActive ? "null_cd" : "cursor", {
           rows_to_insert: rows.length,
           payload_digest: payloadDigest,
           insert_dedup_token: dedupToken,
@@ -788,6 +828,21 @@ export class BatchRunner {
       }
     }
 
+    // ── Null-cd phase recovery ──────────────────────────────────────────
+    if (run?.phase === "null_cd") {
+      this.nullCdPhaseActive = true;
+      this.nullCdUpperBound = run.null_cd_upper_bound ?? null;
+
+      // Discard stale cursor-phase cursors — only trust null-cd phase batches
+      this.lastCommittedId = null;
+
+      const lastDoneNullCd = await this.deps.manifestStore.getLastDoneBatch(runId, batchSeqRange);
+      if (lastDoneNullCd?.upper_inclusive_cursor
+          && (lastDoneNullCd.phase ?? "cursor") === "null_cd") {
+        this.lastCommittedId = lastDoneNullCd.upper_inclusive_cursor;
+      }
+    }
+
     // ── Recover interrupted batches (scoped to range slot) ───────────────
     const inflightBatches = await this.deps.manifestStore.getBatches(runId, {
       status: "inflight",
@@ -807,12 +862,22 @@ export class BatchRunner {
       );
 
       try {
-        // Re-read the exact source range
-        const page = await this.deps.mongoReader.readPage(
-          batch.lower_exclusive_cursor ? deserializeCursor(batch.lower_exclusive_cursor) : null,
-          deserializeCursor(batch.upper_inclusive_cursor),
-          this.deps.config.batchRowsTarget,
-        );
+        // Re-read the exact source range — use batch.phase to pick reader
+        const batchPhase = batch.phase ?? "cursor";
+        let page;
+        if (batchPhase === "null_cd") {
+          const lowerId = batch.lower_exclusive_cursor
+            ? deserializeCursor(batch.lower_exclusive_cursor).id
+            : null;
+          const upperId = deserializeCursor(batch.upper_inclusive_cursor).id;
+          page = await this.deps.mongoReader.readNullCdPage(lowerId, upperId);
+        } else {
+          page = await this.deps.mongoReader.readPage(
+            batch.lower_exclusive_cursor ? deserializeCursor(batch.lower_exclusive_cursor) : null,
+            deserializeCursor(batch.upper_inclusive_cursor),
+            this.deps.config.batchRowsTarget,
+          );
+        }
 
         // Re-transform
         const { rows } = transformBatch(page.docs, this.skipCounter, this.deps.config.collectionDefaults);

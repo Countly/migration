@@ -136,7 +136,7 @@ export class MongoReader {
     this.ensureConnected();
 
     const result = await this.collection!
-      .find({})
+      .find({ cd: { $ne: null } })
       .sort({ cd: -1, _id: -1 })
       .hint({ cd: 1, _id: 1 })
       .limit(1)
@@ -158,7 +158,7 @@ export class MongoReader {
     this.ensureConnected();
 
     const result = await this.collection!
-      .find({})
+      .find({ cd: { $ne: null } })
       .sort({ cd: 1, _id: 1 })
       .hint({ cd: 1, _id: 1 })
       .limit(1)
@@ -183,6 +183,91 @@ export class MongoReader {
     return count;
   }
 
+  async hasNullCdDocuments(): Promise<boolean> {
+    this.ensureConnected();
+    const count = await this.collection!.countDocuments(
+      { $or: [{ cd: null }, { cd: { $exists: false } }] },
+      { limit: 1 },
+    );
+    return count > 0;
+  }
+
+  async getNullCdBounds(): Promise<{ lower: string; upper: string } | null> {
+    this.ensureConnected();
+
+    const nullCdFilter = { $or: [{ cd: null }, { cd: { $exists: false } }] };
+
+    const [first, last] = await Promise.all([
+      this.collection!
+        .find(nullCdFilter)
+        .sort({ _id: 1 })
+        .limit(1)
+        .project({ _id: 1 })
+        .maxTimeMS(this.config.maxTimeMs)
+        .toArray(),
+      this.collection!
+        .find(nullCdFilter)
+        .sort({ _id: -1 })
+        .limit(1)
+        .project({ _id: 1 })
+        .maxTimeMS(this.config.maxTimeMs)
+        .toArray(),
+    ]);
+
+    if (first.length === 0) return null;
+    return { lower: String(first[0]._id), upper: String(last[0]._id) };
+  }
+
+  async readNullCdPage(
+    lastId: string | null,
+    upperBoundId: string,
+    limit?: number,
+  ): Promise<PageResult> {
+    this.ensureConnected();
+    const { cursorBatchSize, maxTimeMs } = this.config;
+    const startMs = performance.now();
+
+    const idFilter: Record<string, string> = { $lte: upperBoundId };
+    if (lastId !== null) {
+      idFilter.$gt = lastId;
+    }
+
+    const filter: Record<string, unknown> = {
+      $or: [{ cd: null }, { cd: { $exists: false } }],
+      _id: idFilter,
+    };
+
+    let query = this.collection!
+      .find(filter)
+      .sort({ _id: 1 })
+      .batchSize(cursorBatchSize)
+      .project(PROJECTION)
+      .maxTimeMS(maxTimeMs);
+
+    if (limit !== undefined) {
+      query = query.limit(limit);
+    }
+
+    const docs = await query.toArray();
+    const fetchMs = Math.round(performance.now() - startMs);
+
+    const lastDoc = docs[docs.length - 1];
+    const lastCursor: Cursor | null = docs.length > 0
+      ? { cd: 0, id: String(lastDoc._id) }
+      : null;
+
+    this.logger.debug(
+      { docsRead: docs.length, lastCursor, fetchMs },
+      "Null-cd page read complete",
+    );
+
+    return {
+      docs: docs as SourceDocument[],
+      lastCursor,
+      fetchMs,
+    };
+  }
+
   async readPage(lastCursor: Cursor | null, upperBound: Cursor, limit?: number): Promise<PageResult> {
     this.ensureConnected();
 
@@ -193,7 +278,7 @@ export class MongoReader {
     const startMs = performance.now();
 
     let query = this.collection!
-      .find({})
+      .find({ cd: { $ne: null } })
       .sort({ cd: 1, _id: 1 })
       .hint({ cd: 1, _id: 1 })
       .max({ cd: ucd, _id: upperBound.id })
