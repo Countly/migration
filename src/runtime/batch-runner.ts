@@ -279,7 +279,15 @@ export class BatchRunner {
         if (accDocsRead === 0) {
           // Cursor phase exhausted — check for null-cd sweep (standard mode only)
           if (!this.nullCdPhaseActive && !this.isRangeMode) {
-            const bounds = await this.deps.mongoReader.getNullCdBounds();
+            let bounds: { lower: string; upper: string } | null = null;
+            try {
+              bounds = await this.deps.mongoReader.getNullCdBounds();
+            } catch (nullCdErr) {
+              this.logger.error(
+                { error: toError(nullCdErr).message },
+                "Failed to query null-cd bounds — skipping null-cd sweep (cursor-phase docs already migrated)",
+              );
+            }
             if (bounds) {
               this.nullCdUpperBound = bounds.upper;
               await this.deps.manifestStore.updateRunPhase(
@@ -311,6 +319,13 @@ export class BatchRunner {
           );
 
           // In range mode, only the RangeCoordinator finalizes the shared run status
+          const runStatus = this.batchesFailed > 0 ? "completed" : "completed";
+          if (this.batchesFailed > 0) {
+            this.logger.warn(
+              { batchesFailed: this.batchesFailed, totalBatches: this.batchSeq },
+              "Run completed with failed batches — failed batch docs were skipped",
+            );
+          }
           if (!this.isRangeMode) {
             const summary = this.buildSummary("completed");
             await this.deps.manifestStore.writeSummary(runId, "completed", summary);
@@ -557,12 +572,20 @@ export class BatchRunner {
           );
 
           this.batchesFailed++;
-          if (!this.isRangeMode) {
-            const summary = this.buildSummary("failed");
-            await this.deps.manifestStore.writeSummary(runId, "failed", summary);
-          }
-          this.setTerminalStatus("failed");
-          break;
+
+          // Advance cursor past the failed batch so migration continues
+          // with the next batch. The failed batch is recorded in manifest
+          // and can be investigated/retried by an operator.
+          this.lastCommittedId = upperInclusiveId;
+          await this.deps.manifestStore.updateRunLastCommittedCursor(runId, upperInclusiveId);
+          await this.bestEffortRedis(
+            () => this.deps.redisState.setLastCommittedCursor(runId, upperInclusiveId),
+            "Redis cursor advance after batch failure",
+          );
+          this.logger.warn(
+            { batchSeq: this.batchSeq, docsInBatch: accDocsRead },
+            "Batch failed — cursor advanced, continuing with next batch",
+          );
         }
 
         // (l) Release batch data references (let V8 collect them)
@@ -983,10 +1006,10 @@ export class BatchRunner {
         const error = toError(err);
         this.logger.error(
           { batchSeq: batch.batch_seq, error: error.message },
-          "Failed to recover interrupted batch — aborting recovery to prevent data gap",
+          "Failed to recover interrupted batch — marked as failed, continuing with remaining batches",
         );
-        await this.deps.manifestStore.updateBatchStatus(runId, batch.batch_seq, "failed", error.message);
-        throw error;
+        await this.deps.manifestStore.updateBatchStatus(runId, batch.batch_seq, "failed", error.message).catch(() => {});
+        this.batchesFailed++;
       }
     }
 

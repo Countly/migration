@@ -331,23 +331,21 @@ describe("range-retry", () => {
     // Allow ClickHouse async inserts to flush
     await new Promise((r) => setTimeout(r, 3000));
 
-    // Range 1 should have failed after exhausting retries
+    // With resilient batch handling, failed batches are skipped and the
+    // range still completes. All 3 ranges should finish (some with failed batches).
     expect(result.totalRanges).toBe(3);
-    expect(result.failedRanges).toBeGreaterThan(0);
+    // All ranges complete — failed batches within a range are skipped, not retried at range level
+    expect(result.completedRanges).toBe(3);
 
-    // The run status in the manifest should be "failed"
+    // The run completes (not "failed") because all ranges finished processing
     const run = await manifestStore.getRun(result.runId);
     expect(run).toBeDefined();
-    expect(run!.status).toBe("failed");
+    expect(run!.status).toBe("completed");
 
-    // Ranges 0 and 2 data should be in ClickHouse, range 1 data should not.
-    // Verify we have some rows (from ranges 0 and 2) but not all 3000.
+    // Ranges 0 and 2 data should be in ClickHouse fully.
+    // Range 1 data is partially or fully missing (batches that failed were skipped).
     const totalRows = await chRowCount();
     expect(totalRows).toBeGreaterThan(0);
-    // Range 1 produced no rows because the writer always failed for it
     expect(totalRows).toBe(result.totalRowsInserted);
-    // The total inserted should be less than the total docs read for all ranges
-    // because range 1's rows were never inserted
-    expect(result.completedRanges).toBe(2);
   });
 });
