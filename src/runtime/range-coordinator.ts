@@ -119,6 +119,25 @@ return nil
 `;
 
 // ---------------------------------------------------------------------------
+// Lua: Atomically mark a range as "done" or "failed".
+//
+// Only transitions if the range is still "processing" and owned by
+// the calling pod.  Prevents the race where CLAIM_RANGE_LUA resets a
+// range to "pending" between a non-atomic HGET and HSET.
+// ---------------------------------------------------------------------------
+
+const MARK_RANGE_TERMINAL_LUA = `
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then return 0 end
+local data = cjson.decode(raw)
+if data.status ~= 'processing' then return 0 end
+if tostring(data.podId) ~= ARGV[3] then return 0 end
+data.status = ARGV[2]
+redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(data))
+return 1
+`;
+
+// ---------------------------------------------------------------------------
 // RangeCoordinator
 // ---------------------------------------------------------------------------
 
@@ -532,20 +551,29 @@ export class RangeCoordinator {
         return JSON.parse(result) as RangeEntry;
     }
 
+    /**
+     * Atomically mark a range as "done" or "failed" via Lua script.
+     * Only transitions if still "processing" and owned by this pod.
+     * Uses ioredis .eval() to run a Lua script on the Redis server (NOT JS eval).
+     */
+    private async markRangeTerminal(idx: number, status: "done" | "failed"): Promise<void> {
+        // ioredis .eval() sends a Lua script to Redis for atomic server-side execution
+        await this.deps.redis.eval(
+            MARK_RANGE_TERMINAL_LUA,
+            1,
+            this.rangesKey,
+            String(idx),
+            status,
+            this.deps.config.podId,
+        );
+    }
+
     private async markRangeDone(idx: number): Promise<void> {
-        const raw = await this.deps.redis.hget(this.rangesKey, String(idx));
-        if (!raw) return;
-        const entry = JSON.parse(raw) as RangeEntry;
-        entry.status = "done";
-        await this.deps.redis.hset(this.rangesKey, String(idx), JSON.stringify(entry));
+        await this.markRangeTerminal(idx, "done");
     }
 
     private async markRangeFailed(idx: number): Promise<void> {
-        const raw = await this.deps.redis.hget(this.rangesKey, String(idx));
-        if (!raw) return;
-        const entry = JSON.parse(raw) as RangeEntry;
-        entry.status = "failed";
-        await this.deps.redis.hset(this.rangesKey, String(idx), JSON.stringify(entry));
+        await this.markRangeTerminal(idx, "failed");
     }
 
     private async processRange(range: RangeEntry, runId: string): Promise<{ docsRead: number; rowsInserted: number; docsSkipped: number; skipsByReason: Record<SkipReason, number> }> {

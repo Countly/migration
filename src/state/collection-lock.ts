@@ -118,6 +118,7 @@ export class CollectionLock {
     private podHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
     private consecutiveHeartbeatFailures = 0;
     private _heartbeatHealthy = true;
+    onLockLost: ((collectionName: string) => void) | null = null;
 
     get heartbeatHealthy(): boolean { return this._heartbeatHealthy; }
 
@@ -365,6 +366,7 @@ export class CollectionLock {
                 if (result === 0) {
                     this.heldLocks.delete(name);
                     this.logger.warn({ collection: name }, "Lock lost during renewal — another pod may have taken it");
+                    try { this.onLockLost?.(name); } catch { /* callback must not throw */ }
                 }
             }),
         );
