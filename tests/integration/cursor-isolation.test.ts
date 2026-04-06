@@ -354,7 +354,7 @@ describe("cursor-isolation (range-parallel)", () => {
     const range3EndDate = new Date(range3EndMs + 1000).toISOString().replace("T", " ").replace("Z", "");
 
     const rowsInRange = await chRowCount(
-      `cd >= '${range3StartDate}' AND cd <= '${range3EndDate}'`,
+      `ts >= '${range3StartDate}' AND ts <= '${range3EndDate}'`,
     );
 
     // All rows should be within range 3's window (the runner should not have
@@ -482,7 +482,7 @@ describe("cursor-isolation (range-parallel)", () => {
       .toISOString().replace("T", " ").replace("Z", "");
 
     const rowsInRange = await chRowCount(
-      `cd >= '${range1StartDate}' AND cd <= '${range1EndDate}'`,
+      `ts >= '${range1StartDate}' AND ts <= '${range1EndDate}'`,
     );
     expect(rowsInRange).toBe(totalRows);
   });

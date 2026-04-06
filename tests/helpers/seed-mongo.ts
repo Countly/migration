@@ -31,6 +31,8 @@ export interface SeedOptions {
   createIndex?: boolean;
   /** Fraction of docs with cd set to null (0–1). Default 0. */
   nullCdFraction?: number;
+  /** Fraction of docs with invalid ts (ts=0, will be skipped). Default 0. */
+  invalidTsFraction?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,18 +125,19 @@ export async function seedCollection(opts: SeedOptions): Promise<{
     const migrated = Math.random() < migratedFrac;
     const missingUid = !migrated && Math.random() < missingUidFrac;
     const nullCd = !migrated && !missingUid && Math.random() < (opts.nullCdFraction ?? 0);
+    const invalidTs = !migrated && !missingUid && !nullCd && Math.random() < (opts.invalidTsFraction ?? 0);
 
     docs.push(makeDoc({
       appId,
       eventName,
-      ts,
+      ts: invalidTs ? 0 : ts,
       cd: nullCd ? null as any : cd,
       idx: i,
       migrated,
       missingUid,
     }));
 
-    if (!migrated && !missingUid) {
+    if (!migrated && !missingUid && !invalidTs) {
       expectedRows++;
     }
   }

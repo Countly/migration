@@ -392,23 +392,82 @@ export class RangeCoordinator {
         // Try to become the coordinator via SETNX
         const acquired = await redis.set(this.initKey, config.podId, "EX", 60, "NX");
         if (!acquired) {
+            // Check if the lock holder is still alive; reclaim if dead
+            const lockHolder = await redis.get(this.initKey);
+            if (lockHolder) {
+                const podKeyPrefix = `${config.redisKeyPrefix}:pod:`;
+                const holderAlive = await redis.exists(`${podKeyPrefix}${lockHolder}`);
+                if (!holderAlive) {
+                    await redis.del(this.initKey);
+                    this.logger.info(
+                        { stalePod: lockHolder },
+                        "Reclaimed stale range init lock from dead pod",
+                    );
+                    // Retry acquisition after reclaim
+                    return this.initRanges();
+                }
+            }
+
             this.logger.info("Another pod is initializing ranges, waiting...");
             for (let i = 0; i < 30; i++) {
                 await new Promise(r => setTimeout(r, 2_000));
                 const rid = await redis.get(this.runIdKey);
                 if (rid) return rid;
+
+                // Re-check pod liveness periodically to avoid waiting for a dead pod
+                const currentHolder = await redis.get(this.initKey);
+                if (currentHolder) {
+                    const podKeyPrefix = `${config.redisKeyPrefix}:pod:`;
+                    const stillAlive = await redis.exists(`${podKeyPrefix}${currentHolder}`);
+                    if (!stillAlive) {
+                        await redis.del(this.initKey);
+                        this.logger.info(
+                            { stalePod: currentHolder },
+                            "Reclaimed stale range init lock from dead pod during wait",
+                        );
+                        return this.initRanges();
+                    }
+                } else {
+                    // initKey expired (TTL), retry
+                    return this.initRanges();
+                }
             }
             throw new Error("Timed out waiting for range initialization");
         }
 
-        // We are the coordinator — query min/max cd
-        const lowerBound = await mongoReader.getLowerBound();
-        const upperBound = await mongoReader.getUpperBound();
-        if (!lowerBound || !upperBound) {
-            const hasNullCd = await mongoReader.hasNullCdDocuments();
-            if (!hasNullCd) {
-                throw new Error("Collection is empty, cannot initialize ranges");
+        // We are the coordinator — wrapped in try/catch to release initKey on failure
+        try {
+            const lowerBound = await mongoReader.getLowerBound();
+            const upperBound = await mongoReader.getUpperBound();
+            if (!lowerBound || !upperBound) {
+                const hasNullCd = await mongoReader.hasNullCdDocuments();
+                if (!hasNullCd) {
+                    throw new Error("Collection is empty, cannot initialize ranges");
+                }
+                const runId = randomUUID();
+                const now = new Date().toISOString();
+                await manifestStore.createRun({
+                    run_id: runId,
+                    status: "active",
+                    source_ns: config.sourceNs,
+                    target_table: config.targetTable,
+                    upper_bound_cursor: serializeCursor({ cd: 0, id: "\uffff".repeat(24) }),
+                    transform_version: config.transformVersion,
+                    created_at: now,
+                });
+                await redis.set(this.runIdKey, runId);
+                await redis.del(this.initKey);
+                this.logger.info({ runId }, "All-null collection — skipping cd-ranges, will sweep via null-cd phase");
+                return runId;
             }
+
+            const minCd = lowerBound.cd;
+            const maxCd = upperBound.cd;
+            const rangeCount = config.rangeCount;
+            const spanMs = maxCd - minCd;
+            const stepMs = Math.max(1, Math.ceil(spanMs / rangeCount));
+
+            // Create shared run in ManifestStore
             const runId = randomUUID();
             const now = new Date().toISOString();
             await manifestStore.createRun({
@@ -416,58 +475,41 @@ export class RangeCoordinator {
                 status: "active",
                 source_ns: config.sourceNs,
                 target_table: config.targetTable,
-                upper_bound_cursor: serializeCursor({ cd: 0, id: "\uffff".repeat(24) }),
+                upper_bound_cursor: serializeCursor(upperBound),
                 transform_version: config.transformVersion,
                 created_at: now,
             });
-            await redis.set(this.runIdKey, runId);
-            this.logger.info({ runId }, "All-null collection — skipping cd-ranges, will sweep via null-cd phase");
+
+            // Create all ranges in Redis (atomic pipeline)
+            const pipeline = redis.multi();
+            for (let i = 0; i < rangeCount; i++) {
+                const startCd = minCd + (i * stepMs);
+                const endCd = i === rangeCount - 1 ? maxCd : minCd + ((i + 1) * stepMs);
+                const entry: RangeEntry = {
+                    idx: i,
+                    startCd,
+                    endCd,
+                    status: "pending",
+                    podId: null,
+                    claimedAt: null,
+                };
+                pipeline.hset(this.rangesKey, String(i), JSON.stringify(entry));
+            }
+            pipeline.set(this.runIdKey, runId);
+            pipeline.set(this.metaKey, JSON.stringify({ minCd, maxCd, rangeCount, createdAt: now }));
+            pipeline.del(this.initKey);
+            await pipeline.exec();
+
+            this.logger.info(
+                { runId, minCd: new Date(minCd).toISOString(), maxCd: new Date(maxCd).toISOString(), rangeCount, stepMs },
+                "Ranges initialized",
+            );
             return runId;
+        } catch (err) {
+            // Release initKey so other pods (or retries) aren't blocked
+            await redis.del(this.initKey).catch(() => {});
+            throw err;
         }
-
-        const minCd = lowerBound.cd;
-        const maxCd = upperBound.cd;
-        const rangeCount = config.rangeCount;
-        const spanMs = maxCd - minCd;
-        const stepMs = Math.max(1, Math.ceil(spanMs / rangeCount));
-
-        // Create shared run in ManifestStore
-        const runId = randomUUID();
-        const now = new Date().toISOString();
-        await manifestStore.createRun({
-            run_id: runId,
-            status: "active",
-            source_ns: config.sourceNs,
-            target_table: config.targetTable,
-            upper_bound_cursor: serializeCursor(upperBound),
-            transform_version: config.transformVersion,
-            created_at: now,
-        });
-
-        // Create all ranges in Redis (atomic pipeline)
-        const pipeline = redis.multi();
-        for (let i = 0; i < rangeCount; i++) {
-            const startCd = minCd + (i * stepMs);
-            const endCd = i === rangeCount - 1 ? maxCd : minCd + ((i + 1) * stepMs);
-            const entry: RangeEntry = {
-                idx: i,
-                startCd,
-                endCd,
-                status: "pending",
-                podId: null,
-                claimedAt: null,
-            };
-            pipeline.hset(this.rangesKey, String(i), JSON.stringify(entry));
-        }
-        pipeline.set(this.runIdKey, runId);
-        pipeline.set(this.metaKey, JSON.stringify({ minCd, maxCd, rangeCount, createdAt: now }));
-        await pipeline.exec();
-
-        this.logger.info(
-            { runId, minCd: new Date(minCd).toISOString(), maxCd: new Date(maxCd).toISOString(), rangeCount, stepMs },
-            "Ranges initialized",
-        );
-        return runId;
     }
 
     private async claimNextRange(): Promise<RangeEntry | null> {
