@@ -152,7 +152,16 @@ export class CollectionOrchestrator {
         await this.recoverCompletedCollections();
 
         // 3. Start lock heartbeat (multi-pod mode)
-        collectionLock?.startHeartbeat();
+        if (collectionLock) {
+            collectionLock.onLockLost = (name) => {
+                if (this.currentCollection === name) {
+                    this.logger.warn({ collection: name }, "Lock lost — stopping current runner");
+                    this.currentRangeCoordinator?.stop();
+                    this.currentBatchRunner?.stopAfterBatch();
+                }
+            };
+            collectionLock.startHeartbeat();
+        }
 
         // 3. Start all index checks in background (non-blocking)
         this.startBackgroundIndexInit();
