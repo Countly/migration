@@ -43,6 +43,7 @@ Copy `.env.example` and adjust. All values below show defaults where applicable.
 | `GRACEFUL_SHUTDOWN_TIMEOUT_MS` | `60000` | Max wait for graceful shutdown (ms) |
 | `RERUN_MODE` | `resume` | `resume`, `new-run`, or `clone-run` |
 | `LOG_LEVEL` | `info` | `fatal`, `error`, `warn`, `info`, `debug`, `trace` |
+| `EXIT_ON_COMPLETE` | `false` | When `true`, exit 0 once all collections complete. Used for one-shot orchestration. |
 
 ### MongoDB Source
 

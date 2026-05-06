@@ -15,6 +15,7 @@ import { AsyncBatchWriter } from './state/async-batch-writer.ts';
 import { RetryPolicy } from './runtime/retry-policy.ts';
 import { GcController, type GcConfig } from './runtime/gc-controller.ts';
 import { ProcessMetricsCollector } from './runtime/process-metrics.ts';
+import { wireExitOnComplete } from './runtime/exit-on-complete.ts';
 import { registerHealthRoutes } from './http/health-route.ts';
 import { registerStatsRoute } from './http/stats-route.ts';
 import { registerControlRoutes } from './http/control-route.ts';
@@ -251,10 +252,12 @@ async function main(): Promise<void> {
   processMetrics.start();
   gcController.start();
 
-  orchestrator.run().catch((err) => {
+  const runPromise = orchestrator.run();
+  runPromise.catch((err) => {
     logger.fatal({ err }, 'CollectionOrchestrator crashed unexpectedly');
     process.exit(1);
   });
+  wireExitOnComplete(runPromise, config.service.exitOnComplete, logger);
 
   // ── 9. Log startup complete ─────────────────────────────────────────
   logger.info(

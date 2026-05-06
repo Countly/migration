@@ -43,6 +43,7 @@ export const configSchema = z.object({
         host: z.string().default("0.0.0.0"),
         gracefulShutdownTimeoutMs: intFromEnv.default(60_000),
         rerunMode: z.enum(['resume', 'clone-run', 'new-run']).default('resume'),
+        exitOnComplete: booleanFromEnv.default(false),
     }),
 
     // ── MongoDB Source ───────────────────────────────────────────────────

@@ -18,6 +18,7 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             host: env.SERVICE_HOST,
             gracefulShutdownTimeoutMs: env.GRACEFUL_SHUTDOWN_TIMEOUT_MS,
             rerunMode: env.RERUN_MODE,
+            exitOnComplete: env.EXIT_ON_COMPLETE,
         },
 
         source: {
