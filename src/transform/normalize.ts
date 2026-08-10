@@ -27,7 +27,7 @@ import type { CollectionDefaults } from './hash-resolver.ts';
  */
 const KNOWN_FIELDS = new Set<string>([
   'a', 'e', 'n', 'uid', 'uid_canon', 'did', 'lsid',
-  '_id', 'ts', 'up', 'custom', 'cmp', 'sg', 'c', 's', 'dur', 'lu',
+  '_id', 'ts', 'up', 'custom', 'cmp', 'sg', 'c', 's', 'dur', 'lu', 'cd',
 ]);
 
 const CLY_PREFIX = '[CLY]_';
@@ -81,6 +81,7 @@ export interface OutputRow {
   s: number;
   dur: number;
   lu?: string;
+  cd: string;
 }
 
 export interface TransformResult {
@@ -259,6 +260,21 @@ function doTransform(doc: SourceDocument, defaults?: CollectionDefaults): Transf
   } else {
     delete row['lu'];
   }
+
+  // `cd` must always be emitted. The ClickHouse column is declared
+  // `cd DateTime64(3) DEFAULT now64(3)`, so omitting it from the JSONEachRow
+  // payload makes ClickHouse stamp the row with the migration's wall-clock
+  // time instead of the event's real creation time. Downstream consumers
+  // filter on `cd` (MAU/datapoint terms, the dedup job), so a defaulted value
+  // silently pulls the entire migrated history into whichever term the
+  // migration happened to run in.
+  //
+  // Documents predating the introduction of `cd` have no value to recover --
+  // those are the ones handled by the null-cd sweep. Falling back to `ts`
+  // keeps them in a plausible term and, unlike now64(3), is deterministic, so
+  // re-running or resuming a migration is idempotent.
+  const cdMillis = toEpochMillis(doc.cd);
+  row['cd'] = formatTimestamp(cdMillis !== null && cdMillis > 0 ? cdMillis : tsMillis);
 
   return { row: row as unknown as OutputRow, skipReason: null };
 }
