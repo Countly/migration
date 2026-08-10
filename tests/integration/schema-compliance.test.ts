@@ -80,6 +80,40 @@ describe("schema-compliance", () => {
     expect(row!.c).toBeDefined();
     expect(row!.s).toBeDefined();
     expect(row!.dur).toBeDefined();
+    expect(row!.cd).toBeDefined();
+  });
+
+  it("cd preserved from source document", () => {
+    const doc = makeValidDoc({ cd: new Date("2024-03-27T09:00:00.123Z") });
+    const { row } = transformDocument(doc);
+
+    expect(row).not.toBeNull();
+    expect(row!.cd).toBe("2024-03-27 09:00:00.123");
+  });
+
+  it("cd accepts epoch millis and epoch seconds", () => {
+    // Older drill documents store cd as a raw epoch rather than a BSON Date.
+    const millis = transformDocument(makeValidDoc({ cd: 1711530000123 }));
+    expect(millis.row!.cd).toBe("2024-03-27 09:00:00.123");
+
+    const seconds = transformDocument(makeValidDoc({ cd: 1711530000 }));
+    expect(seconds.row!.cd).toBe("2024-03-27 09:00:00.000");
+  });
+
+  it("cd falls back to ts when source cd is missing or null", () => {
+    // Documents predating the introduction of `cd` -- the population the
+    // null-cd sweep exists to pick up. They must still get a deterministic
+    // value rather than ClickHouse's now64(3) default.
+    const missing = makeValidDoc();
+    delete (missing as any).cd;
+    const fromMissing = transformDocument(missing);
+    expect(fromMissing.row).not.toBeNull();
+    expect(fromMissing.row!.cd).toBe(fromMissing.row!.ts);
+
+    const nulled = makeValidDoc({ cd: null });
+    const fromNull = transformDocument(nulled);
+    expect(fromNull.row).not.toBeNull();
+    expect(fromNull.row!.cd).toBe(fromNull.row!.ts);
   });
 
   it("timestamp formatted as DateTime64(3)", () => {
@@ -204,5 +238,40 @@ describe("schema-compliance", () => {
     expect(Number(rows[0].c)).toBe(row!.c);
     expect(Number(rows[0].s)).toBeCloseTo(row!.s, 2);
     expect(Number(rows[0].dur)).toBeCloseTo(row!.dur, 2);
+  });
+
+  it("end-to-end: cd survives the insert instead of defaulting to now64(3)", async () => {
+    // Regression guard. The column is declared `cd DateTime64(3) DEFAULT
+    // now64(3)`, so a row that omits `cd` from its JSONEachRow payload is
+    // stamped with the migration's wall-clock time -- silently relocating the
+    // whole migrated history into the term the migration ran in.
+    const docId = new ObjectId().toHexString();
+    const sourceCd = new Date("2021-06-15T12:34:56.789Z");
+    const doc = makeValidDoc({
+      _id: docId,
+      e: "cd_preservation_test",
+      cd: sourceCd,
+    });
+    const { row } = transformDocument(doc);
+    expect(row).not.toBeNull();
+
+    const ch = await getClickHouseClient();
+    await ch.insert({
+      table: TEST_CH_TABLE,
+      values: [row!],
+      format: "JSONEachRow",
+      clickhouse_settings: {
+        date_time_input_format: "best_effort",
+      },
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    const rows = await chQuery<{ cd_ms: string }>(
+      `SELECT toUnixTimestamp64Milli(cd) AS cd_ms FROM ${TEST_CH_TABLE} WHERE _id = '${docId}'`,
+    );
+
+    expect(rows.length).toBe(1);
+    expect(Number(rows[0].cd_ms)).toBe(sourceCd.getTime());
   });
 });
