@@ -40,7 +40,14 @@ async function main(): Promise<void> {
 
   // ── 2. Create logger ────────────────────────────────────────────────
   const logger = createLogger(config);
-  logger.info({ service: config.service.name }, 'Starting migration service');
+  logger.info({ service: config.service.name, engine: config.engine }, 'Starting migration service');
+
+  // ── 2b. Engine selection: 'ledger' runs the no-Redis chunk engine ────
+  if (config.engine === 'ledger') {
+    const { runLedgerEngine } = await import('./runtime/ledger-engine.ts');
+    await runLedgerEngine(config, logger);
+    return;
+  }
 
   // ── 3. Initialize components ────────────────────────────────────────
 
@@ -49,7 +56,8 @@ async function main(): Promise<void> {
   await manifestStore.connect();
   logger.info({ db: config.state.manifestDb }, 'ManifestStore initialized');
 
-  const redisState = new RedisHotState(config.state.redisUrl, config.state.redisKeyPrefix);
+  // redisUrl presence for the classic engine is validated in loadConfig()
+  const redisState = new RedisHotState(config.state.redisUrl!, config.state.redisKeyPrefix);
   logger.info('RedisHotState initialized');
 
   // Source (no collection binding — orchestrator handles switchCollection per collection)

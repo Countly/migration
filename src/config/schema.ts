@@ -36,6 +36,21 @@ const positiveIntFromEnv = z
 // ---------------------------------------------------------------------------
 
 export const configSchema = z.object({
+    // ── Engine selection ─────────────────────────────────────────────────
+    // 'classic'  = current architecture (per-batch checkpoints, Redis hot state)
+    // 'ledger'   = chunk checklist in MongoDB, per-chunk staging tables, no Redis
+    engine: z.enum(["classic", "ledger"]).default("classic"),
+
+    // ── Ledger engine ────────────────────────────────────────────────────
+    ledger: z
+        .object({
+            runId: z.string().default("ledger-v1"),
+            chunkDocsTarget: positiveIntFromEnv.default(2_000_000),
+            insertInflight: positiveIntFromEnv.default(3),
+            leaseSec: positiveIntFromEnv.default(600),
+        })
+        .default({}),
+
     // ── Service ──────────────────────────────────────────────────────────
     service: z.object({
         name: z.string().min(1),
@@ -100,7 +115,8 @@ export const configSchema = z.object({
     // ── State ────────────────────────────────────────────────────────────
     state: z.object({
         manifestDb: z.string().default("countly_drill"),
-        redisUrl: z.string().min(1),
+        // Required for the classic engine only — the ledger engine has no Redis.
+        redisUrl: z.string().min(1).optional(),
         redisKeyPrefix: z.string().default("mig"),
         timelineSnapshotInterval: positiveIntFromEnv.default(10),
     }),

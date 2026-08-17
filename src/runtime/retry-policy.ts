@@ -70,6 +70,7 @@ export class RetryPolicy {
     label: string,
     logger: Logger,
     onError?: (attempt: number, error: Error) => Promise<void>,
+    classifier?: (err: unknown) => 'permanent' | 'transient',
   ): Promise<T> {
     let lastError: Error | null = null;
 
@@ -81,6 +82,16 @@ export class RetryPolicy {
 
         if (onError) {
           await onError(attempt, lastError).catch(() => {});
+        }
+
+        // Permanent errors (bad data) can never succeed on retry — fail fast
+        // instead of burning the full backoff schedule per doomed batch.
+        if (classifier && classifier(err) === 'permanent') {
+          logger.warn(
+            { label, error: lastError.message },
+            'Permanent error — failing immediately without retries',
+          );
+          throw lastError;
         }
 
         if (this.shouldRetry(attempt + 1)) {

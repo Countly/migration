@@ -12,6 +12,15 @@ import { configSchema, type Config } from "./schema.ts";
  */
 function envToRawConfig(env: NodeJS.ProcessEnv) {
     return {
+        engine: env.MIGRATION_ENGINE,
+
+        ledger: {
+            runId: env.LEDGER_RUN_ID,
+            chunkDocsTarget: env.LEDGER_CHUNK_DOCS_TARGET,
+            insertInflight: env.LEDGER_INSERT_INFLIGHT,
+            leaseSec: env.LEDGER_LEASE_SEC,
+        },
+
         service: {
             name: env.SERVICE_NAME,
             port: env.SERVICE_PORT,
@@ -146,6 +155,10 @@ export function loadConfig(): Config {
 
     // Semantic validation
     const { memory, target } = config;
+
+    if (config.engine === "classic" && !config.state.redisUrl) {
+        throw new Error("REDIS_URL is required for MIGRATION_ENGINE=classic (the ledger engine needs no Redis)");
+    }
 
     const rssSoft = memory.gcRssSoftLimitMb * 1024 * 1024;
     const rssHard = memory.gcRssHardLimitMb * 1024 * 1024;
