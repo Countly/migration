@@ -109,7 +109,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     waived: await dlq.waive(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId, req.body?.ids),
   }));
   const { registerLedgerVizRoutes } = await import('../http/ledger-viz-route.ts');
-  registerLedgerVizRoutes(app, { orchestrator, ledger, config });
+  registerLedgerVizRoutes(app, { orchestrator, ledger, dlq, config });
   await app.listen({ port: config.service.port, host: config.service.host });
   logger.info({ port: config.service.port }, 'Ledger engine HTTP listening');
 

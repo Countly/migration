@@ -9,18 +9,37 @@
 import type { FastifyInstance } from 'fastify';
 import type { ChunkOrchestrator } from '../runtime/chunk-orchestrator.ts';
 import type { LedgerStore } from '../state/ledger-store.ts';
+import type { DlqStore } from '../state/dlq-store.ts';
 import type { Config } from '../config/schema.ts';
 
 export interface LedgerVizDeps {
   orchestrator: ChunkOrchestrator;
   ledger: LedgerStore;
+  dlq: DlqStore;
   config: Config;
 }
 
 export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDeps): void {
+  const runId = () => deps.config.ledger.dryRun ? `${deps.config.ledger.runId}-dry` : deps.config.ledger.runId;
+
   app.get('/api/chunks', async () => {
-    const chunks = await deps.ledger.listAll(deps.config.ledger.runId);
-    return { runId: deps.config.ledger.runId, chunks };
+    const chunks = await deps.ledger.listAll(runId());
+    return { runId: runId(), chunks };
+  });
+
+  app.get('/api/dlq', async () => {
+    const pending = await deps.dlq.listPending(runId(), 20);
+    return {
+      byStatus: await deps.dlq.countByStatus(runId()),
+      topErrors: await deps.dlq.topErrors(runId(), 8),
+      samples: pending.map((p) => ({
+        source_id: p.source_id,
+        collection: p.collection,
+        reason: p.reason,
+        error: p.error,
+        raw_doc: JSON.stringify(p.raw_doc).slice(0, 2_000),
+      })),
+    };
   });
 
   app.get('/viz', async (_req, reply) => {
@@ -110,6 +129,33 @@ const PAGE = `<!doctype html>
   td { padding: 8px 12px 8px 0; border-bottom: 1px solid var(--bg); font-variant-numeric: tabular-nums; vertical-align: top; }
   td.err { color: #C0392B; font-family: ui-monospace, Menlo, monospace; font-size: 12px; word-break: break-word; }
   .empty { color: var(--muted); padding: 8px 0; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+  .btn {
+    font-family: Inter; font-size: 13px; font-weight: 600; cursor: pointer;
+    padding: 8px 16px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--card); color: var(--ink); transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--green); color: var(--green); }
+  .btn.primary { background: var(--green); border-color: var(--green); color: #fff; }
+  .btn.primary:hover { opacity: 0.9; color: #fff; }
+  .btn.danger:hover { border-color: var(--red); color: #C0392B; }
+  .btn:disabled { opacity: 0.45; cursor: default; }
+  .btn-note { color: var(--muted); font-size: 12px; align-self: center; }
+  .pill { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; margin-right: 6px; }
+  .pill.pending { background: #FDEEDD; color: #A05A16; }
+  .pill.resolved { background: var(--green-soft); color: #157A45; }
+  .pill.waived { background: var(--bg); color: var(--ink-2); border: 1px solid var(--line); }
+  details.dlq-sample { margin: 6px 0; font-size: 12px; }
+  details.dlq-sample summary { cursor: pointer; font-family: ui-monospace, Menlo, monospace; color: var(--ink-2); }
+  details.dlq-sample pre {
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 10px; overflow-x: auto; font-size: 11px; max-height: 200px;
+  }
+  #toast {
+    position: fixed; bottom: 20px; right: 20px; background: var(--ink); color: #fff;
+    padding: 10px 18px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity 0.3s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
   footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 24px; }
 </style>
 </head>
@@ -134,6 +180,15 @@ const PAGE = `<!doctype html>
     <div class="stat"><small>ETA</small><b id="s-eta">–</b></div>
   </div>
 
+  <div class="controls">
+    <button class="btn" onclick="control('pause', 'Paused')">Pause</button>
+    <button class="btn primary" onclick="control('resume', 'Resumed')">Resume</button>
+    <button class="btn" onclick="confirm('Reset all failed chunks to pending (purges their live windows) and resume?') && control('retry-failed', 'Failed chunks queued for redo')">Retry failed chunks</button>
+    <button class="btn" onclick="control('replay-dlq', 'DLQ replay finished')">Replay DLQ</button>
+    <button class="btn danger" onclick="confirm('Waive ALL pending DLQ docs? This is the explicit decision that they will NOT migrate (raw docs are retained).') && control('waive-dlq', 'Pending DLQ entries waived')">Waive pending DLQ</button>
+    <span class="btn-note">Actions call the /control endpoints — same as curl, with receipts.</span>
+  </div>
+
   <div class="card">
     <h2>Collections</h2>
     <div id="collections"><div class="empty">Waiting for first chunk…</div></div>
@@ -156,10 +211,75 @@ const PAGE = `<!doctype html>
     <div id="failed"><div class="empty">None 🎉</div></div>
   </div>
 
+  <div class="card">
+    <h2>Dead-letter queue <span style="color:var(--muted);font-weight:400;font-size:12px">(unmigratable docs, stored with their full raw source — replay after a fix, or waive)</span></h2>
+    <div id="dlq-status" style="margin-bottom:10px"></div>
+    <div id="dlq-errors"></div>
+    <div id="dlq-samples"></div>
+  </div>
+
+  <div class="card">
+    <h2>Coercions <span style="color:var(--muted);font-weight:400;font-size:12px">(values the transform had to alter — the data-quality report)</span></h2>
+    <div id="coercions"><div class="empty">None</div></div>
+  </div>
+
+  <div id="toast"></div>
+
   <footer>State source: chunk ledger (MongoDB) + live engine counters — refreshed every 2s. No Redis involved.</footer>
 </main>
 <script>
 const fmt = (n) => n == null ? '–' : Number(n).toLocaleString('en-US', { maximumFractionDigits: 0 });
+const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3500);
+}
+
+async function control(action, okMsg) {
+  try {
+    const res = await fetch('/control/' + action, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast('\u274c ' + action + ' failed (' + res.status + '): ' + (body.message || JSON.stringify(body)));
+    } else {
+      toast('\u2705 ' + okMsg + ' — ' + JSON.stringify(body));
+    }
+    tick(); slowTick();
+  } catch (e) { toast('\u274c ' + action + ' failed: ' + e.message); }
+  return true;
+}
+
+async function slowTick() {
+  try {
+    const [dlq, report] = await Promise.all([
+      fetch('/api/dlq').then(r => r.json()),
+      fetch('/report').then(r => r.json()),
+    ]);
+    const bs = dlq.byStatus || {};
+    document.getElementById('dlq-status').innerHTML =
+      ['pending', 'resolved', 'waived'].map(k =>
+        '<span class="pill ' + k + '">' + k + ': ' + fmt(bs[k] || 0) + '</span>').join('') +
+      ((bs.pending || 0) === 0 ? ' <span style="color:var(--green);font-size:12px;font-weight:600">ready for sign-off</span>'
+                               : ' <span style="color:#A05A16;font-size:12px">sign-off requires pending = 0 (fix &amp; replay, or waive)</span>');
+    const errs = dlq.topErrors || [];
+    document.getElementById('dlq-errors').innerHTML = errs.length === 0 ? '' :
+      '<table><tr><th>Error</th><th>Docs</th></tr>' +
+      errs.map(e => '<tr><td class="err">' + esc(e.error) + '</td><td>' + fmt(e.n) + '</td></tr>').join('') + '</table>';
+    document.getElementById('dlq-samples').innerHTML = (dlq.samples || []).slice(0, 8).map(sm =>
+      '<details class="dlq-sample"><summary>' + esc(sm.source_id) + ' · ' + esc(sm.reason) + ' · ' + esc(sm.error) + '</summary>' +
+      '<pre>' + esc(sm.raw_doc) + '</pre></details>').join('');
+
+    const co = (report.coercions || []).slice(0, 12);
+    document.getElementById('coercions').innerHTML = co.length === 0
+      ? '<div class="empty">None</div>'
+      : '<table><tr><th>Rule · field</th><th>Count</th><th>Sample</th></tr>' +
+        co.map(c => '<tr><td class="err">' + esc(c.rule_key) + '</td><td>' + fmt(c.count) + '</td><td style="font-size:12px;color:var(--ink-2)">' +
+          (c.sample ? esc(c.sample.original) + ' → ' + esc(c.sample.coerced) : '') + '</td></tr>').join('') + '</table>';
+  } catch { /* engine restarting */ }
+}
 
 async function tick() {
   try {
@@ -237,7 +357,9 @@ async function tick() {
   } catch { /* engine restarting — keep polling */ }
 }
 tick();
+slowTick();
 setInterval(tick, 2000);
+setInterval(slowTick, 5000);
 </script>
 </body>
 </html>`;
