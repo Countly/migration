@@ -17,7 +17,7 @@
 import { MongoClient, type Collection } from 'mongodb';
 import type { Logger } from 'pino';
 
-export type ChunkStatus = 'pending' | 'in_progress' | 'written' | 'attaching' | 'done' | 'failed';
+export type ChunkStatus = 'pending' | 'in_progress' | 'written' | 'attaching' | 'done' | 'failed' | 'superseded';
 
 export interface ChunkDoc {
   _id: string;                 // `${runId}:${collection}:${idx}`
@@ -204,6 +204,55 @@ export class LedgerStore {
       ])
       .toArray();
     return Object.fromEntries(rows.map((r) => [r._id, r.n]));
+  }
+
+  /**
+   * Poison-pill quarantine: replace a chunk that keeps crashing the process
+   * with `parts` fresh sub-chunks over its cd span. Repeated splitting
+   * converges on a tiny window around the poison document. The original
+   * chunk becomes `superseded` (terminal).
+   */
+  async splitChunk(chunk: ChunkDoc, parts: number): Promise<number> {
+    const maxDoc = await this.c()
+      .find({ run_id: chunk.run_id, collection: chunk.collection })
+      .sort({ idx: -1 }).limit(1).project({ idx: 1 }).toArray();
+    const baseIdx = (maxDoc[0]?.idx ?? 0) + 1;
+
+    const span = chunk.upper_cd - chunk.lower_cd;
+    const now = new Date();
+    const subs: ChunkDoc[] = [];
+    for (let i = 0; i < parts; i++) {
+      const lo = chunk.lower_cd + Math.floor((span * i) / parts);
+      const hi = i === parts - 1 ? chunk.upper_cd : chunk.lower_cd + Math.floor((span * (i + 1)) / parts);
+      if (hi <= lo) continue;
+      subs.push({
+        _id: `${chunk.run_id}:${chunk.collection}:${baseIdx + i}`,
+        run_id: chunk.run_id,
+        collection: chunk.collection,
+        idx: baseIdx + i,
+        lower_cd: lo,
+        upper_cd: hi,
+        status: 'pending',
+        pod_id: null,
+        lease_until: null,
+        staging_table: null,
+        docs_read: 0,
+        docs_skipped: 0,
+        rows_expected: 0,
+        partitions: [],
+        attached: [],
+        attach_method: null,
+        attempts: 0,
+        last_error: null,
+        transform_version: chunk.transform_version,
+        updated_at: now,
+      });
+    }
+    await this.c().insertMany(subs, { ordered: false });
+    await this.transition(chunk._id, ['in_progress', 'failed'], 'superseded', {
+      last_error: `split into ${subs.length} sub-chunks (idx ${baseIdx}..${baseIdx + subs.length - 1}) after repeated crashes`,
+    });
+    return subs.length;
   }
 
   /** All chunks of a run (dashboard feed) — trimmed projection, idx order. */

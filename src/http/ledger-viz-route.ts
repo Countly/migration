@@ -101,6 +101,7 @@ const PAGE = `<!doctype html>
   .cell.in_progress { background: var(--blue); animation: pulse 1.2s ease-in-out infinite; }
   .cell.written, .cell.attaching { background: var(--amber); }
   .cell.failed { background: var(--red); }
+  .cell.superseded { background: repeating-linear-gradient(45deg, var(--line), var(--line) 3px, transparent 3px, transparent 6px); }
   .legend { display: flex; gap: 16px; margin-top: 12px; color: var(--ink-2); font-size: 12px; flex-wrap: wrap; }
   .legend span { display: inline-flex; align-items: center; gap: 6px; }
   .legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }

@@ -238,6 +238,19 @@ export class ChunkOrchestrator {
       await this.reclaimExpiredLeases(collection, log);
 
       const chunk = await ledger.claimNext(this.runId, collection, this.podId, config.ledger.leaseSec);
+      if (chunk && chunk.attempts > MAX_CHUNK_ATTEMPTS && this.isSplittable(chunk)) {
+        // Poison-pill quarantine: this chunk keeps killing the process (a
+        // clean data error would have failed it long before exhausting
+        // crash-retries). Don't retry the same span again — bisect it, so
+        // repeated splitting converges on a tiny window around the poison
+        // document instead of quarantining millions of docs.
+        const parts = await ledger.splitChunk(chunk, 4);
+        log.warn(
+          { chunk: chunk._id, attempts: chunk.attempts, parts },
+          'Chunk exhausted crash-retries — split into sub-chunks (poison-pill hunt)',
+        );
+        continue;
+      }
       if (!chunk) {
         // Nothing pending — but "complete" means NO non-terminal chunks.
         // Chunks may still be leased by another pod (or orphaned by a dead
@@ -257,8 +270,11 @@ export class ChunkOrchestrator {
         continue;
       }
       if (chunk.attempts > MAX_CHUNK_ATTEMPTS) {
+        // Too small to split further (or the null-cd sentinel): quarantine.
+        // The window is now tiny — the offending doc(s) are inspectable
+        // directly in the source between lower_cd and upper_cd.
         await ledger.transition(chunk._id, 'in_progress', 'failed', {
-          last_error: `exceeded ${MAX_CHUNK_ATTEMPTS} attempts`,
+          last_error: `exceeded ${MAX_CHUNK_ATTEMPTS} attempts (crash quarantine — inspect source docs in this cd window)`,
         });
         this.noteChunkFailure(log);
         continue;
@@ -478,6 +494,11 @@ export class ChunkOrchestrator {
     return chunk.lower_cd === -1 && chunk.upper_cd === 0;
   }
 
+  /** Splittable for the poison-pill hunt: cd-bounded and wider than 1 minute. */
+  private isSplittable(chunk: ChunkDoc): boolean {
+    return !this.isNullCdChunk(chunk) && chunk.upper_cd - chunk.lower_cd > 60_000;
+  }
+
   private async copyChunk(
     chunk: ChunkDoc,
     stagingTable: string,
@@ -576,6 +597,16 @@ export class ChunkOrchestrator {
     clog: Logger,
   ): Promise<void> {
     const { config } = this.d;
+
+    // Chaos hook for poison-pill drills (bench/poison-drill.ts): hard-kills
+    // the process when a specific doc is touched. Inert unless the test-only
+    // env var is set — simulates a doc that OOMs/crashes the transform.
+    if (process.env.LEDGER_TEST_CRASH_ID
+        && docs.some((d) => String(d._id) === process.env.LEDGER_TEST_CRASH_ID)) {
+      this.logger.fatal({ poison: process.env.LEDGER_TEST_CRASH_ID }, 'CHAOS: simulated poison-pill crash');
+      process.exit(137);
+    }
+
     state.docsRead += docs.length;
 
     const tfStart = performance.now();

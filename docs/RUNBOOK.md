@@ -52,6 +52,7 @@ once, for minutes, at cutover — never for the migration.
 | Systematic failures (>5% of a chunk) | Circuit breaker pauses the engine; DLQ already names the error | Investigate, fix, `POST /control/retry-failed` (purges + redoes failed chunks, resumes) |
 | Migrator crashes / pod dies | Nothing else notices. In-flight chunks are redone from their staging tables; a dead pod's lease expires and others reclaim | Restart the pod. No manual cleanup exists in this flow |
 | Live-table rows lost/corrupted for a done chunk | Invariant monitor detects the count mismatch, pauses, flags the chunk | `POST /control/retry-failed` — the chunk's cd window is purged and redone |
+| A doc CRASHES the process every time (poison pill) | After 3 crash-retries the chunk is auto-split instead of retried; repeated splitting converges on a ≤1-min window quarantined as a tiny failed chunk — everything else migrates (verified: 20k-doc drill localized 1 poison doc to a 2-doc window in 25 restarts) | Inspect the few source docs in the failed chunk's cd window; fix/remove them, then `POST /control/retry-failed` |
 | Live ClickHouse itself must be rebuilt | Live events still sit in the Kafka log; history still sits in frozen Mongo | Recreate table → reset ONLY the ClickHouse-sink connector's offsets to earliest (aggregator groups untouched) → re-run the migrator |
 
 ## Verification cheat sheet
