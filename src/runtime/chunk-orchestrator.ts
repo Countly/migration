@@ -217,6 +217,14 @@ export class ChunkOrchestrator {
       bounds = bounds.filter((_, i) => i % k === 0);
     }
 
+    // Null-cd sweep chunk: documents with no `cd` value are invisible to the
+    // cd-bounded chunks — they get one dedicated chunk, paged by `_id`.
+    // Sentinel bounds {-1, 0} mark it.
+    if (!this.dryRun && (await mongoReader.hasNullCdDocuments())) {
+      bounds.push({ lowerCd: -1, upperCd: 0 });
+      log.info('Collection has null-cd documents — added null-cd sweep chunk');
+    }
+
     const created = await ledger.initChunks(this.runId, collection, bounds, config.transform.version);
     log.info({ estimated, chunks: bounds.length, created, dryRun: this.dryRun }, 'Chunk list ready');
 
@@ -447,6 +455,10 @@ export class ChunkOrchestrator {
    * row (for DLQ), and a bounded window of concurrent inserts with
    * bisection on permanent errors.
    */
+  private isNullCdChunk(chunk: ChunkDoc): boolean {
+    return chunk.lower_cd === -1 && chunk.upper_cd === 0;
+  }
+
   private async copyChunk(
     chunk: ChunkDoc,
     stagingTable: string,
@@ -454,90 +466,33 @@ export class ChunkOrchestrator {
     clog: Logger,
   ): Promise<{ docsRead: number; docsSkipped: number; docsDlq: number; transformErrors: number }> {
     const { config, mongoReader } = this.d;
+
+    if (this.isNullCdChunk(chunk)) {
+      return this.copyNullCdChunk(chunk, stagingTable, defaults, clog);
+    }
     const upperBound: Cursor = { cd: chunk.upper_cd, id: '' };
     let resumeFrom: Cursor | null = { cd: chunk.lower_cd, id: '' };
     let skipFirstId: string | null = null;
 
-    let docsRead = 0;
-    let docsSkipped = 0;
-    let docsDlq = 0;
-    let transformErrors = 0;
-    let batchSeq = 0;
-    let firstError: Error | null = null;
-
+    const state = { docsRead: 0, docsSkipped: 0, docsDlq: 0, transformErrors: 0, batchSeq: 0, firstError: null as Error | null };
     const inflight: Promise<void>[] = [];
-    const pushInsert = (rows: OutputRow[], srcs: SourceDocument[]) => {
-      const seq = batchSeq++;
-      const p = this.insertOrBisect(chunk, stagingTable, rows, srcs, seq, clog)
-        .then((r) => { docsDlq += r.dlqd; })
-        .catch((err) => { if (!firstError) firstError = err as Error; });
-      inflight.push(p);
-    };
 
-    for (let attempt = 0; attempt < 5 && !firstError; attempt++) {
+    for (let attempt = 0; attempt < 5 && !state.firstError; attempt++) {
       try {
         const stream = mongoReader.readStream(resumeFrom, upperBound, config.source.mongoPageSize);
         for await (const page of stream) {
-          const rStart = performance.now();
           this.stageMs.read += page.fetchMs;
 
           let docs = page.docs;
           // min() is inclusive: on (re)open, drop the already-processed boundary doc.
           if (skipFirstId !== null && String(docs[0]?._id) === skipFirstId) docs = docs.slice(1);
           skipFirstId = null;
-          void rStart;
 
           if (docs.length === 0) { resumeFrom = page.lastCursor; continue; }
-          docsRead += docs.length;
-
-          const tfStart = performance.now();
-          const rows: OutputRow[] = [];
-          const srcs: SourceDocument[] = [];
-          const dlqBatch: Parameters<DlqStore['add']>[0] = [];
-          for (const doc of docs) {
-            const { row, skipReason } = transformDocument(doc, defaults, this.coercions);
-            if (row !== null) {
-              rows.push(row);
-              srcs.push(doc);
-            } else if (skipReason !== null) {
-              this.skips.increment(skipReason);
-              docsSkipped++;
-              // Every unmigratable doc (except already-migrated) is captured
-              // with its raw source doc — accounted for and replayable after
-              // a rule change, never silently dropped.
-              if (skipReason !== SkipReason.ALREADY_MARKED_MIGRATED) {
-                transformErrors++;
-                if (config.ledger.captureTransformErrors) {
-                  dlqBatch.push({
-                    run_id: this.runId,
-                    collection: chunk.collection,
-                    chunk_id: chunk._id,
-                    source_id: String(doc._id ?? `unknown_${docsRead}`),
-                    raw_doc: doc as Record<string, unknown>,
-                    reason: skipReason === SkipReason.TRANSFORM_ERROR ? 'transform_error' : 'skipped',
-                    error: `skip:${skipReason}`,
-                    transform_version: config.transform.version,
-                  });
-                }
-              }
-            }
-          }
-          this.stageMs.transform += performance.now() - tfStart;
-          if (dlqBatch.length > 0) await this.d.dlq.add(dlqBatch);
-
-          await this.respectBackpressure();
-
-          if (rows.length > 0) {
-            pushInsert(rows, srcs);
-            if (inflight.length >= config.ledger.insertInflight) {
-              const iStart = performance.now();
-              await inflight.shift();
-              this.stageMs.insert += performance.now() - iStart;
-            }
-          }
+          await this.processPage(docs, chunk, stagingTable, defaults, state, inflight, clog);
 
           resumeFrom = page.lastCursor;
-          if (firstError) break;
+          if (state.firstError) break;
         }
         break; // stream exhausted cleanly
       } catch (err) {
@@ -553,11 +508,105 @@ export class ChunkOrchestrator {
     await Promise.all(inflight);
     this.stageMs.insert += performance.now() - iStart;
 
-    if (firstError) throw firstError;
+    if (state.firstError) throw state.firstError;
 
     // DLQ'd transform errors are already counted in docsSkipped; insert-DLQ'd
     // docs are not skipped (they were readable and transformable).
-    return { docsRead, docsSkipped, docsDlq, transformErrors };
+    return { docsRead: state.docsRead, docsSkipped: state.docsSkipped, docsDlq: state.docsDlq, transformErrors: state.transformErrors };
+  }
+
+  /** Null-cd sweep: page by `_id` over docs with no cd value. */
+  private async copyNullCdChunk(
+    chunk: ChunkDoc,
+    stagingTable: string,
+    defaults: CollectionDefaults | undefined,
+    clog: Logger,
+  ): Promise<{ docsRead: number; docsSkipped: number; docsDlq: number; transformErrors: number }> {
+    const { config, mongoReader } = this.d;
+    const bounds = await mongoReader.getNullCdBounds();
+    const state = { docsRead: 0, docsSkipped: 0, docsDlq: 0, transformErrors: 0, batchSeq: 0, firstError: null as Error | null };
+    if (!bounds) return state;
+
+    const inflight: Promise<void>[] = [];
+    let lastId: string | null = null;
+    for (;;) {
+      const page = await mongoReader.readNullCdPage(lastId, bounds.upper, config.source.mongoPageSize);
+      this.stageMs.read += page.fetchMs;
+      if (page.docs.length === 0) break;
+      await this.processPage(page.docs, chunk, stagingTable, defaults, state, inflight, clog);
+      lastId = page.lastCursor!.id;
+      if (state.firstError || page.docs.length < config.source.mongoPageSize) break;
+    }
+
+    const iStart = performance.now();
+    await Promise.all(inflight);
+    this.stageMs.insert += performance.now() - iStart;
+    if (state.firstError) throw state.firstError;
+    return state;
+  }
+
+  /** Shared per-page pipeline: transform (with raw-doc pairing), DLQ capture,
+   *  backpressure, and windowed insert-or-bisect. */
+  private async processPage(
+    docs: SourceDocument[],
+    chunk: ChunkDoc,
+    stagingTable: string,
+    defaults: CollectionDefaults | undefined,
+    state: { docsRead: number; docsSkipped: number; docsDlq: number; transformErrors: number; batchSeq: number; firstError: Error | null },
+    inflight: Promise<void>[],
+    clog: Logger,
+  ): Promise<void> {
+    const { config } = this.d;
+    state.docsRead += docs.length;
+
+    const tfStart = performance.now();
+    const rows: OutputRow[] = [];
+    const srcs: SourceDocument[] = [];
+    const dlqBatch: Parameters<DlqStore['add']>[0] = [];
+    for (const doc of docs) {
+      const { row, skipReason } = transformDocument(doc, defaults, this.coercions);
+      if (row !== null) {
+        rows.push(row);
+        srcs.push(doc);
+      } else if (skipReason !== null) {
+        this.skips.increment(skipReason);
+        state.docsSkipped++;
+        // Every unmigratable doc (except already-migrated) is captured with
+        // its raw source doc — accounted for and replayable, never dropped.
+        if (skipReason !== SkipReason.ALREADY_MARKED_MIGRATED) {
+          state.transformErrors++;
+          if (config.ledger.captureTransformErrors) {
+            dlqBatch.push({
+              run_id: this.runId,
+              collection: chunk.collection,
+              chunk_id: chunk._id,
+              source_id: String(doc._id ?? `unknown_${state.docsRead}`),
+              raw_doc: doc as Record<string, unknown>,
+              reason: skipReason === SkipReason.TRANSFORM_ERROR ? 'transform_error' : 'skipped',
+              error: `skip:${skipReason}`,
+              transform_version: config.transform.version,
+            });
+          }
+        }
+      }
+    }
+    this.stageMs.transform += performance.now() - tfStart;
+    if (dlqBatch.length > 0) await this.d.dlq.add(dlqBatch);
+
+    await this.respectBackpressure();
+
+    if (rows.length > 0) {
+      const seq = state.batchSeq++;
+      const p = this.insertOrBisect(chunk, stagingTable, rows, srcs, seq, clog)
+        .then((r) => { state.docsDlq += r.dlqd; })
+        .catch((err) => { if (!state.firstError) state.firstError = err as Error; });
+      inflight.push(p);
+      if (inflight.length >= config.ledger.insertInflight) {
+        const iStart = performance.now();
+        await inflight.shift();
+        this.stageMs.insert += performance.now() - iStart;
+      }
+    }
   }
 
   /**
@@ -642,8 +691,12 @@ export class ChunkOrchestrator {
 
     const remaining = chunk.partitions.filter((p) => !attachedSet.has(p));
     for (const partitionId of remaining) {
-      // Verify-then-attach: never attach a partition whose rows are already live.
-      const already = await staging.countLiveInChunkPartition(partitionId, chunk.lower_cd, chunk.upper_cd);
+      // Verify-then-attach: never attach a partition whose rows are already
+      // live. Regular chunks check their cd window (fast, minmax-indexed);
+      // the null-cd sweep has no cd window, so it checks staged ids instead.
+      const already = this.isNullCdChunk(chunk)
+        ? await staging.countLiveByStagedIds(stagingTable, partitionId)
+        : await staging.countLiveInChunkPartition(partitionId, chunk.lower_cd, chunk.upper_cd);
       if (already > 0) {
         await ledger.recordAttached(chunk._id, partitionId);
         continue;
@@ -702,10 +755,18 @@ export class ChunkOrchestrator {
     if (!this.currentCollection) return;
     const done = await this.d.ledger.listByStatus(this.runId, this.currentCollection, 'done');
     if (done.length === 0) return;
-    const samples = done.sort(() => Math.random() - 0.5).slice(0, 5);
+    // Null-cd rows carry cd values derived from ts, which land inside regular
+    // chunks' cd windows — with a null-cd sweep present, exact equality per
+    // window is not a valid invariant; missing rows still are.
+    const hasNullCd = done.some((c) => this.isNullCdChunk(c));
+    const samples = done
+      .filter((c) => !this.isNullCdChunk(c))
+      .sort(() => Math.random() - 0.5)
+      .slice(0, 5);
     for (const chunk of samples) {
       const live = await this.d.staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd);
-      if (live !== chunk.rows_expected) {
+      const violated = hasNullCd ? live < chunk.rows_expected : live !== chunk.rows_expected;
+      if (violated) {
         this.logger.error(
           { chunk: chunk._id, live, expected: chunk.rows_expected },
           'INVARIANT VIOLATION: live-table count disagrees with verified chunk — pausing engine',

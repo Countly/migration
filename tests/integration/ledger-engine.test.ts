@@ -175,6 +175,9 @@ describe('ledger engine end-to-end', () => {
       _id: 'coerce_me', a: 'app1', e: 'big_int_event', uid: 'u9', did: 'd9',
       ts: base + 1, cd: new Date(base + 1), sg: { order_id: 9.2e25 }, c: 1,
     });
+    // Docs with no cd value — must be picked up by the null-cd sweep chunk
+    docs.push({ _id: 'nocd_1', a: 'app1', e: 'legacy_event', uid: 'u1', did: 'd', ts: base - 86_400_000 });
+    docs.push({ _id: 'nocd_2', a: 'app1', e: 'legacy_event', uid: 'u2', did: 'd', ts: base - 86_400_000, cd: null });
     await coll.insertMany(docs as never[]);
     await coll.createIndex({ cd: 1, _id: 1 });
 
@@ -185,7 +188,6 @@ describe('ledger engine end-to-end', () => {
     process.env.MANIFEST_DB = DB;
     process.env.CLICKHOUSE_URL = CH_URL;
     process.env.CLICKHOUSE_DB = DB;
-    process.env.MIGRATION_ENGINE = 'ledger';
     process.env.LEDGER_RUN_ID = 'e2e-1';
     process.env.LEDGER_CHUNK_DOCS_TARGET = '500';
     process.env.LEDGER_MONITOR_INTERVAL_MS = '0';
@@ -194,7 +196,7 @@ describe('ledger engine end-to-end', () => {
 
     const mongoReader = new MongoReader({
       uri: MONGO_URI, database: DB, readPreference: 'primary', readConcern: 'local',
-      retryReads: true, appName: 'e2e', batchRowsTarget: 500, cursorBatchSize: 500, maxTimeMs: 60_000,
+      retryReads: true, appName: 'e2e', cursorBatchSize: 500, maxTimeMs: 60_000,
     }, logger);
     const ledger = new LedgerStore(MONGO_URI, DB, logger);
     dlq = new DlqStore(MONGO_URI, DB, logger);
@@ -232,9 +234,16 @@ describe('ledger engine end-to-end', () => {
       format: 'JSONEachRow',
     });
     const [row] = await res.json<{ t: string; u: string }>();
-    // clean docs + the coercion doc land; the 3 transform-poisoned do not
-    expect(Number(row.t)).toBe(CLEAN_DOCS + 1);
-    expect(Number(row.u)).toBe(CLEAN_DOCS + 1); // zero duplicates
+    // clean docs + coercion doc + 2 null-cd docs land; the 3 poisoned do not
+    expect(Number(row.t)).toBe(CLEAN_DOCS + 3);
+    expect(Number(row.u)).toBe(CLEAN_DOCS + 3); // zero duplicates
+
+    // Null-cd docs arrived via the sweep chunk
+    const nocd = await ch.query({
+      query: `SELECT count() AS c FROM ${DB}.drill_events WHERE _id LIKE 'nocd_%'`,
+      format: 'JSONEachRow',
+    });
+    expect(Number((await nocd.json<{ c: string }>())[0].c)).toBe(2);
 
     // DLQ carries the poisoned docs WITH their raw source docs
     const pending = await dlq.listPending('e2e-1');

@@ -32,7 +32,6 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       readConcern: config.source.readConcern,
       retryReads: config.source.retryReads,
       appName: config.source.appName ?? config.service.name,
-      batchRowsTarget: config.source.batchRowsTarget,
       cursorBatchSize: config.source.cursorBatchSize,
       maxTimeMs: config.source.maxTimeMs,
     },

@@ -229,6 +229,22 @@ export class StagingManager {
   }
 
   /**
+   * Attach-recovery check for chunks WITHOUT a usable cd window (the null-cd
+   * sweep): are any of this staging partition's row ids already live?
+   */
+  async countLiveByStagedIds(stagingTable: string, partitionId: string): Promise<number> {
+    const res = await this.ch().query({
+      query: `SELECT count() AS c FROM ${this.fq(this.config.table)}
+              WHERE _partition_id = {pid:String}
+                AND _id IN (SELECT _id FROM ${this.fq(stagingTable)} WHERE _partition_id = {pid:String} LIMIT 100)`,
+      query_params: { pid: partitionId },
+      format: 'JSONEachRow',
+    });
+    const rows = await res.json<{ c: string }>();
+    return Number(rows[0]?.c ?? 0);
+  }
+
+  /**
    * Attach one partition of a staging table into the live table.
    * Parts-level (no rewrite). Throws on failure — caller decides fallback.
    */

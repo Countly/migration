@@ -10,7 +10,6 @@ export interface MongoReaderConfig {
   readConcern: string;
   retryReads: boolean;
   appName: string;
-  batchRowsTarget: number;
   cursorBatchSize: number;
   maxTimeMs: number;
 }
@@ -264,60 +263,6 @@ export class MongoReader {
     return {
       docs: docs as SourceDocument[],
       lastCursor,
-      fetchMs,
-    };
-  }
-
-  async readPage(lastCursor: Cursor | null, upperBound: Cursor, limit?: number): Promise<PageResult> {
-    this.ensureConnected();
-
-    const { cursorBatchSize, maxTimeMs } = this.config;
-    const pageLimit = limit ?? this.config.batchRowsTarget;
-
-    const ucd = new Date(upperBound.cd);
-    const startMs = performance.now();
-
-    let query = this.collection!
-      .find({ cd: { $ne: null } })
-      .sort({ cd: 1, _id: 1 })
-      .hint({ cd: 1, _id: 1 })
-      .max({ cd: ucd, _id: upperBound.id })
-      .limit(pageLimit)
-      .batchSize(cursorBatchSize)
-      .project(PROJECTION)
-      .maxTimeMS(maxTimeMs);
-
-    if (lastCursor !== null) {
-      const lcd = new Date(lastCursor.cd);
-      query = query.min({ cd: lcd, _id: lastCursor.id });
-    }
-
-    const docs = await query.toArray();
-
-    const fetchMs = Math.round(performance.now() - startMs);
-
-    const lastDoc = docs[docs.length - 1];
-    const lastCursorResult: Cursor | null = docs.length > 0
-      ? { cd: cdToEpoch(lastDoc.cd), id: String(lastDoc._id) }
-      : null;
-
-    // Guard: min() is inclusive, so the first doc may equal lastCursor.
-    // If it's the only doc returned, lastCursorResult === lastCursor → infinite loop.
-    // Signal "done" to the caller instead.
-    if (lastCursor !== null && lastCursorResult !== null
-        && lastCursorResult.cd === lastCursor.cd
-        && lastCursorResult.id === lastCursor.id) {
-      return { docs: [], lastCursor: null, fetchMs: Math.round(performance.now() - startMs) };
-    }
-
-    this.logger.debug(
-      { docsRead: docs.length, lastCursor: lastCursorResult, fetchMs },
-      "Page read complete",
-    );
-
-    return {
-      docs: docs as SourceDocument[],
-      lastCursor: lastCursorResult,
       fetchMs,
     };
   }

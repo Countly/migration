@@ -4,9 +4,6 @@
  *   1. every source doc is accounted for (rows in CH == mongo docs - skipped)
  *   2. zero duplicates (count() == uniqExact(_id))
  *
- * This is the crash-safety half of the A/B: run it, then try the same thing
- * against the classic engine.
- *
  * Env: same AB_* vars as setup.ts, plus KILL_MIN_MS / KILL_MAX_MS (5000/20000).
  */
 import { spawn } from 'node:child_process';
@@ -22,12 +19,9 @@ const KILL_MIN = Number(process.env.KILL_MIN_MS ?? 5_000);
 const KILL_MAX = Number(process.env.KILL_MAX_MS ?? 20_000);
 const MAX_ROUNDS = Number(process.env.KILL_MAX_ROUNDS ?? 60);
 
-const ENGINE = (process.env.DRILL_ENGINE ?? 'ledger') as 'ledger' | 'classic';
-
 const env: NodeJS.ProcessEnv = {
   ...process.env,
-  MIGRATION_ENGINE: ENGINE,
-  SERVICE_NAME: `kill-drill-${ENGINE}`,
+  SERVICE_NAME: 'kill-drill',
   SERVICE_PORT: String(PORT),
   MONGO_URI,
   MONGO_DB,
@@ -38,18 +32,9 @@ const env: NodeJS.ProcessEnv = {
   LOG_LEVEL: 'warn',
   NODE_ENV: 'production',
 };
-if (ENGINE === 'ledger') {
-  env.LEDGER_RUN_ID = process.env.LEDGER_RUN_ID ?? 'kill-drill-1';
-  env.LEDGER_CHUNK_DOCS_TARGET = process.env.LEDGER_CHUNK_DOCS_TARGET ?? '25000';
-  env.MULTI_POD_ENABLED = 'false';
-} else {
-  // classic needs Redis and resumes via manifest/Redis recovery
-  if (!process.env.REDIS_URL) {
-    console.error('DRILL_ENGINE=classic requires REDIS_URL');
-    process.exit(1);
-  }
-  env.RERUN_MODE = 'resume';
-}
+env.LEDGER_RUN_ID = process.env.LEDGER_RUN_ID ?? 'kill-drill-1';
+env.LEDGER_CHUNK_DOCS_TARGET = process.env.LEDGER_CHUNK_DOCS_TARGET ?? '25000';
+env.MULTI_POD_ENABLED = 'false';
 
 function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 

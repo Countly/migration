@@ -36,11 +36,6 @@ const positiveIntFromEnv = z
 // ---------------------------------------------------------------------------
 
 export const configSchema = z.object({
-    // ── Engine selection ─────────────────────────────────────────────────
-    // 'classic'  = current architecture (per-batch checkpoints, Redis hot state)
-    // 'ledger'   = chunk checklist in MongoDB, per-chunk staging tables, no Redis
-    engine: z.enum(["classic", "ledger"]).default("classic"),
-
     // ── Ledger engine ────────────────────────────────────────────────────
     ledger: z
         .object({
@@ -68,7 +63,6 @@ export const configSchema = z.object({
         port: positiveIntFromEnv.default(8080),
         host: z.string().default("0.0.0.0"),
         gracefulShutdownTimeoutMs: intFromEnv.default(60_000),
-        rerunMode: z.enum(['resume', 'clone-run', 'new-run']).default('resume'),
         exitOnComplete: booleanFromEnv.default(false),
     }),
 
@@ -82,13 +76,9 @@ export const configSchema = z.object({
         readConcern: z.string().default("majority"),
         retryReads: booleanFromEnv.default(true),
         appName: z.string().optional(),
-        batchRowsTarget: positiveIntFromEnv.default(10_000),
         mongoPageSize: positiveIntFromEnv.default(10_000),
         cursorBatchSize: positiveIntFromEnv.default(10_000),
         maxTimeMs: positiveIntFromEnv.default(600_000),
-        rangeParallelThreshold: intFromEnv.default(500_000),
-        rangeCount: positiveIntFromEnv.default(100),
-        rangeLeaseTtlSec: positiveIntFromEnv.default(300),
     }),
 
     // ── Transform ────────────────────────────────────────────────────────
@@ -107,7 +97,6 @@ export const configSchema = z.object({
         maxRetries: intFromEnv.default(8),
         retryBaseDelayMs: positiveIntFromEnv.default(1_000),
         retryMaxDelayMs: positiveIntFromEnv.default(30_000),
-        useDedupToken: booleanFromEnv.default(true),
     }),
 
     // ── Backpressure ─────────────────────────────────────────────────────
@@ -123,39 +112,15 @@ export const configSchema = z.object({
         maxPauseEpisodeMs: intFromEnv.default(180_000),
     }),
 
-    // ── State ────────────────────────────────────────────────────────────
+    // ── State (chunk ledger + DLQ live here) ─────────────────────────────
     state: z.object({
         manifestDb: z.string().default("countly_drill"),
-        // Required for the classic engine only — the ledger engine has no Redis.
-        redisUrl: z.string().min(1).optional(),
-        redisKeyPrefix: z.string().default("mig"),
-        timelineSnapshotInterval: positiveIntFromEnv.default(10),
-    }),
-
-    // ── Memory / GC ─────────────────────────────────────────────────────
-    memory: z.object({
-        gcEnabled: booleanFromEnv.default(true),
-        gcRssSoftLimitMb: intFromEnv.default(3_072),
-        gcRssHardLimitMb: intFromEnv.default(6_144),
-        gcHeapUsedRatio: numberFromEnv.default(0.70),
-        gcEveryNBatches: intFromEnv.default(50),
     }),
 
     // ── Worker / Multi-Pod ──────────────────────────────────────────────
     worker: z.object({
         podId: z.string().default(""),
         enabled: booleanFromEnv.default(true),
-        lockTtlSec: positiveIntFromEnv.default(300),
-        lockRenewMs: positiveIntFromEnv.default(60_000),
-        progressUpdateMs: positiveIntFromEnv.default(5_000),
-        podHeartbeatMs: positiveIntFromEnv.default(30_000),
-        podDeadAfterSec: positiveIntFromEnv.default(180),
-    }),
-
-    // ── Async Write ──────────────────────────────────────────────────────
-    asyncWrite: z.object({
-        flushIntervalMs: positiveIntFromEnv.default(5_000),
-        flushBatchSize: positiveIntFromEnv.default(10),
     }),
 
     // ── Logging ──────────────────────────────────────────────────────────
