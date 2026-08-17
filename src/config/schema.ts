@@ -48,6 +48,17 @@ export const configSchema = z.object({
             chunkDocsTarget: positiveIntFromEnv.default(2_000_000),
             insertInflight: positiveIntFromEnv.default(3),
             leaseSec: positiveIntFromEnv.default(600),
+            // Circuit breaker: pause when >pct% of a chunk's docs fail, or
+            // after N consecutive failed chunks (systematic-bug detection).
+            breakerPct: numberFromEnv.default(5).pipe(z.number().min(0).max(100)),
+            breakerConsecutive: positiveIntFromEnv.default(3),
+            // Background invariant spot checks (0 disables).
+            monitorIntervalMs: intFromEnv.default(900_000),
+            // Capture full raw docs of transform failures into the DLQ.
+            captureTransformErrors: booleanFromEnv.default(true),
+            // Dry run: sampled rehearsal against a Null-engine clone.
+            dryRun: booleanFromEnv.default(false),
+            dryRunSamplePct: numberFromEnv.default(2).pipe(z.number().min(0.1).max(5)),
         })
         .default({}),
 

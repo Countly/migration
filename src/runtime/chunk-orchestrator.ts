@@ -1,18 +1,23 @@
 /**
  * ChunkOrchestrator — the `ledger` engine.
  *
- * Work model: each collection is split into cd-bounded chunks (sized by
- * estimated doc count). Per chunk: claim (atomic, leased, newest-first) →
- * copy into a per-chunk staging table (pipelined reads + a small window of
- * concurrent synchronous inserts) → verify (read tally vs exact ClickHouse
- * count) → promote (verify-then-ATTACH per partition, INSERT SELECT
- * fallback) → drop staging → done.
+ * Work model: each collection is split into cd-bounded chunks. Per chunk:
+ * claim (atomic, leased, newest-first) → stream-copy into a per-chunk staging
+ * table (one long-lived cursor; concurrent synchronous inserts) → verify
+ * (read tally vs exact ClickHouse count) → promote (verify-then-ATTACH per
+ * partition, INSERT SELECT fallback) → drop staging → done.
  *
- * Recovery model: the ledger is a worklist, never blindly trusted.
- *   in_progress → drop staging, redo whole chunk
- *   written     → recount staging; matches → promote, else drop + redo
- *   attaching   → per partition: already in live table? record : attach
- * No Redis anywhere; MongoDB (ledger) + ClickHouse are the only dependencies.
+ * Failure model:
+ *  - permanent insert errors are BISECTED down to the offending documents,
+ *    which land in the DLQ with their full raw source doc (replayable);
+ *  - a circuit breaker pauses the engine when failures look systematic;
+ *  - ClickHouse parts pressure is respected via a TTL-cached sampler;
+ *  - crash recovery never trusts the ledger: in_progress → drop + redo,
+ *    written → recount, attaching → verify-then-attach per partition;
+ *  - an invariant monitor spot-checks done chunks against the live table.
+ *
+ * No Redis anywhere; MongoDB (ledger + DLQ) + ClickHouse are the only
+ * dependencies. Dry-run mode targets a Null-engine clone with ≤5% sampling.
  */
 
 import type { Logger } from 'pino';
@@ -20,23 +25,29 @@ import type { Config } from '../config/schema.ts';
 import type { MongoReader } from '../source/mongo-reader.ts';
 import type { HashResolver, CollectionDefaults } from '../transform/hash-resolver.ts';
 import type { RetryPolicy } from './retry-policy.ts';
+import type { ClickHousePressure, PressureState } from '../target/clickhouse-pressure.ts';
 import { LedgerStore, type ChunkDoc } from '../state/ledger-store.ts';
+import { DlqStore } from '../state/dlq-store.ts';
 import { StagingManager } from '../target/staging-manager.ts';
-import { transformBatch, type OutputRow } from '../transform/normalize.ts';
-import { SkipCounter } from '../transform/skip-reasons.ts';
+import { transformDocument, type OutputRow, type SourceDocument } from '../transform/normalize.ts';
+import { SkipCounter, SkipReason } from '../transform/skip-reasons.ts';
+import { CoercionCounter } from '../transform/coercions.ts';
 import { classifyError } from './error-classifier.ts';
 import { discoverCollections } from '../source/discover-collections.ts';
 import type { Cursor } from '../types/cursor.ts';
 import { createHash } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 export interface ChunkOrchestratorDeps {
   config: Config;
   logger: Logger;
   mongoReader: MongoReader;
   ledger: LedgerStore;
+  dlq: DlqStore;
   staging: StagingManager;
   retryPolicy: RetryPolicy;
   hashResolver: HashResolver;
+  chPressure?: ClickHousePressure;
 }
 
 export interface LedgerEngineStats {
@@ -44,20 +55,24 @@ export interface LedgerEngineStats {
   runId: string;
   podId: string;
   status: string;
+  dryRun: boolean;
   currentCollection: string | null;
   currentChunk: string | null;
   totalDocsRead: number;
   totalDocsSkipped: number;
   totalRowsInserted: number;
+  totalDocsDlq: number;
+  totalCoercions: number;
   chunksDone: number;
   chunksFailed: number;
   docsPerSecond: number;
-  stageMs: { read: number; transform: number; insert: number; verify: number; attach: number };
+  stageMs: { read: number; transform: number; insert: number; verify: number; attach: number; pressureWait: number };
   dedupWorks: boolean | null;
   chunkStatusCounts: Record<string, number>;
 }
 
 const MAX_CHUNK_ATTEMPTS = 3;
+const BISECT_LOG_THRESHOLD = 1;
 
 function shortHash(s: string): string {
   return createHash('sha1').update(s).digest('hex').slice(0, 8);
@@ -68,60 +83,85 @@ export class ChunkOrchestrator {
   private readonly logger: Logger;
   private readonly runId: string;
   private readonly podId: string;
+  private readonly dryRun: boolean;
 
   private status = 'idle';
   private stopping = false;
+  private paused = false;
   private currentCollection: string | null = null;
   private currentChunk: string | null = null;
   private startedAt = 0;
+  private consecutiveFailed = 0;
+  private lastReclaimAt = 0;
+  private monitorTimer: ReturnType<typeof setInterval> | null = null;
 
+  private readonly coercions = new CoercionCounter();
+  private readonly skips = new SkipCounter();
   private totalDocsRead = 0;
   private totalDocsSkipped = 0;
   private totalRowsInserted = 0;
+  private totalDocsDlq = 0;
   private chunksDone = 0;
   private chunksFailed = 0;
-  private stageMs = { read: 0, transform: 0, insert: 0, verify: 0, attach: 0 };
+  private stageMs = { read: 0, transform: 0, insert: 0, verify: 0, attach: 0, pressureWait: 0 };
   private lastStatusCounts: Record<string, number> = {};
+
+  private lastPressure: { state: PressureState; at: number } | null = null;
 
   constructor(deps: ChunkOrchestratorDeps) {
     this.d = deps;
     this.logger = deps.logger.child({ component: 'ChunkOrchestrator' });
-    this.runId = deps.config.ledger.runId;
+    this.dryRun = deps.config.ledger.dryRun;
+    this.runId = this.dryRun ? `${deps.config.ledger.runId}-dry` : deps.config.ledger.runId;
     this.podId = deps.config.worker.podId;
   }
 
-  stopAfterChunk(): void {
-    this.stopping = true;
-  }
+  // -------------------------------------------------------------------------
+  // Controls
+  // -------------------------------------------------------------------------
 
-  getStatus(): string {
-    return this.status;
-  }
+  stopAfterChunk(): void { this.stopping = true; }
+  pause(): void { this.paused = true; if (this.status === 'running') this.status = 'paused'; }
+  resume(): void { this.paused = false; if (this.status === 'paused') this.status = 'running'; }
+  getStatus(): string { return this.status; }
+
+  // -------------------------------------------------------------------------
+  // Main
+  // -------------------------------------------------------------------------
 
   async run(): Promise<void> {
     this.status = 'running';
     this.startedAt = Date.now();
     const { config } = this.d;
 
-    await this.d.staging.runDedupCanary();
+    if (this.dryRun) {
+      await this.d.staging.createDryRunTable();
+      this.logger.warn(
+        { samplePct: config.ledger.dryRunSamplePct },
+        'DRY RUN: sampled rehearsal against a Null-engine clone — nothing is stored, nothing is promoted',
+      );
+    } else {
+      await this.d.staging.runDedupCanary();
+      this.startInvariantMonitor();
+    }
 
     const db = this.d.mongoReader.getDatabase();
     let collections = await discoverCollections(db, config.source.collectionPrefix, this.logger);
 
-    // Same APM filtering as the classic engine
     const skipEventNames = new Set(['[CLY]_apm_device', '[CLY]_apm_network']);
     collections = collections.filter((name) => {
       const defaults = this.d.hashResolver.resolveCollectionName(name, config.source.collectionPrefix);
       return !(defaults && skipEventNames.has(defaults.e));
     });
 
-    this.logger.info({ collections: collections.length, runId: this.runId }, 'Ledger engine starting');
+    this.logger.info({ collections: collections.length, runId: this.runId, dryRun: this.dryRun }, 'Ledger engine starting');
 
     for (const collection of collections) {
       if (this.stopping) break;
       await this.processCollection(collection);
     }
 
+    if (this.monitorTimer) clearInterval(this.monitorTimer);
     this.status = this.stopping ? 'stopped' : 'completed';
     this.logger.info(
       {
@@ -130,6 +170,8 @@ export class ChunkOrchestrator {
         chunksFailed: this.chunksFailed,
         totalDocsRead: this.totalDocsRead,
         totalRowsInserted: this.totalRowsInserted,
+        totalDocsDlq: this.totalDocsDlq,
+        totalCoercions: this.coercions.getTotal(),
         elapsedSec: Math.round((Date.now() - this.startedAt) / 1000),
       },
       'Ledger engine finished',
@@ -162,30 +204,38 @@ export class ChunkOrchestrator {
     const estimated = await mongoReader.getEstimatedCount();
     const chunkCount = Math.max(1, Math.min(50_000, Math.ceil(estimated / config.ledger.chunkDocsTarget)));
     const spanMs = upper.cd + 1 - lower.cd;
-    const bounds: Array<{ lowerCd: number; upperCd: number }> = [];
+    let bounds: Array<{ lowerCd: number; upperCd: number }> = [];
     for (let i = 0; i < chunkCount; i++) {
       const lo = lower.cd + Math.floor((spanMs * i) / chunkCount);
       const hi = i === chunkCount - 1 ? upper.cd + 1 : lower.cd + Math.floor((spanMs * (i + 1)) / chunkCount);
       if (hi > lo) bounds.push({ lowerCd: lo, upperCd: hi });
     }
 
+    // Dry run: keep every k-th chunk so old and new data shapes are both covered.
+    if (this.dryRun) {
+      const k = Math.max(1, Math.ceil(100 / config.ledger.dryRunSamplePct));
+      bounds = bounds.filter((_, i) => i % k === 0);
+    }
+
     const created = await ledger.initChunks(this.runId, collection, bounds, config.transform.version);
-    log.info({ estimated, chunks: bounds.length, created }, 'Chunk list ready');
+    log.info({ estimated, chunks: bounds.length, created, dryRun: this.dryRun }, 'Chunk list ready');
 
     const defaults = this.d.hashResolver.resolveCollectionName(collection, config.source.collectionPrefix) ?? undefined;
 
-    await this.recoverChunks(collection, defaults, log);
+    await this.recoverChunks(collection, log);
 
-    // Work loop: claim newest-first until nothing is pending
     for (;;) {
       if (this.stopping) return;
+      while (this.paused && !this.stopping) await sleep(1_000);
+      await this.reclaimExpiredLeases(collection, log);
+
       const chunk = await ledger.claimNext(this.runId, collection, this.podId, config.ledger.leaseSec);
       if (!chunk) break;
       if (chunk.attempts > MAX_CHUNK_ATTEMPTS) {
         await ledger.transition(chunk._id, 'in_progress', 'failed', {
           last_error: `exceeded ${MAX_CHUNK_ATTEMPTS} attempts`,
         });
-        this.chunksFailed++;
+        this.noteChunkFailure(log);
         continue;
       }
       await this.processChunk(chunk, defaults, log);
@@ -198,49 +248,85 @@ export class ChunkOrchestrator {
   }
 
   // -------------------------------------------------------------------------
-  // Startup / lease recovery
+  // Recovery & multi-pod lease reclaim
   // -------------------------------------------------------------------------
 
-  private async recoverChunks(
-    collection: string,
-    defaults: CollectionDefaults | undefined,
-    log: Logger,
-  ): Promise<void> {
-    const { ledger, staging } = this.d;
-    // Single-pod default: recover everything non-terminal. Multi-pod: only expired leases.
+  private async recoverChunks(collection: string, log: Logger): Promise<void> {
     const includeAll = !this.d.config.worker.enabled;
-    const recoverable = await ledger.findRecoverable(this.runId, collection, includeAll);
-
+    const recoverable = await this.d.ledger.findRecoverable(this.runId, collection, includeAll);
     for (const chunk of recoverable) {
-      const stagingTable = chunk.staging_table ?? this.stagingName(collection, chunk.idx);
-      log.info({ chunk: chunk._id, status: chunk.status }, 'Recovering chunk');
+      await this.recoverOne(chunk, log);
+    }
+  }
 
-      if (chunk.status === 'in_progress') {
-        // Mid-copy crash: never reconstruct — drop and redo.
+  /** Periodic tick (multi-pod): reclaim chunks whose owner's lease expired. */
+  private async reclaimExpiredLeases(collection: string, log: Logger): Promise<void> {
+    if (!this.d.config.worker.enabled) return;
+    const intervalMs = (this.d.config.ledger.leaseSec * 1000) / 2;
+    if (Date.now() - this.lastReclaimAt < intervalMs) return;
+    this.lastReclaimAt = Date.now();
+    const expired = await this.d.ledger.findRecoverable(this.runId, collection, false);
+    for (const chunk of expired) {
+      log.warn({ chunk: chunk._id, pod: chunk.pod_id }, 'Reclaiming chunk from expired lease');
+      await this.recoverOne(chunk, log);
+    }
+  }
+
+  private async recoverOne(chunk: ChunkDoc, log: Logger): Promise<void> {
+    const { ledger, staging } = this.d;
+    const stagingTable = chunk.staging_table ?? this.stagingName(chunk.collection, chunk.idx);
+    log.info({ chunk: chunk._id, status: chunk.status }, 'Recovering chunk');
+
+    if (chunk.status === 'in_progress') {
+      // Mid-copy crash: never reconstruct — drop and redo.
+      await staging.dropStaging(stagingTable);
+      await ledger.transition(chunk._id, 'in_progress', 'pending', { staging_table: null, pod_id: null });
+      return;
+    }
+    if (chunk.status === 'written') {
+      const count = await staging.countRows(stagingTable).catch(() => -1);
+      if (count === chunk.rows_expected && count >= 0) {
+        await this.promoteChunk({ ...chunk, staging_table: stagingTable }, log);
+      } else {
         await staging.dropStaging(stagingTable);
-        await ledger.transition(chunk._id, 'in_progress', 'pending', { staging_table: null, pod_id: null });
-        continue;
+        await ledger.transition(chunk._id, 'written', 'pending', { staging_table: null, pod_id: null });
       }
+      return;
+    }
+    if (chunk.status === 'attaching') {
+      // The one state where blind retry is unsafe (double-attach duplicates).
+      await this.finishAttaching({ ...chunk, staging_table: stagingTable }, log);
+    }
+  }
 
-      if (chunk.status === 'written') {
-        // Copy finished but promotion never started: recount, then promote or redo.
-        const count = await staging.countRows(stagingTable).catch(() => -1);
-        if (count === chunk.rows_expected && count >= 0) {
-          await this.promoteChunk({ ...chunk, staging_table: stagingTable }, log);
-        } else {
-          await staging.dropStaging(stagingTable);
-          await ledger.transition(chunk._id, 'written', 'pending', { staging_table: null, pod_id: null });
-        }
-        continue;
-      }
+  // -------------------------------------------------------------------------
+  // Backpressure (TTL-cached — never 3 system queries per batch)
+  // -------------------------------------------------------------------------
 
-      if (chunk.status === 'attaching') {
-        // The one state where blind retry is unsafe (double-attach duplicates):
-        // verify per partition before attaching what remains.
-        await this.finishAttaching({ ...chunk, staging_table: stagingTable }, log);
+  private async respectBackpressure(): Promise<void> {
+    const { chPressure, config } = this.d;
+    if (!chPressure || !config.backpressure.enabled || this.dryRun) return;
+
+    const now = Date.now();
+    if (this.lastPressure && now - this.lastPressure.at < config.backpressure.pollIntervalMs) {
+      if (!this.lastPressure.state.shouldPause) return;
+    }
+
+    const t0 = performance.now();
+    let state = await chPressure.sample(config.target.db, config.target.table);
+    this.lastPressure = { state, at: Date.now() };
+
+    if (state.shouldPause) {
+      this.logger.warn({ reason: state.pauseReason }, 'ClickHouse backpressure — pausing inserts');
+      const deadline = Date.now() + config.backpressure.maxPauseEpisodeMs;
+      while (Date.now() < deadline && !this.stopping) {
+        await sleep(config.backpressure.pollIntervalMs);
+        state = await chPressure.sample(config.target.db, config.target.table);
+        this.lastPressure = { state, at: Date.now() };
+        if (state.canResume) break;
       }
     }
-    void defaults; // reserved for future recovery-time re-transform checks
+    this.stageMs.pressureWait += performance.now() - t0;
   }
 
   // -------------------------------------------------------------------------
@@ -256,9 +342,9 @@ export class ChunkOrchestrator {
     defaults: CollectionDefaults | undefined,
     log: Logger,
   ): Promise<void> {
-    const { config, mongoReader, ledger, staging, retryPolicy } = this.d;
+    const { config, mongoReader, ledger, staging } = this.d;
     this.currentChunk = chunk._id;
-    const stagingTable = this.stagingName(chunk.collection, chunk.idx);
+    const stagingTable = this.dryRun ? staging.dryRunTable : this.stagingName(chunk.collection, chunk.idx);
     const clog = log.child({ chunk: chunk.idx, staging: stagingTable });
 
     const heartbeat = setInterval(() => {
@@ -266,108 +352,51 @@ export class ChunkOrchestrator {
     }, Math.max(10_000, (config.ledger.leaseSec * 1000) / 3));
 
     try {
-      await staging.createStaging(stagingTable);
+      if (!this.dryRun) {
+        await staging.createStaging(stagingTable);
+      }
       await ledger.transition(chunk._id, 'in_progress', 'in_progress', { staging_table: stagingTable });
 
-      const skips = new SkipCounter();
-      const upperBound: Cursor = { cd: chunk.upper_cd, id: '' };
-      let cursor: Cursor | null = { cd: chunk.lower_cd, id: '' };
-      let docsRead = 0;
-      let batchSeq = 0;
-      let firstError: Error | null = null;
+      const result = await this.copyChunk(chunk, stagingTable, defaults, clog);
 
-      const inflight: Promise<void>[] = [];
-      const pushInsert = (rows: OutputRow[]) => {
-        const seq = batchSeq++;
-        const p = retryPolicy
-          .execute(
-            () => staging.insertBatch(
-              stagingTable,
-              rows,
-              `mig:${this.runId}:${chunk._id}:${seq}`,
-              `mig__${shortHash(chunk._id)}__${seq}`,
-            ),
-            `chunk-${chunk.idx}-batch-${seq}`,
-            clog,
-            undefined,
-            classifyError,
-          )
-          .then(() => {
-            this.totalRowsInserted += rows.length;
-          })
-          .catch((err) => {
-            if (!firstError) firstError = err as Error;
-          });
-        inflight.push(p);
-      };
+      this.totalDocsRead += result.docsRead;
+      this.totalDocsSkipped += result.docsSkipped;
+      this.totalDocsDlq += result.docsDlq;
 
-      // Pipelined read: prefetch the next page while transforming/inserting.
-      // Track the cursor each read was issued with: readPage's min() bound is
-      // INCLUSIVE, so every page after the first re-returns the previous
-      // page's last doc — it must be dropped or it lands twice. (The classic
-      // engine has this exact off-by-one; see the A/B findings.)
-      const issueRead = (cur: Cursor | null) => ({
-        curId: cur && cur.id !== '' ? cur.id : null,
-        promise: mongoReader.readPage(cur, upperBound, config.source.mongoPageSize),
-      });
-      const t0 = performance.now();
-      let tRead = 0;
-      let pending = issueRead(cursor);
-      for (;;) {
-        const rStart = performance.now();
-        const page = await pending.promise;
-        tRead += performance.now() - rStart;
-        if (page.docs.length === 0) break;
-
-        let docs = page.docs;
-        if (pending.curId !== null && String(docs[0]?._id) === pending.curId) {
-          docs = docs.slice(1);
-        }
-
-        docsRead += docs.length;
-        cursor = page.lastCursor;
-        const isLast = page.docs.length < config.source.mongoPageSize;
-        if (!isLast && !firstError) {
-          pending = issueRead(cursor);
-        }
-
-        const tfStart = performance.now();
-        const { rows } = transformBatch(docs, skips, defaults);
-        this.stageMs.transform += performance.now() - tfStart;
-
-        if (rows.length > 0) {
-          pushInsert(rows);
-          if (inflight.length >= config.ledger.insertInflight) {
-            const iStart = performance.now();
-            await inflight.shift();
-            this.stageMs.insert += performance.now() - iStart;
-          }
-        }
-
-        if (isLast || firstError) break;
-      }
-      this.stageMs.read += tRead;
-
-      const iStart = performance.now();
-      await Promise.all(inflight);
-      this.stageMs.insert += performance.now() - iStart;
-
-      const docsSkipped = skips.getTotal();
-      this.totalDocsRead += docsRead;
-      this.totalDocsSkipped += docsSkipped;
-
-      if (firstError) {
-        throw firstError;
-      }
-
-      const rowsExpected = docsRead - docsSkipped;
+      const rowsExpected = result.docsRead - result.docsSkipped - result.docsDlq;
       await ledger.transition(chunk._id, 'in_progress', 'written', {
-        docs_read: docsRead,
-        docs_skipped: docsSkipped,
+        docs_read: result.docsRead,
+        docs_skipped: result.docsSkipped,
         rows_expected: rowsExpected,
       });
 
-      // Verify: read tally vs exact ClickHouse count
+      // Circuit breaker: a high in-chunk failure rate is a systematic bug,
+      // not dirty data — halt before the DLQ balloons into a dataset copy.
+      const failRate = result.docsRead > 1_000
+        ? (result.docsDlq + result.transformErrors) / result.docsRead : 0;
+      if (failRate > config.ledger.breakerPct / 100) {
+        clog.error(
+          { failRate: (failRate * 100).toFixed(1) + '%', dlq: result.docsDlq, transformErrors: result.transformErrors },
+          'Circuit breaker tripped — pausing engine (systematic failure suspected)',
+        );
+        await ledger.transition(chunk._id, 'written', 'failed', {
+          last_error: `circuit breaker: ${(failRate * 100).toFixed(1)}% of docs failed`,
+        });
+        this.noteChunkFailure(clog);
+        this.pause();
+        return;
+      }
+
+      if (this.dryRun) {
+        // Null-engine target: nothing stored, nothing to verify or promote.
+        await ledger.transition(chunk._id, 'written', 'done', { attach_method: null });
+        this.chunksDone++;
+        this.consecutiveFailed = 0;
+        clog.info({ docsRead: result.docsRead, dlq: result.docsDlq }, 'Dry-run chunk done');
+        return;
+      }
+
+      // Verify: read tally vs exact ClickHouse count.
       const vStart = performance.now();
       const landed = await staging.countRows(stagingTable);
       this.stageMs.verify += performance.now() - vStart;
@@ -384,31 +413,208 @@ export class ChunkOrchestrator {
       }
 
       await this.promoteChunk(
-        { ...chunk, staging_table: stagingTable, rows_expected: rowsExpected, docs_read: docsRead, docs_skipped: docsSkipped },
+        { ...chunk, staging_table: stagingTable, rows_expected: rowsExpected, docs_read: result.docsRead, docs_skipped: result.docsSkipped },
         clog,
       );
+      this.consecutiveFailed = 0;
 
       clog.info(
-        { docsRead, docsSkipped, rowsExpected, elapsedMs: Math.round(performance.now() - t0) },
+        { docsRead: result.docsRead, docsSkipped: result.docsSkipped, dlq: result.docsDlq, rowsExpected },
         'Chunk done',
       );
     } catch (err) {
       const error = err as Error;
       const isPermanent = classifyError(err) === 'permanent';
       clog.error({ error: error.message, isPermanent }, 'Chunk failed');
-      await staging.dropStaging(stagingTable).catch(() => {});
-      // Permanent data errors won't fix themselves — mark failed for the
-      // operator (future: bisection + DLQ). Transient: back to pending.
+      if (!this.dryRun) await staging.dropStaging(stagingTable).catch(() => {});
       const target = isPermanent || chunk.attempts >= MAX_CHUNK_ATTEMPTS ? 'failed' : 'pending';
       await ledger.transition(chunk._id, ['in_progress', 'written'], target, {
         staging_table: null,
         pod_id: null,
         last_error: error.message.slice(0, 500),
       });
-      if (target === 'failed') this.chunksFailed++;
+      if (target === 'failed') this.noteChunkFailure(clog);
     } finally {
       clearInterval(heartbeat);
       this.currentChunk = null;
+    }
+  }
+
+  /**
+   * Stream-copy one chunk into its staging table.
+   * One long-lived cursor (reopened from the last committed position on
+   * cursor death), per-doc transform that keeps the raw doc paired with its
+   * row (for DLQ), and a bounded window of concurrent inserts with
+   * bisection on permanent errors.
+   */
+  private async copyChunk(
+    chunk: ChunkDoc,
+    stagingTable: string,
+    defaults: CollectionDefaults | undefined,
+    clog: Logger,
+  ): Promise<{ docsRead: number; docsSkipped: number; docsDlq: number; transformErrors: number }> {
+    const { config, mongoReader } = this.d;
+    const upperBound: Cursor = { cd: chunk.upper_cd, id: '' };
+    let resumeFrom: Cursor | null = { cd: chunk.lower_cd, id: '' };
+    let skipFirstId: string | null = null;
+
+    let docsRead = 0;
+    let docsSkipped = 0;
+    let docsDlq = 0;
+    let transformErrors = 0;
+    let batchSeq = 0;
+    let firstError: Error | null = null;
+
+    const inflight: Promise<void>[] = [];
+    const pushInsert = (rows: OutputRow[], srcs: SourceDocument[]) => {
+      const seq = batchSeq++;
+      const p = this.insertOrBisect(chunk, stagingTable, rows, srcs, seq, clog)
+        .then((r) => { docsDlq += r.dlqd; })
+        .catch((err) => { if (!firstError) firstError = err as Error; });
+      inflight.push(p);
+    };
+
+    for (let attempt = 0; attempt < 5 && !firstError; attempt++) {
+      try {
+        const stream = mongoReader.readStream(resumeFrom, upperBound, config.source.mongoPageSize);
+        for await (const page of stream) {
+          const rStart = performance.now();
+          this.stageMs.read += page.fetchMs;
+
+          let docs = page.docs;
+          // min() is inclusive: on (re)open, drop the already-processed boundary doc.
+          if (skipFirstId !== null && String(docs[0]?._id) === skipFirstId) docs = docs.slice(1);
+          skipFirstId = null;
+          void rStart;
+
+          if (docs.length === 0) { resumeFrom = page.lastCursor; continue; }
+          docsRead += docs.length;
+
+          const tfStart = performance.now();
+          const rows: OutputRow[] = [];
+          const srcs: SourceDocument[] = [];
+          const dlqBatch: Parameters<DlqStore['add']>[0] = [];
+          for (const doc of docs) {
+            const { row, skipReason } = transformDocument(doc, defaults, this.coercions);
+            if (row !== null) {
+              rows.push(row);
+              srcs.push(doc);
+            } else if (skipReason !== null) {
+              this.skips.increment(skipReason);
+              docsSkipped++;
+              // Every unmigratable doc (except already-migrated) is captured
+              // with its raw source doc — accounted for and replayable after
+              // a rule change, never silently dropped.
+              if (skipReason !== SkipReason.ALREADY_MARKED_MIGRATED) {
+                transformErrors++;
+                if (config.ledger.captureTransformErrors) {
+                  dlqBatch.push({
+                    run_id: this.runId,
+                    collection: chunk.collection,
+                    chunk_id: chunk._id,
+                    source_id: String(doc._id ?? `unknown_${docsRead}`),
+                    raw_doc: doc as Record<string, unknown>,
+                    reason: skipReason === SkipReason.TRANSFORM_ERROR ? 'transform_error' : 'skipped',
+                    error: `skip:${skipReason}`,
+                    transform_version: config.transform.version,
+                  });
+                }
+              }
+            }
+          }
+          this.stageMs.transform += performance.now() - tfStart;
+          if (dlqBatch.length > 0) await this.d.dlq.add(dlqBatch);
+
+          await this.respectBackpressure();
+
+          if (rows.length > 0) {
+            pushInsert(rows, srcs);
+            if (inflight.length >= config.ledger.insertInflight) {
+              const iStart = performance.now();
+              await inflight.shift();
+              this.stageMs.insert += performance.now() - iStart;
+            }
+          }
+
+          resumeFrom = page.lastCursor;
+          if (firstError) break;
+        }
+        break; // stream exhausted cleanly
+      } catch (err) {
+        // Cursor died — reopen from the last committed position.
+        clog.warn({ error: (err as Error).message, attempt }, 'Read stream failed — reopening from last cursor');
+        skipFirstId = resumeFrom && resumeFrom.id !== '' ? resumeFrom.id : null;
+        if (attempt === 4) throw err;
+        await sleep(1_000 * (attempt + 1));
+      }
+    }
+
+    const iStart = performance.now();
+    await Promise.all(inflight);
+    this.stageMs.insert += performance.now() - iStart;
+
+    if (firstError) throw firstError;
+
+    // DLQ'd transform errors are already counted in docsSkipped; insert-DLQ'd
+    // docs are not skipped (they were readable and transformable).
+    return { docsRead, docsSkipped, docsDlq, transformErrors };
+  }
+
+  /**
+   * Insert a batch; on a PERMANENT error, bisect (halve and retry each half,
+   * still with transient-retry protection) until the offending documents are
+   * isolated, then DLQ them with their raw source docs. Transient errors
+   * exhaust the retry policy and propagate (chunk redo).
+   */
+  private async insertOrBisect(
+    chunk: ChunkDoc,
+    stagingTable: string,
+    rows: OutputRow[],
+    srcs: SourceDocument[],
+    seq: number,
+    clog: Logger,
+    depth = 0,
+  ): Promise<{ inserted: number; dlqd: number }> {
+    const { retryPolicy, staging, dlq, config } = this.d;
+    try {
+      await retryPolicy.execute(
+        () => staging.insertBatch(
+          stagingTable,
+          rows,
+          `mig:${this.runId}:${chunk._id}:${seq}:${depth}:${rows.length}`,
+          `mig__${shortHash(`${chunk._id}:${seq}:${depth}:${rows.length}`)}`,
+        ),
+        `chunk-${chunk.idx}-batch-${seq}-d${depth}`,
+        clog,
+        undefined,
+        classifyError,
+      );
+      this.totalRowsInserted += rows.length;
+      return { inserted: rows.length, dlqd: 0 };
+    } catch (err) {
+      if (classifyError(err) !== 'permanent') throw err;
+
+      if (rows.length === 1) {
+        await dlq.add([{
+          run_id: this.runId,
+          collection: chunk.collection,
+          chunk_id: chunk._id,
+          source_id: String(srcs[0]._id),
+          raw_doc: srcs[0] as Record<string, unknown>,
+          reason: 'insert_rejected',
+          error: (err as Error).message.slice(0, 1_000),
+          transform_version: config.transform.version,
+        }]);
+        return { inserted: 0, dlqd: 1 };
+      }
+
+      if (depth === BISECT_LOG_THRESHOLD) {
+        clog.warn({ batch: seq, size: rows.length }, 'Permanent insert error — bisecting to isolate offending docs');
+      }
+      const mid = Math.ceil(rows.length / 2);
+      const left = await this.insertOrBisect(chunk, stagingTable, rows.slice(0, mid), srcs.slice(0, mid), seq, clog, depth + 1);
+      const right = await this.insertOrBisect(chunk, stagingTable, rows.slice(mid), srcs.slice(mid), seq, clog, depth + 1);
+      return { inserted: left.inserted + right.inserted, dlqd: left.dlqd + right.dlqd };
     }
   }
 
@@ -428,7 +634,6 @@ export class ChunkOrchestrator {
     this.stageMs.attach += performance.now() - aStart;
   }
 
-  /** Attach all not-yet-attached partitions, verify-then-attach, then finalize. */
   private async finishAttaching(chunk: ChunkDoc, log: Logger): Promise<void> {
     const { ledger, staging } = this.d;
     const stagingTable = chunk.staging_table!;
@@ -437,8 +642,7 @@ export class ChunkOrchestrator {
 
     const remaining = chunk.partitions.filter((p) => !attachedSet.has(p));
     for (const partitionId of remaining) {
-      // Verify-then-attach: if rows for this partition∩chunk already exist in
-      // the live table, a previous attempt attached it — never attach twice.
+      // Verify-then-attach: never attach a partition whose rows are already live.
       const already = await staging.countLiveInChunkPartition(partitionId, chunk.lower_cd, chunk.upper_cd);
       if (already > 0) {
         await ledger.recordAttached(chunk._id, partitionId);
@@ -448,14 +652,13 @@ export class ChunkOrchestrator {
         await staging.attachPartition(stagingTable, partitionId);
       } catch (err) {
         if (attachedSet.size === 0 && remaining[0] === partitionId) {
-          // Nothing attached yet — safe to fall back to a full copy.
           log.warn({ err: (err as Error).message }, 'ATTACH unavailable — falling back to INSERT SELECT');
           await staging.insertSelect(stagingTable);
           method = 'insert_select';
           for (const p of chunk.partitions) await ledger.recordAttached(chunk._id, p);
           break;
         }
-        throw err; // partial attach + failure → keep 'attaching', recovery resumes it
+        throw err; // partial attach + failure → stays 'attaching', recovery resumes
       }
       await ledger.recordAttached(chunk._id, partitionId);
     }
@@ -466,7 +669,118 @@ export class ChunkOrchestrator {
   }
 
   // -------------------------------------------------------------------------
-  // Stats
+  // Circuit breaker bookkeeping
+  // -------------------------------------------------------------------------
+
+  private noteChunkFailure(log: Logger): void {
+    this.chunksFailed++;
+    this.consecutiveFailed++;
+    if (this.consecutiveFailed >= this.d.config.ledger.breakerConsecutive) {
+      log.error(
+        { consecutiveFailed: this.consecutiveFailed },
+        'Circuit breaker: consecutive chunk failures — pausing engine',
+      );
+      this.pause();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Invariant monitor (background spot checks — never on the hot path)
+  // -------------------------------------------------------------------------
+
+  private startInvariantMonitor(): void {
+    const intervalMs = this.d.config.ledger.monitorIntervalMs;
+    if (intervalMs <= 0) return;
+    this.monitorTimer = setInterval(() => {
+      this.runInvariantCheck().catch((err) =>
+        this.logger.warn({ err: (err as Error).message }, 'Invariant check failed to run'));
+    }, intervalMs);
+    this.monitorTimer.unref?.();
+  }
+
+  private async runInvariantCheck(): Promise<void> {
+    if (!this.currentCollection) return;
+    const done = await this.d.ledger.listByStatus(this.runId, this.currentCollection, 'done');
+    if (done.length === 0) return;
+    const samples = done.sort(() => Math.random() - 0.5).slice(0, 5);
+    for (const chunk of samples) {
+      const live = await this.d.staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd);
+      if (live !== chunk.rows_expected) {
+        this.logger.error(
+          { chunk: chunk._id, live, expected: chunk.rows_expected },
+          'INVARIANT VIOLATION: live-table count disagrees with verified chunk — pausing engine',
+        );
+        await this.d.ledger.transition(chunk._id, 'done', 'failed', {
+          last_error: `invariant violation: live=${live} expected=${chunk.rows_expected}`,
+        });
+        this.pause();
+        return;
+      }
+    }
+    this.logger.debug({ sampled: samples.length }, 'Invariant spot check passed');
+  }
+
+  // -------------------------------------------------------------------------
+  // DLQ replay
+  // -------------------------------------------------------------------------
+
+  /**
+   * Replay pending DLQ entries: re-transform the stored raw docs under the
+   * CURRENT transform version and insert them directly into the live table.
+   * Safe to run anytime after the affected chunks are done.
+   */
+  async replayDlq(): Promise<{ replayed: number; stillFailing: number }> {
+    const { dlq, staging, retryPolicy, config } = this.d;
+    const pending = await dlq.listPending(this.runId);
+    let replayed = 0;
+    let stillFailing = 0;
+
+    for (let i = 0; i < pending.length; i += 500) {
+      const batch = pending.slice(i, i + 500);
+      const rows: OutputRow[] = [];
+      const ids: string[] = [];
+      for (const entry of batch) {
+        const defaults = this.d.hashResolver.resolveCollectionName(entry.collection, config.source.collectionPrefix) ?? undefined;
+        const { row } = transformDocument(entry.raw_doc as SourceDocument, defaults, this.coercions);
+        if (row) { rows.push(row); ids.push(entry._id); }
+        else {
+          await dlq.recordRetryError(entry._id, 'still fails transform under ' + config.transform.version);
+          stillFailing++;
+        }
+      }
+      if (rows.length === 0) continue;
+      try {
+        await retryPolicy.execute(
+          () => staging.insertIntoLive(rows, `dlqreplay:${this.runId}:${i}`),
+          `dlq-replay-${i}`,
+          this.logger,
+          undefined,
+          classifyError,
+        );
+        await dlq.markResolved(ids, config.transform.version);
+        replayed += rows.length;
+      } catch (err) {
+        // Isolate row-level failures within the replay batch too.
+        for (let j = 0; j < rows.length; j++) {
+          try {
+            await staging.insertIntoLive([rows[j]], `dlqreplay:${this.runId}:${i}:${j}`);
+            await dlq.markResolved([ids[j]], config.transform.version);
+            replayed++;
+          } catch (rowErr) {
+            await dlq.recordRetryError(ids[j], (rowErr as Error).message.slice(0, 1_000));
+            stillFailing++;
+          }
+        }
+        void err;
+      }
+    }
+
+    this.logger.info({ replayed, stillFailing }, 'DLQ replay complete');
+    return { replayed, stillFailing };
+  }
+
+  // -------------------------------------------------------------------------
+  // Stats & report
   // -------------------------------------------------------------------------
 
   getStats(): LedgerEngineStats {
@@ -476,11 +790,14 @@ export class ChunkOrchestrator {
       runId: this.runId,
       podId: this.podId,
       status: this.status,
+      dryRun: this.dryRun,
       currentCollection: this.currentCollection,
       currentChunk: this.currentChunk,
       totalDocsRead: this.totalDocsRead,
       totalDocsSkipped: this.totalDocsSkipped,
       totalRowsInserted: this.totalRowsInserted,
+      totalDocsDlq: this.totalDocsDlq,
+      totalCoercions: this.coercions.getTotal(),
       chunksDone: this.chunksDone,
       chunksFailed: this.chunksFailed,
       docsPerSecond: elapsedSec > 0 ? this.totalDocsRead / elapsedSec : 0,
@@ -490,9 +807,26 @@ export class ChunkOrchestrator {
         insert: Math.round(this.stageMs.insert),
         verify: Math.round(this.stageMs.verify),
         attach: Math.round(this.stageMs.attach),
+        pressureWait: Math.round(this.stageMs.pressureWait),
       },
       dedupWorks: this.d.staging.dedupWorks,
       chunkStatusCounts: this.lastStatusCounts,
+    };
+  }
+
+  /** Data-quality report: coercions, skips, DLQ — the dry-run/final artifact. */
+  async getReport(): Promise<Record<string, unknown>> {
+    return {
+      runId: this.runId,
+      dryRun: this.dryRun,
+      status: this.status,
+      chunkStatusCounts: await this.d.ledger.statusCounts(this.runId),
+      skipsByReason: this.skips.getCounts(),
+      coercions: this.coercions.getReport(),
+      dlq: {
+        byStatus: await this.d.dlq.countByStatus(this.runId),
+        topErrors: await this.d.dlq.topErrors(this.runId),
+      },
     };
   }
 }

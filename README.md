@@ -27,7 +27,46 @@ npm install
 node --experimental-strip-types --expose-gc --max-old-space-size=2048 src/main.ts
 ```
 
-Required env vars: `SERVICE_NAME`, `MONGO_URI`, `CLICKHOUSE_URL`, `REDIS_URL`.
+Required env vars: `SERVICE_NAME`, `MONGO_URI`, `CLICKHOUSE_URL`, `REDIS_URL`
+(`REDIS_URL` is required only for the default `classic` engine — see below).
+
+## Engines
+
+Two migration engines live in this build, selected by `MIGRATION_ENGINE`:
+
+- **`classic`** (default) — the original architecture: per-batch checkpoints,
+  Redis hot state, async manifest writes. Unchanged behavior.
+- **`ledger`** — chunk-checklist architecture, **no Redis**: work is cut into
+  cd-bounded chunks tracked in a MongoDB ledger (`mig_ranges`); each chunk is
+  stream-copied into its own staging table, verified (read tally vs exact
+  ClickHouse count), then promoted into the live table via verify-then-ATTACH
+  (INSERT SELECT fallback). Crash recovery redoes in-flight chunks instead of
+  trusting saved progress. Includes: synchronous inserts + startup dedup
+  canary, error classification (permanent data errors fail fast), bisection
+  of rejected batches down to per-document DLQ entries carrying the raw
+  source doc (`mig_dlq_docs`, replayable via `POST /control/replay-dlq`),
+  a circuit breaker, TTL-cached ClickHouse backpressure, a background
+  invariant monitor, per-stage timings, a data-quality report
+  (`GET /report`), and a Countly-branded live dashboard (`/viz`).
+
+### Ledger engine env vars
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MIGRATION_ENGINE` | `classic` | `classic` or `ledger` |
+| `LEDGER_RUN_ID` | `ledger-v1` | Stable run identity (resume key) |
+| `LEDGER_CHUNK_DOCS_TARGET` | `2000000` | Docs per chunk (sizes redo cost) |
+| `LEDGER_INSERT_INFLIGHT` | `3` | Concurrent insert window per chunk |
+| `LEDGER_LEASE_SEC` | `600` | Chunk claim lease (multi-pod reclaim) |
+| `LEDGER_BREAKER_PCT` | `5` | Pause when >pct% of a chunk's docs fail |
+| `LEDGER_BREAKER_CONSECUTIVE` | `3` | Pause after N consecutive failed chunks |
+| `LEDGER_MONITOR_INTERVAL_MS` | `900000` | Invariant spot-check interval (0 = off) |
+| `LEDGER_CAPTURE_TRANSFORM_ERRORS` | `true` | DLQ every unmigratable doc with its raw doc |
+| `DRY_RUN` | `false` | Sampled rehearsal against a Null-engine clone |
+| `DRY_RUN_SAMPLE_PCT` | `2` | Dry-run sample size (hard cap 5) |
+
+A/B harness (seed, throughput comparison, SIGKILL crash drill): see
+[`bench/README.md`](bench/README.md).
 
 ## Configuration
 

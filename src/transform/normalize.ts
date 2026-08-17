@@ -16,6 +16,7 @@ import {
   firstNonBlank,
 } from './validators.ts';
 import type { CollectionDefaults } from './hash-resolver.ts';
+import { CoercionCounter, coerceBag, UINT32_MAX } from './coercions.ts';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -100,9 +101,13 @@ export interface TransformResult {
  *
  * Returns `{ row, skipReason }` where exactly one of the two is non-null.
  */
-export function transformDocument(doc: SourceDocument, defaults?: CollectionDefaults): TransformResult {
+export function transformDocument(
+  doc: SourceDocument,
+  defaults?: CollectionDefaults,
+  coercions?: CoercionCounter,
+): TransformResult {
   try {
-    return doTransform(doc, defaults);
+    return doTransform(doc, defaults, coercions);
   } catch {
     return { row: null, skipReason: SkipReason.TRANSFORM_ERROR };
   }
@@ -124,13 +129,14 @@ export function transformBatch(
   docs: SourceDocument[],
   skipCounter: SkipCounter,
   defaults?: CollectionDefaults,
+  coercions?: CoercionCounter,
 ): { rows: OutputRow[]; skippedSamples: Array<{ _id: string; reason: SkipReason }> } {
   const rows: OutputRow[] = [];
   const skippedSamples: Array<{ _id: string; reason: SkipReason }> = [];
   const MAX_SKIP_SAMPLES = 10;
 
   for (const doc of docs) {
-    const { row, skipReason } = transformDocument(doc, defaults);
+    const { row, skipReason } = transformDocument(doc, defaults, coercions);
 
     if (row !== null) {
       rows.push(row);
@@ -150,7 +156,11 @@ export function transformBatch(
 // Internal helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-function doTransform(doc: SourceDocument, defaults?: CollectionDefaults): TransformResult {
+function doTransform(
+  doc: SourceDocument,
+  defaults?: CollectionDefaults,
+  coercions?: CoercionCounter,
+): TransformResult {
   // ── Skip if already migrated ──────────────────────────────────────────
   if (doc.migrated === true) {
     return { row: null, skipReason: SkipReason.ALREADY_MARKED_MIGRATED };
@@ -209,7 +219,22 @@ function doTransform(doc: SourceDocument, defaults?: CollectionDefaults): Transf
 
   row['s'] = toDouble(doc.s, 0.0);
   row['dur'] = toDouble(doc.dur, 0.0);
-  row['c'] = Math.max(0, Math.floor(toDouble(doc.c, 0)));
+  // Countly-owned counter: clamp to the UInt32 column range (overflow is
+  // corruption, not information — see coercions.ts policy).
+  const cRaw = Math.max(0, Math.floor(toDouble(doc.c, 0)));
+  if (cRaw > UINT32_MAX) {
+    coercions?.record('clamp_uint32', 'c', cRaw, UINT32_MAX);
+    row['c'] = UINT32_MAX;
+  } else {
+    row['c'] = cRaw;
+  }
+
+  // Customer-owned bags: values that can't survive the numeric path are
+  // stringified losslessly (zero-copy when nothing needs fixing).
+  if ('sg' in doc) row['sg'] = coerceBag(doc.sg, 'sg', coercions);
+  if ('custom' in doc) row['custom'] = coerceBag(doc.custom, 'custom', coercions);
+  if ('cmp' in doc) row['cmp'] = coerceBag(doc.cmp, 'cmp', coercions);
+  if ('up' in doc) row['up'] = coerceBag(doc.up, 'up', coercions);
 
   // ── Event name derivation ─────────────────────────────────────────────
   let eventName = e;

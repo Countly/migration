@@ -19,6 +19,12 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             chunkDocsTarget: env.LEDGER_CHUNK_DOCS_TARGET,
             insertInflight: env.LEDGER_INSERT_INFLIGHT,
             leaseSec: env.LEDGER_LEASE_SEC,
+            breakerPct: env.LEDGER_BREAKER_PCT,
+            breakerConsecutive: env.LEDGER_BREAKER_CONSECUTIVE,
+            monitorIntervalMs: env.LEDGER_MONITOR_INTERVAL_MS,
+            captureTransformErrors: env.LEDGER_CAPTURE_TRANSFORM_ERRORS,
+            dryRun: env.DRY_RUN,
+            dryRunSamplePct: env.DRY_RUN_SAMPLE_PCT,
         },
 
         service: {
