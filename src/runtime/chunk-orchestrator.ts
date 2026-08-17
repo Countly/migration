@@ -238,7 +238,24 @@ export class ChunkOrchestrator {
       await this.reclaimExpiredLeases(collection, log);
 
       const chunk = await ledger.claimNext(this.runId, collection, this.podId, config.ledger.leaseSec);
-      if (!chunk) break;
+      if (!chunk) {
+        // Nothing pending — but "complete" means NO non-terminal chunks.
+        // Chunks may still be leased by another pod (or orphaned by a dead
+        // one); wait for their leases instead of declaring a hole "done".
+        const nonTerminal = await ledger.findRecoverable(this.runId, collection, true);
+        if (nonTerminal.length === 0) break;
+        if (!config.worker.enabled) {
+          // Single-pod: no other pod can own these — recover immediately.
+          for (const orphan of nonTerminal) await this.recoverOne(orphan, log);
+          continue;
+        }
+        log.info(
+          { waitingOn: nonTerminal.length },
+          'No pending chunks; waiting on leased in-flight chunks (reclaim on lease expiry)',
+        );
+        await sleep(Math.min((config.ledger.leaseSec * 1000) / 2, 15_000));
+        continue;
+      }
       if (chunk.attempts > MAX_CHUNK_ATTEMPTS) {
         await ledger.transition(chunk._id, 'in_progress', 'failed', {
           last_error: `exceeded ${MAX_CHUNK_ATTEMPTS} attempts`,
@@ -270,7 +287,7 @@ export class ChunkOrchestrator {
   /** Periodic tick (multi-pod): reclaim chunks whose owner's lease expired. */
   private async reclaimExpiredLeases(collection: string, log: Logger): Promise<void> {
     if (!this.d.config.worker.enabled) return;
-    const intervalMs = (this.d.config.ledger.leaseSec * 1000) / 2;
+    const intervalMs = Math.min((this.d.config.ledger.leaseSec * 1000) / 2, 30_000);
     if (Date.now() - this.lastReclaimAt < intervalMs) return;
     this.lastReclaimAt = Date.now();
     const expired = await this.d.ledger.findRecoverable(this.runId, collection, false);
@@ -387,7 +404,9 @@ export class ChunkOrchestrator {
           { failRate: (failRate * 100).toFixed(1) + '%', dlq: result.docsDlq, transformErrors: result.transformErrors },
           'Circuit breaker tripped — pausing engine (systematic failure suspected)',
         );
+        if (!this.dryRun) await staging.dropStaging(stagingTable).catch(() => {});
         await ledger.transition(chunk._id, 'written', 'failed', {
+          staging_table: null,
           last_error: `circuit breaker: ${(failRate * 100).toFixed(1)}% of docs failed`,
         });
         this.noteChunkFailure(clog);
@@ -779,6 +798,50 @@ export class ChunkOrchestrator {
       }
     }
     this.logger.debug({ sampled: samples.length }, 'Invariant spot check passed');
+  }
+
+  // -------------------------------------------------------------------------
+  // Operator: retry failed chunks
+  // -------------------------------------------------------------------------
+
+  /**
+   * Reset all failed chunks of this run back to pending and resume.
+   * If a failed chunk had already been (partially) promoted — e.g. flagged by
+   * the invariant monitor — its live-table cd window is purged first so the
+   * redo starts clean and verify-then-attach behaves correctly.
+   * (Null-cd sweep chunks have no cd window and are reset without a purge —
+   * their id-based attach check tolerates partial presence.)
+   */
+  async retryFailed(): Promise<{ retried: number }> {
+    const { ledger, staging } = this.d;
+    let retried = 0;
+    const collections = new Set<string>();
+    const failedAll: ChunkDoc[] = [];
+    // Failed chunks may span collections; statusCounts is global, listByStatus per collection.
+    const counts = await ledger.statusCounts(this.runId);
+    if ((counts.failed ?? 0) > 0) {
+      const all = await ledger.listAll(this.runId);
+      for (const c of all) if (c.status === 'failed') { collections.add(c.collection); failedAll.push(c as ChunkDoc); }
+    }
+    for (const chunk of failedAll) {
+      if (!this.isNullCdChunk(chunk as ChunkDoc) && !this.dryRun) {
+        await staging.deleteLiveCdRange(chunk.lower_cd, chunk.upper_cd);
+      }
+      const reset = await ledger.transition(chunk._id, 'failed', 'pending', {
+        pod_id: null,
+        staging_table: null,
+        partitions: [],
+        attached: [],
+        attach_method: null,
+        attempts: 0,
+        last_error: null,
+      });
+      if (reset) retried++;
+    }
+    this.consecutiveFailed = 0;
+    this.resume();
+    this.logger.info({ retried }, 'Failed chunks reset to pending');
+    return { retried };
   }
 
   // -------------------------------------------------------------------------

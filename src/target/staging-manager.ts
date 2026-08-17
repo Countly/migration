@@ -264,6 +264,20 @@ export class StagingManager {
     });
   }
 
+  /**
+   * Purge the live table's rows in a chunk's cd window (lightweight DELETE).
+   * Used when retrying a chunk that was already (partially) promoted — redo
+   * must start from a clean window or verify-then-attach would skip it.
+   */
+  async deleteLiveCdRange(lowerCdMs: number, upperCdMs: number): Promise<void> {
+    await this.ch().command({
+      query: `DELETE FROM ${this.fq(this.config.table)}
+              WHERE cd >= fromUnixTimestamp64Milli({lo:Int64})
+                AND cd <  fromUnixTimestamp64Milli({hi:Int64})`,
+      query_params: { lo: lowerCdMs, hi: upperCdMs },
+    });
+  }
+
   /** Grouped verification: rows in the live table within given cd bounds. */
   async countLiveInCdRange(lowerCdMs: number, upperCdMs: number): Promise<number> {
     const res = await this.ch().query({

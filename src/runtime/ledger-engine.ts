@@ -104,6 +104,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.post('/control/pause', async () => { orchestrator.pause(); return { status: orchestrator.getStatus() }; });
   app.post('/control/resume', async () => { orchestrator.resume(); return { status: orchestrator.getStatus() }; });
   app.post('/control/replay-dlq', async () => orchestrator.replayDlq());
+  app.post('/control/retry-failed', async () => orchestrator.retryFailed());
   const { registerLedgerVizRoutes } = await import('../http/ledger-viz-route.ts');
   registerLedgerVizRoutes(app, { orchestrator, ledger, config });
   await app.listen({ port: config.service.port, host: config.service.host });
