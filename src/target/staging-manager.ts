@@ -80,7 +80,9 @@ export class StagingManager {
    * so operators can see it in /stats.
    */
   async runDedupCanary(): Promise<boolean> {
-    const canary = `${this.config.table}_mig_canary`;
+    // Per-process name: concurrent pods each probe their own canary table
+    // (a shared name races on create/drop and false-flags dedup as inert).
+    const canary = `${this.config.table}_mig_canary_${process.pid}`;
     const row = [{ _id: 'canary', a: 'canary', e: 'canary', n: 'canary', uid: 'canary', did: '',
       ts: '2000-01-01 00:00:00.000', up: {}, sg: {}, c: 1, s: 0, dur: 0, cd: '2000-01-01 00:00:00.000' }];
     try {
