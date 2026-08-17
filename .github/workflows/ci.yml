@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Typecheck + differential harness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '25'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Asserts src/transform/ reproduces countly-platform's live ingestion
+      # normalization exactly (vendored goldens in tests/differential/).
+      # Pure unit tests — no MongoDB/ClickHouse/Redis required.
+      - name: Ingestion-matching differential harness
+        run: npx vitest run tests/differential

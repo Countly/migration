@@ -10,7 +10,8 @@ import { MongoClient } from 'mongodb';
 import { createClient, type ClickHouseClient } from '@clickhouse/client';
 
 import { classifyError } from '../../src/runtime/error-classifier.ts';
-import { CoercionCounter, coerceBag } from '../../src/transform/coercions.ts';
+import { CoercionCounter } from '../../src/transform/coercions.ts';
+import { sanitizeJsonValue } from '../../src/transform/validators.ts';
 import { transformDocument } from '../../src/transform/normalize.ts';
 import { LedgerStore } from '../../src/state/ledger-store.ts';
 import { DlqStore } from '../../src/state/dlq-store.ts';
@@ -49,20 +50,25 @@ describe('error-classifier', () => {
   });
 });
 
-describe('coercions', () => {
-  it('stringifies unsafe numbers in customer bags, losslessly, without mutating input', () => {
-    const counter = new CoercionCounter();
-    const sg = { ok: 42, big: 9.2e25, nan: NaN, str: 'hello' };
-    const out = coerceBag(sg, 'sg', counter) as Record<string, unknown>;
-    expect(out.big).toBe('9.2e+25');
+describe('coercions (shared spec: only non-JSON-carriable values change)', () => {
+  it('stringifies NaN/Infinity/bigint losslessly; finite large doubles STAY numbers (matches live ingestion)', () => {
+    const out = sanitizeJsonValue({ ok: 42, big: 9.2e25, nan: NaN, inf: Infinity, huge: 10n ** 30n, str: 'hello' }) as Record<string, unknown>;
     expect(out.nan).toBe('NaN');
+    expect(out.inf).toBe('Infinity');
+    expect(out.huge).toBe('1000000000000000000000000000000');
+    expect(out.big).toBe(9.2e25);   // finite double: live keeps it numeric — so do we
     expect(out.ok).toBe(42);
-    expect(sg.big).toBe(9.2e25); // input untouched
-    expect(counter.getTotal()).toBe(2);
   });
-  it('returns the same reference when nothing needs coercion (zero-copy)', () => {
-    const sg = { a: 1, b: 'x' };
-    expect(coerceBag(sg, 'sg')).toBe(sg);
+  it('counts coercions per key through the transform', () => {
+    const counter = new CoercionCounter();
+    const { row } = transformDocument(
+      { _id: 'x', a: 'app', e: 'ev', uid: 'u1', ts: 1750000000000, sg: { weird: NaN } },
+      undefined,
+      counter,
+    );
+    expect((row?.sg as Record<string, unknown>).weird).toBe('NaN');
+    expect(counter.getTotal()).toBe(1);
+    expect(counter.getReport()[0].rule_key).toBe('stringify_nonfinite:sg');
   });
   it('clamps the Countly-owned counter c to UInt32', () => {
     const counter = new CoercionCounter();
@@ -173,7 +179,7 @@ describe('ledger engine end-to-end', () => {
     }
     docs.push({
       _id: 'coerce_me', a: 'app1', e: 'big_int_event', uid: 'u9', did: 'd9',
-      ts: base + 1, cd: new Date(base + 1), sg: { order_id: 9.2e25 }, c: 1,
+      ts: base + 1, cd: new Date(base + 1), sg: { order_id: 9.2e25, weird: Number.POSITIVE_INFINITY }, c: 1,
     });
     // Docs with no cd value — must be picked up by the null-cd sweep chunk
     docs.push({ _id: 'nocd_1', a: 'app1', e: 'legacy_event', uid: 'u1', did: 'd', ts: base - 86_400_000 });
@@ -251,13 +257,14 @@ describe('ledger engine end-to-end', () => {
     expect(pending.every((p) => p.reason === 'skipped' && p.error === 'skip:invalid_ts')).toBe(true);
     expect(pending.every((p) => typeof p.raw_doc === 'object' && p.raw_doc.ts === 'not-a-ts')).toBe(true);
 
-    // The oversized sg value was stringified losslessly and landed
+    // Spec behavior: finite large double stays numeric; Infinity stringified
     const coerced = await ch.query({
-      query: `SELECT sg.order_id AS v FROM ${DB}.drill_events WHERE _id = 'coerce_me'`,
+      query: `SELECT sg.order_id AS v, sg.weird AS w FROM ${DB}.drill_events WHERE _id = 'coerce_me'`,
       format: 'JSONEachRow',
     });
-    const [c] = await coerced.json<{ v: string }>();
-    expect(String(c.v)).toBe('9.2e+25');
+    const [c] = await coerced.json<{ v: unknown; w: unknown }>();
+    expect(Number(c.v)).toBe(9.2e25);
+    expect(String(c.w)).toBe('Infinity');
 
     const stats = orchestrator.getStats();
     expect(stats.totalCoercions).toBeGreaterThanOrEqual(1);
