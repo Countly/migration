@@ -935,6 +935,113 @@ export class ChunkOrchestrator {
   }
 
   // -------------------------------------------------------------------------
+  // Self-service: preflight & verification
+  // -------------------------------------------------------------------------
+
+  /**
+   * Environment/readiness checks for the guided UI. Read-only; safe to run
+   * anytime (uses the raw Db handle, never mutates reader state).
+   */
+  async preflight(): Promise<Record<string, unknown>> {
+    const { config, mongoReader, staging, ledger } = this.d;
+    const checks: Array<{ id: string; label: string; status: 'pass' | 'warn' | 'fail'; detail: string }> = [];
+
+    // MongoDB source
+    let collections: string[] = [];
+    try {
+      const db = mongoReader.getDatabase();
+      collections = await discoverCollections(db, config.source.collectionPrefix, this.logger);
+      checks.push({ id: 'mongo', label: 'MongoDB source reachable', status: 'pass', detail: `${collections.length} drill collection(s) found` });
+      let indexed = 0;
+      let totalDocs = 0;
+      for (const name of collections) {
+        const idx = await db.collection(name).indexes().catch(() => []);
+        const has = idx.some((i) => (i.key as Record<string, unknown>).cd !== undefined && (i.key as Record<string, unknown>)._id !== undefined);
+        if (has) indexed++;
+        totalDocs += await db.collection(name).estimatedDocumentCount().catch(() => 0);
+      }
+      checks.push({
+        id: 'index',
+        label: '{cd,_id} index on all collections',
+        status: indexed === collections.length ? 'pass' : 'warn',
+        detail: indexed === collections.length
+          ? 'all indexed'
+          : `${collections.length - indexed} collection(s) missing the index — the service builds it automatically, but pre-building avoids a long pause (see Guide step 2)`,
+      });
+      checks.push({ id: 'docs', label: 'Estimated documents to migrate', status: 'pass', detail: totalDocs.toLocaleString('en-US') });
+    } catch (err) {
+      checks.push({ id: 'mongo', label: 'MongoDB source reachable', status: 'fail', detail: (err as Error).message });
+    }
+
+    // ClickHouse target
+    const target = await staging.targetTableInfo();
+    checks.push({
+      id: 'clickhouse',
+      label: `ClickHouse target table (${config.target.db}.${config.target.table})`,
+      status: target.exists ? 'pass' : 'fail',
+      detail: target.exists ? `exists, ${target.rows.toLocaleString('en-US')} rows` : 'table not found — create it (or start the new stack) before migrating',
+    });
+
+    // Dedup canary
+    checks.push({
+      id: 'dedup',
+      label: 'Insert-dedup canary',
+      status: staging.dedupWorks === null ? 'warn' : staging.dedupWorks ? 'pass' : 'warn',
+      detail: staging.dedupWorks === null
+        ? 'not probed yet (runs at migration start)'
+        : staging.dedupWorks ? 'dedup token verified working on this target'
+          : 'dedup token inert on this target — safe (chunk redo covers it), but ambiguous insert retries may need chunk redo',
+    });
+
+    // Dry run
+    const dryCounts = await ledger.statusCounts(`${this.d.config.ledger.runId}-dry`);
+    const dryTotal = Object.values(dryCounts).reduce((a, b) => a + b, 0);
+    checks.push({
+      id: 'dryrun',
+      label: 'Dry run (sampled rehearsal)',
+      status: dryTotal > 0 && (dryCounts.done ?? 0) === dryTotal ? 'pass' : 'warn',
+      detail: dryTotal === 0
+        ? 'not run yet — start once with DRY_RUN=1 and review the report (Guide step 3)'
+        : `${dryCounts.done ?? 0}/${dryTotal} sampled chunks done`,
+    });
+
+    return { engineStatus: this.status, checks };
+  }
+
+  /**
+   * Full migration verification: every done chunk's live-table count checked
+   * against its verified expectation, plus table totals. Exact, minutes at
+   * most — run before sign-off or any time trust is in question.
+   */
+  async verifyMigration(): Promise<Record<string, unknown>> {
+    const { ledger, staging } = this.d;
+    const all = await ledger.listAll(this.runId);
+    const byCollection = new Map<string, boolean>();
+    for (const c of all) {
+      if (this.isNullCdChunk(c as ChunkDoc)) byCollection.set(c.collection, true);
+    }
+
+    let checked = 0;
+    const mismatches: Array<{ chunk: string; expected: number; live: number }> = [];
+    for (const chunk of all) {
+      if (chunk.status !== 'done' || this.isNullCdChunk(chunk as ChunkDoc)) continue;
+      const live = await staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd);
+      const relaxed = byCollection.get(chunk.collection) === true;
+      const bad = relaxed ? live < chunk.rows_expected : live !== chunk.rows_expected;
+      checked++;
+      if (bad) mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live });
+    }
+
+    const totals = await staging.countAndUniq();
+    return {
+      ok: mismatches.length === 0 && totals.count === totals.uniq,
+      checkedChunks: checked,
+      mismatches,
+      table: { rows: totals.count, distinctIds: totals.uniq, duplicates: totals.count - totals.uniq },
+    };
+  }
+
+  // -------------------------------------------------------------------------
   // Stats & report
   // -------------------------------------------------------------------------
 

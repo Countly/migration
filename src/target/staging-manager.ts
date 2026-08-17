@@ -280,6 +280,26 @@ export class StagingManager {
     });
   }
 
+  /** Total + distinct-id counts of the live table (exact, one query). */
+  async countAndUniq(): Promise<{ count: number; uniq: number }> {
+    const res = await this.ch().query({
+      query: `SELECT count() AS c, uniqExact(_id) AS u FROM ${this.fq(this.config.table)}`,
+      format: 'JSONEachRow',
+    });
+    const rows = await res.json<{ c: string; u: string }>();
+    return { count: Number(rows[0]?.c ?? 0), uniq: Number(rows[0]?.u ?? 0) };
+  }
+
+  /** Does the live target table exist / how many rows does it hold? */
+  async targetTableInfo(): Promise<{ exists: boolean; rows: number }> {
+    try {
+      const rows = await this.countRows(this.config.table);
+      return { exists: true, rows };
+    } catch {
+      return { exists: false, rows: 0 };
+    }
+  }
+
   /** Grouped verification: rows in the live table within given cd bounds. */
   async countLiveInCdRange(lowerCdMs: number, upperCdMs: number): Promise<number> {
     const res = await this.ch().query({
