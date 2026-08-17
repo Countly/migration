@@ -206,6 +206,20 @@ export class LedgerStore {
     return Object.fromEntries(rows.map((r) => [r._id, r.n]));
   }
 
+  /** All chunks of a run (dashboard feed) — trimmed projection, idx order. */
+  async listAll(runId: string): Promise<Array<Pick<ChunkDoc,
+    '_id' | 'collection' | 'idx' | 'status' | 'lower_cd' | 'upper_cd' |
+    'docs_read' | 'docs_skipped' | 'rows_expected' | 'attempts' | 'last_error' | 'pod_id' | 'updated_at'>>> {
+    return this.c()
+      .find(
+        { run_id: runId },
+        { projection: { collection: 1, idx: 1, status: 1, lower_cd: 1, upper_cd: 1,
+          docs_read: 1, docs_skipped: 1, rows_expected: 1, attempts: 1, last_error: 1, pod_id: 1, updated_at: 1 } },
+      )
+      .sort({ collection: 1, idx: 1 })
+      .toArray() as never;
+  }
+
   /** Sum of expected rows for done chunks — used by full re-verification. */
   async expectedRows(runId: string, collection: string): Promise<number> {
     const rows = await this.c()

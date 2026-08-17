@@ -77,10 +77,12 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     hashResolver,
   });
 
-  // Minimal HTTP surface: health + stats
+  // HTTP surface: health + stats + Countly-branded live dashboard (/viz)
   const app = Fastify({ logger: false });
   app.get('/healthz', async () => ({ status: 'ok', engine: 'ledger' }));
   app.get('/stats', async () => orchestrator.getStats());
+  const { registerLedgerVizRoutes } = await import('../http/ledger-viz-route.ts');
+  registerLedgerVizRoutes(app, { orchestrator, ledger, config });
   await app.listen({ port: config.service.port, host: config.service.host });
   logger.info({ port: config.service.port }, 'Ledger engine HTTP listening');
 
