@@ -31,6 +31,15 @@ const PERMANENT_CH_CODES = new Set([
   '491', // CANNOT_PARSE_IPV6
 ]);
 
+/**
+ * ClickHouse capacity/limit codes — transient: they clear when the operator
+ * frees disk / load subsides. The retry→attempts→circuit-breaker chain turns
+ * a persistent disk-full into a paused engine awaiting the operator.
+ *  243 NOT_ENOUGH_SPACE, 202 TOO_MANY_SIMULTANEOUS_QUERIES,
+ *  209 SOCKET_TIMEOUT, 210 NETWORK_ERROR (already covered by default-transient,
+ *  listed for documentation).
+ */
+
 /** Node/undici-level network error codes — always transient. */
 const TRANSIENT_SYSTEM_CODES = new Set([
   'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN',

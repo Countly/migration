@@ -246,6 +246,11 @@ const PAGE = `<!doctype html>
     <h2>Coercions <span class="hint">(values the transform had to alter — the data-quality report)</span></h2>
     <div id="coercions"><div class="empty">None</div></div>
   </div>
+
+  <div class="card">
+    <h2>Pods <span class="hint">(scale by starting more instances with the same env + unique POD_ID — they claim chunks via leases; add machines, not processes, once one machine's CPU saturates)</span></h2>
+    <div id="pods"><div class="empty">–</div></div>
+  </div>
 </div>
 
 <!-- ══════════════════ GUIDE ══════════════════ -->
@@ -267,13 +272,18 @@ const PAGE = `<!doctype html>
 
   <details class="phase" id="phase-2"><summary><span class="num">2</span> Index <span class="ph-status" id="ph2-s">auto</span></summary>
     <div class="body">
-      <p>Every <code>drill_events*</code> collection needs the <code>{cd:1,_id:1}</code> index. The migrator builds missing ones itself, but pre-building avoids a long pause at start (~1–3 days for 10&nbsp;TB). Preflight above shows per-collection status. No collection consolidation is ever needed.</p>
+      <p>Every <code>drill_events*</code> collection needs the <code>{cd:1,_id:1}</code> index. The migrator builds missing ones itself, but pre-building avoids a long pause at start (~1–3 days for 10&nbsp;TB). No collection consolidation is ever needed.</p>
+      <p><button class="btn primary" id="btn-buildidx" onclick="buildIndexes(this)">Build missing indexes</button>
+      <span class="hint">— server-side, background; safe to leave running.</span></p>
+      <div id="idx-progress"></div>
     </div>
   </details>
 
   <details class="phase" id="phase-3"><summary><span class="num">3</span> Rehearse (dry run) <span class="ph-status" id="ph3-s">auto</span></summary>
     <div class="body">
-      <p>Run the service once with <code>DRY_RUN=1</code>: a ≤5% sample goes through full ClickHouse validation with nothing stored. Then review the Overview tab's DLQ and Coercions panels — that is the data-quality report to sign off before the real run.</p>
+      <p>A ≤5% sample goes through the full pipeline with real ClickHouse validation and nothing stored. Review the Overview tab's DLQ and Coercions panels afterwards — that is the data-quality report to sign off before the real run.</p>
+      <p><button class="btn primary" id="btn-dryrun" onclick="startDry(this)">Run dry run (sampled)</button>
+      <span class="hint" id="dry-status">— available while the main migration is not running.</span></p>
     </div>
   </details>
 
@@ -422,6 +432,39 @@ async function runVerify(btn) {
   btn.disabled = false; btn.textContent = 'Verify migration';
 }
 
+async function buildIndexes(btn) {
+  btn.disabled = true;
+  try {
+    const r = await fetch('/control/build-indexes', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then(x => x.json());
+    toast(r.started ? '\u2705 Index builds started (' + r.missing + ' collection(s))' : (r.missing === 0 ? '\u2705 All collections already indexed' : '\u26a0\ufe0f Build already running'));
+    pollIndexProgress();
+  } catch (e) { toast('\u274c ' + e.message); }
+  btn.disabled = false;
+}
+let idxTimer = null;
+async function pollIndexProgress() {
+  const p = await fetch('/api/index-progress').then(r => r.json()).catch(() => null);
+  if (!p) return;
+  const el = document.getElementById('idx-progress');
+  const rows = [];
+  if (p.total > 0) rows.push('<div class="check"><span class="ic">' + (p.running ? '\u23f3' : (p.error ? '\u274c' : '\u2705')) + '</span><span class="lbl">' +
+    p.done.length + '/' + p.total + ' built</span><span class="det">' + esc(p.current ? 'building: ' + p.current : (p.error || 'idle')) + '</span></div>');
+  for (const op of p.serverOps || []) {
+    rows.push('<div class="check"><span class="ic">\u23f3</span><span class="lbl">' + esc(op.collection) + '</span><span class="det">' + (op.pct != null ? op.pct + '%' : esc(op.msg || 'in progress')) + '</span></div>');
+  }
+  el.innerHTML = rows.join('');
+  if (p.running && !idxTimer) { idxTimer = setInterval(pollIndexProgress, 3000); }
+  if (!p.running && idxTimer) { clearInterval(idxTimer); idxTimer = null; }
+}
+async function startDry(btn) {
+  btn.disabled = true;
+  try {
+    const r = await fetch('/control/dry-run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then(x => x.json());
+    toast(r.started ? '\u2705 Dry run started' : '\u26a0\ufe0f ' + (r.reason || 'not started'));
+  } catch (e) { toast('\u274c ' + e.message); }
+  btn.disabled = false;
+}
+
 // Manual guide checkboxes persist locally per browser.
 document.querySelectorAll('label.step input').forEach((cb) => {
   const key = 'mig-step-' + cb.dataset.step;
@@ -548,6 +591,29 @@ async function slowTick() {
           (c.sample ? esc(c.sample.original) + ' \\u2192 ' + esc(c.sample.coerced) : '') + '</td></tr>').join('') + '</table>';
 
     document.getElementById('ph3-s').textContent = report.dryRun ? 'this is a dry run' : 'run with DRY_RUN=1';
+
+    const [pods, dry] = await Promise.all([
+      fetch('/api/pods').then(r => r.json()).catch(() => null),
+      fetch('/api/dryrun').then(r => r.json()).catch(() => null),
+    ]);
+    if (pods && pods.pods) {
+      const now = Date.now();
+      document.getElementById('pods').innerHTML = pods.pods.length === 0
+        ? '<div class="empty">No pods have claimed work yet.</div>'
+        : '<table><tr><th>Pod</th><th>Chunks done</th><th>Active</th><th>Last seen</th></tr>' +
+          pods.pods.map(p => {
+            const ago = p.lastSeen ? Math.round((now - new Date(p.lastSeen).getTime()) / 1000) : null;
+            const alive = ago !== null && ago < pods.leaseSec;
+            return '<tr><td>' + esc(p.pod) + (alive ? ' <span class="pill resolved">alive</span>' : ' <span class="pill waived">idle/gone</span>') +
+              '</td><td>' + fmt(p.done) + '</td><td>' + fmt(p.active) + '</td><td>' + (ago === null ? '–' : ago + 's ago') + '</td></tr>';
+          }).join('') + '</table>';
+    }
+    if (dry) {
+      const el = document.getElementById('dry-status');
+      if (dry.status === 'running') el.textContent = '— dry run in progress…';
+      else if (dry.status === 'completed') el.textContent = '— dry run completed: review DLQ & Coercions, then Preflight shows the result';
+      else if (dry.status === 'failed') el.textContent = '— dry run FAILED: ' + (dry.error || '');
+    }
   } catch { /* engine restarting */ }
 }
 

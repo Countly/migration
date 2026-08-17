@@ -20,6 +20,7 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             breakerPct: env.LEDGER_BREAKER_PCT,
             breakerConsecutive: env.LEDGER_BREAKER_CONSECUTIVE,
             monitorIntervalMs: env.LEDGER_MONITOR_INTERVAL_MS,
+            maxChunkDays: env.LEDGER_MAX_CHUNK_DAYS,
             captureTransformErrors: env.LEDGER_CAPTURE_TRANSFORM_ERRORS,
             dryRun: env.DRY_RUN,
             dryRunSamplePct: env.DRY_RUN_SAMPLE_PCT,

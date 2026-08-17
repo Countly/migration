@@ -269,6 +269,23 @@ export class LedgerStore {
       .toArray() as never;
   }
 
+  /** Per-pod activity summary (Pods panel): who did what, who is alive. */
+  async podActivity(runId: string): Promise<Array<{ pod: string; done: number; active: number; lastSeen: Date | null }>> {
+    const rows = await this.c()
+      .aggregate<{ _id: string; done: number; active: number; lastSeen: Date }>([
+        { $match: { run_id: runId, pod_id: { $ne: null } } },
+        { $group: {
+          _id: '$pod_id',
+          done: { $sum: { $cond: [{ $eq: ['$status', 'done'] }, 1, 0] } },
+          active: { $sum: { $cond: [{ $in: ['$status', ['in_progress', 'written', 'attaching']] }, 1, 0] } },
+          lastSeen: { $max: '$updated_at' },
+        } },
+        { $sort: { done: -1 } },
+      ])
+      .toArray();
+    return rows.map((r) => ({ pod: r._id, done: r.done, active: r.active, lastSeen: r.lastSeen ?? null }));
+  }
+
   /** Sum of expected rows for done chunks — used by full re-verification. */
   async expectedRows(runId: string, collection: string): Promise<number> {
     const rows = await this.c()

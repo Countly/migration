@@ -70,6 +70,35 @@ and `/viz` — a live dashboard fed by the ledger.
 | `LEDGER_CAPTURE_TRANSFORM_ERRORS` | `true` | DLQ every unmigratable doc with its raw doc |
 | `DRY_RUN` | `false` | Sampled rehearsal against a Null-engine clone |
 | `DRY_RUN_SAMPLE_PCT` | `2` | Dry-run sample size (hard cap 5) |
+| `LEDGER_MAX_CHUNK_DAYS` | `7` | Max chunk time span — guards sizing against bad doc estimates |
+| `MONGO_READ_PREFERENCE` | `primary` | Set `secondaryPreferred` on replica sets — offloads the primary; exact reads since the source is frozen after cutover |
+
+### Sizing knobs — when to change them
+
+- `MONGO_PAGE_SIZE` (10,000): lower it (1,000 or less) when documents are
+  large (hundreds of KB+) — a page is held in memory whole.
+- `LEDGER_CHUNK_DOCS_TARGET` (2M): a chunk is the unit of crash-redo and of
+  pod parallelism. Smaller chunks = cheaper redo + finer progress, more
+  per-chunk overhead. Lower it on unstable infrastructure.
+- `LEDGER_INSERT_INFLIGHT` (3): raise for a high-latency ClickHouse (more
+  hidden wait), set 1 for a memory-tight one.
+
+### Scaling with pods
+
+Start more instances with the same env and a unique `POD_ID` each
+(`MULTI_POD_ENABLED=true`, default). Pods coordinate ONLY through the chunk
+ledger: an atomic claim hands each pending chunk to exactly one pod; chunk
+cd-ranges are disjoint, so no overlap and no gaps; a dead pod's lease expires
+and survivors reclaim its chunk (drop staging, redo). Verified: 3 pods, one
+killed mid-run, exact final counts.
+
+**Pods scale across machines, not on one box** — a single pod is CPU-bound
+(BSON decode), so extra pods on the same host fight for the same cores
+(measured slower locally). Find your ceiling empirically: add a pod at a
+time on separate hosts and watch per-pod docs/s in the dashboard's Pods
+panel; when adding a pod no longer raises the total (source Mongo or target
+ClickHouse saturated — read time share and backpressure waits rise in
+/stats stageMs), you've found it.
 
 Validation harness (seed + SIGKILL crash drill): see [`bench/README.md`](bench/README.md).
 

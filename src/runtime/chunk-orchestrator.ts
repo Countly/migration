@@ -202,8 +202,13 @@ export class ChunkOrchestrator {
     }
 
     const estimated = await mongoReader.getEstimatedCount();
-    const chunkCount = Math.max(1, Math.min(50_000, Math.ceil(estimated / config.ledger.chunkDocsTarget)));
     const spanMs = upper.cd + 1 - lower.cd;
+    // Two independent sizing signals: doc estimate AND time span. The span
+    // floor protects against a wrong estimate (metadata fastcount resets
+    // after unclean mongod shutdowns) producing a whole-collection chunk.
+    const byDocs = Math.ceil(estimated / config.ledger.chunkDocsTarget);
+    const bySpan = Math.ceil(spanMs / (config.ledger.maxChunkDays * 86_400_000));
+    const chunkCount = Math.max(1, Math.min(50_000, Math.max(byDocs, bySpan)));
     let bounds: Array<{ lowerCd: number; upperCd: number }> = [];
     for (let i = 0; i < chunkCount; i++) {
       const lo = lower.cd + Math.floor((spanMs * i) / chunkCount);
@@ -935,6 +940,67 @@ export class ChunkOrchestrator {
   }
 
   // -------------------------------------------------------------------------
+  // Self-service: index building (UI action with progress)
+  // -------------------------------------------------------------------------
+
+  private indexBuild: { running: boolean; total: number; done: string[]; current: string | null; error: string | null } =
+    { running: false, total: 0, done: [], current: null, error: null };
+
+  /** Kick off {cd,_id} index builds on all collections missing it (background). */
+  async startIndexBuilds(): Promise<{ started: boolean; missing: number }> {
+    if (this.indexBuild.running) return { started: false, missing: this.indexBuild.total - this.indexBuild.done.length };
+    const db = this.d.mongoReader.getDatabase();
+    const collections = await discoverCollections(db, this.d.config.source.collectionPrefix, this.logger);
+    const missing: string[] = [];
+    for (const name of collections) {
+      const idx = await db.collection(name).indexes().catch(() => []);
+      const has = idx.some((i) => (i.key as Record<string, unknown>).cd !== undefined && (i.key as Record<string, unknown>)._id !== undefined);
+      if (!has) missing.push(name);
+    }
+    if (missing.length === 0) return { started: false, missing: 0 };
+
+    this.indexBuild = { running: true, total: missing.length, done: [], current: null, error: null };
+    void (async () => {
+      for (const name of missing) {
+        this.indexBuild.current = name;
+        try {
+          await db.collection(name).createIndex({ cd: 1, _id: 1 });
+          this.indexBuild.done.push(name);
+        } catch (err) {
+          this.indexBuild.error = `${name}: ${(err as Error).message}`;
+          break;
+        }
+      }
+      this.indexBuild.running = false;
+      this.indexBuild.current = null;
+    })();
+    return { started: true, missing: missing.length };
+  }
+
+  /** Index-build progress incl. live server-side build progress via $currentOp. */
+  async indexBuildProgress(): Promise<Record<string, unknown>> {
+    let serverOps: Array<{ collection: string; pct: number | null; msg: string }> = [];
+    try {
+      const adminDb = this.d.mongoReader.getDatabase().client.db('admin');
+      const ops = await adminDb
+        .aggregate([
+          { $currentOp: { allUsers: true } },
+          { $match: { 'command.createIndexes': { $exists: true } } },
+          { $project: { command: 1, progress: 1, msg: 1 } },
+        ])
+        .toArray();
+      serverOps = ops.map((o: Record<string, unknown>) => ({
+        collection: String((o.command as Record<string, unknown>)?.createIndexes ?? '?'),
+        pct: o.progress && (o.progress as Record<string, number>).total
+          ? Math.round(((o.progress as Record<string, number>).done / (o.progress as Record<string, number>).total) * 100)
+          : null,
+        msg: String(o.msg ?? ''),
+      }));
+    } catch { /* $currentOp may need privileges — progress is then best-effort */ }
+    return { ...this.indexBuild, serverOps };
+  }
+
+  // -------------------------------------------------------------------------
   // Self-service: preflight & verification
   // -------------------------------------------------------------------------
 
@@ -971,6 +1037,48 @@ export class ChunkOrchestrator {
       checks.push({ id: 'docs', label: 'Estimated documents to migrate', status: 'pass', detail: totalDocs.toLocaleString('en-US') });
     } catch (err) {
       checks.push({ id: 'mongo', label: 'MongoDB source reachable', status: 'fail', detail: (err as Error).message });
+    }
+
+    // Replica set: reading from secondaries offloads the primary during the
+    // days-long scan. (After cutover the source is frozen, so secondary reads
+    // are exact.)
+    try {
+      const hello = await mongoReader.getDatabase().admin().command({ hello: 1 });
+      if (hello.setName) {
+        const onPrimary = config.source.readPreference === 'primary';
+        checks.push({
+          id: 'replicaset',
+          label: `Replica set detected (${hello.setName})`,
+          status: onPrimary ? 'warn' : 'pass',
+          detail: onPrimary
+            ? `reading from the PRIMARY — set MONGO_READ_PREFERENCE=secondaryPreferred to offload it (source is frozen after cutover, so secondary reads are exact)`
+            : `read preference: ${config.source.readPreference}`,
+        });
+      }
+    } catch { /* standalone or no permission — nothing to suggest */ }
+
+    // Disk headroom — the #1 preventable mid-migration incident.
+    try {
+      const dbStats = await mongoReader.getDatabase().stats();
+      if (dbStats.fsTotalSize) {
+        const freePct = Math.round(((dbStats.fsTotalSize - dbStats.fsUsedSize) / dbStats.fsTotalSize) * 100);
+        checks.push({
+          id: 'mongo-disk',
+          label: 'MongoDB disk headroom',
+          status: freePct < 10 ? 'fail' : freePct < 20 ? 'warn' : 'pass',
+          detail: `${freePct}% free`,
+        });
+      }
+    } catch { /* stats not available */ }
+    const chDisk = await staging.diskSpace();
+    if (chDisk && chDisk.totalBytes > 0) {
+      const freePct = Math.round((chDisk.freeBytes / chDisk.totalBytes) * 100);
+      checks.push({
+        id: 'ch-disk',
+        label: 'ClickHouse disk headroom',
+        status: freePct < 10 ? 'fail' : freePct < 20 ? 'warn' : 'pass',
+        detail: `${freePct}% free (${(chDisk.freeBytes / 1e9).toFixed(1)} GB) — needs room for staging + the migrated data (~10-20% of the Mongo size after compression)`,
+      });
     }
 
     // ClickHouse target

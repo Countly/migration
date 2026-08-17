@@ -51,6 +51,11 @@ export const configSchema = z.object({
             monitorIntervalMs: intFromEnv.default(900_000),
             // Capture full raw docs of transform failures into the DLQ.
             captureTransformErrors: booleanFromEnv.default(true),
+            // Upper bound on a chunk's time span. Guards chunk sizing against
+            // bad estimatedDocumentCount (e.g. metadata fastcount reset after
+            // an unclean mongod shutdown) — a wrong estimate can never produce
+            // a whole-collection mega-chunk.
+            maxChunkDays: numberFromEnv.default(7).pipe(z.number().positive()),
             // Dry run: sampled rehearsal against a Null-engine clone.
             dryRun: booleanFromEnv.default(false),
             dryRunSamplePct: numberFromEnv.default(2).pipe(z.number().min(0.1).max(5)),

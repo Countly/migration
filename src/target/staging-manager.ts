@@ -280,6 +280,18 @@ export class StagingManager {
     });
   }
 
+  /** ClickHouse disk headroom (preflight). */
+  async diskSpace(): Promise<{ freeBytes: number; totalBytes: number } | null> {
+    try {
+      const res = await this.ch().query({
+        query: `SELECT sum(free_space) AS f, sum(total_space) AS t FROM system.disks`,
+        format: 'JSONEachRow',
+      });
+      const rows = await res.json<{ f: string; t: string }>();
+      return { freeBytes: Number(rows[0]?.f ?? 0), totalBytes: Number(rows[0]?.t ?? 0) };
+    } catch { return null; }
+  }
+
   /** Total + distinct-id counts of the live table (exact, one query). */
   async countAndUniq(): Promise<{ count: number; uniq: number }> {
     const res = await this.ch().query({

@@ -96,6 +96,58 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     chPressure,
   });
 
+  // ── In-process dry-run runner (UI action) ─────────────────────────────
+  // Uses its OWN MongoReader/StagingManager so it can never disturb the main
+  // orchestrator's collection binding. Allowed only while the main run is
+  // not actively copying.
+  const dryState: { status: string; stats: Record<string, unknown> | null; error: string | null } =
+    { status: 'not_run', stats: null, error: null };
+
+  async function startDryRun(): Promise<{ started: boolean; reason?: string }> {
+    if (dryState.status === 'running') return { started: false, reason: 'dry run already running' };
+    if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — pause or wait for completion first' };
+    dryState.status = 'running'; dryState.error = null;
+
+    const dryConfig: Config = { ...config, ledger: { ...config.ledger, dryRun: true } };
+    const dryReader = new MongoReader(
+      {
+        uri: config.source.uri, database: config.source.db,
+        readPreference: config.source.readPreference, readConcern: config.source.readConcern,
+        retryReads: config.source.retryReads, appName: `${config.service.name}-dry`,
+        cursorBatchSize: config.source.cursorBatchSize, maxTimeMs: config.source.maxTimeMs,
+      },
+      logger,
+    );
+    const dryStaging = new StagingManager(
+      {
+        url: config.target.url, database: config.target.db, table: config.target.table,
+        username: config.target.username, password: config.target.password,
+        queryTimeoutMs: config.target.queryTimeoutMs,
+      },
+      logger,
+    );
+    void (async () => {
+      try {
+        await dryReader.connect();
+        await dryStaging.connect();
+        const dryOrch = new ChunkOrchestrator({
+          config: dryConfig, logger, mongoReader: dryReader, ledger, dlq,
+          staging: dryStaging, retryPolicy, hashResolver,
+        });
+        await dryOrch.run();
+        dryState.stats = dryOrch.getStats() as unknown as Record<string, unknown>;
+        dryState.status = 'completed';
+      } catch (err) {
+        dryState.status = 'failed';
+        dryState.error = (err as Error).message;
+      } finally {
+        await dryReader.close().catch(() => {});
+        await dryStaging.close().catch(() => {});
+      }
+    })();
+    return { started: true };
+  }
+
   // HTTP surface: health + stats + report + controls + branded dashboard (/viz)
   const app = Fastify({ logger: false });
   app.get('/healthz', async () => ({ status: 'ok', engine: 'ledger' }));
@@ -107,6 +159,14 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.post('/control/retry-failed', async () => orchestrator.retryFailed());
   app.post<{ Body: { ids?: string[] } }>('/control/waive-dlq', async (req) => ({
     waived: await dlq.waive(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId, req.body?.ids),
+  }));
+  app.post('/control/build-indexes', async () => orchestrator.startIndexBuilds());
+  app.get('/api/index-progress', async () => orchestrator.indexBuildProgress());
+  app.post('/control/dry-run', async () => startDryRun());
+  app.get('/api/dryrun', async () => dryState);
+  app.get('/api/pods', async () => ({
+    pods: await ledger.podActivity(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId),
+    leaseSec: config.ledger.leaseSec,
   }));
   const { registerLedgerVizRoutes } = await import('../http/ledger-viz-route.ts');
   registerLedgerVizRoutes(app, { orchestrator, ledger, dlq, config });
