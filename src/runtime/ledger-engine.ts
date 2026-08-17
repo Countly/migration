@@ -105,6 +105,9 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.post('/control/resume', async () => { orchestrator.resume(); return { status: orchestrator.getStatus() }; });
   app.post('/control/replay-dlq', async () => orchestrator.replayDlq());
   app.post('/control/retry-failed', async () => orchestrator.retryFailed());
+  app.post<{ Body: { ids?: string[] } }>('/control/waive-dlq', async (req) => ({
+    waived: await dlq.waive(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId, req.body?.ids),
+  }));
   const { registerLedgerVizRoutes } = await import('../http/ledger-viz-route.ts');
   registerLedgerVizRoutes(app, { orchestrator, ledger, config });
   await app.listen({ port: config.service.port, host: config.service.host });

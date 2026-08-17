@@ -48,7 +48,7 @@ once, for minutes, at cutover — never for the migration.
 
 | Incident | What happens | Operator action |
 |---|---|---|
-| A doc can't be inserted / converted | Isolated automatically (bisection), stored in DLQ with the full raw doc; run continues | Later: fix the transform rule (platform-first, sync goldens) or fix the stored raw doc, then `POST /control/replay-dlq` |
+| A doc can't be inserted / converted | Isolated automatically (bisection), stored in DLQ with the full raw doc; run continues | Later: fix the transform rule (platform-first, sync goldens) or fix the stored raw doc, then `POST /control/replay-dlq`. Docs that keep failing stay pending with an updated error — terminal outcomes are fix-and-replay or `POST /control/waive-dlq` (explicitly accept non-migration; raw docs are retained as the record). Sign-off requires pending = 0 |
 | Systematic failures (>5% of a chunk) | Circuit breaker pauses the engine; DLQ already names the error | Investigate, fix, `POST /control/retry-failed` (purges + redoes failed chunks, resumes) |
 | Migrator crashes / pod dies | Nothing else notices. In-flight chunks are redone from their staging tables; a dead pod's lease expires and others reclaim | Restart the pod. No manual cleanup exists in this flow |
 | Live-table rows lost/corrupted for a done chunk | Invariant monitor detects the count mismatch, pauses, flags the chunk | `POST /control/retry-failed` — the chunk's cd window is purged and redone |

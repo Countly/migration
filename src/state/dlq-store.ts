@@ -113,4 +113,18 @@ export class DlqStore {
   async recordRetryError(id: string, error: string): Promise<void> {
     await this.c().updateOne({ _id: id }, { $set: { error, updated_at: new Date() } });
   }
+
+  /**
+   * Waive pending entries: the explicit operator decision that these docs
+   * will NOT be migrated. The raw docs stay in the DLQ permanently as the
+   * record of what was excluded — waived is terminal, but reversible (an
+   * operator can flip back to pending and replay after a later fix).
+   * With no ids given, waives everything currently pending for the run.
+   */
+  async waive(runId: string, ids?: string[]): Promise<number> {
+    const filter: Record<string, unknown> = { run_id: runId, status: 'pending' };
+    if (ids && ids.length > 0) filter._id = { $in: ids };
+    const res = await this.c().updateMany(filter, { $set: { status: 'waived', updated_at: new Date() } });
+    return res.modifiedCount;
+  }
 }

@@ -283,4 +283,12 @@ describe('ledger engine end-to-end', () => {
     expect(pending.length).toBe(3);
     expect(pending[0].error).toContain('still fails transform');
   }, 60_000);
+
+  it('waive is the terminal operator decision: pending drains, raw docs retained', async () => {
+    const waived = await dlq.waive('e2e-1');
+    expect(waived).toBe(3);
+    expect((await dlq.listPending('e2e-1')).length).toBe(0);
+    const byStatus = await dlq.countByStatus('e2e-1');
+    expect(byStatus.waived).toBe(3); // still in the DLQ as the record of what was excluded
+  }, 30_000);
 });
