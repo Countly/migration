@@ -42,12 +42,22 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
     return { runId: runId(), summary, chunks, truncated };
   });
 
+  // Counts + grouped errors are aggregations — cheap at thousands, real
+  // work at a hundred million. Cache 15s so the 2s poll stays harmless.
+  let dlqAggCache: { at: number; byStatus: Record<string, number>; topErrors: unknown[] } | null = null;
   app.get<{ Querystring: { offset?: string } }>('/api/dlq', async (req) => {
     const offset = Math.max(0, parseInt(req.query.offset ?? '0', 10) || 0);
     const pending = await deps.dlq.listPending(runId(), 8, offset);
+    if (!dlqAggCache || Date.now() - dlqAggCache.at > 15_000) {
+      dlqAggCache = {
+        at: Date.now(),
+        byStatus: await deps.dlq.countByStatus(runId()),
+        topErrors: await deps.dlq.topErrors(runId(), 8),
+      };
+    }
     return {
-      byStatus: await deps.dlq.countByStatus(runId()),
-      topErrors: await deps.dlq.topErrors(runId(), 8),
+      byStatus: dlqAggCache.byStatus,
+      topErrors: dlqAggCache.topErrors,
       // Where fixes go: Replay re-transforms raw_doc FROM THIS COLLECTION —
       // never from the source. The source stays the untouched record.
       fixLocation: { db: deps.config.state.manifestDb, collection: 'mig_dlq_docs' },
@@ -278,7 +288,8 @@ const PAGE = `<!doctype html>
   <div class="card">
     <h2>Dead-letter queue <span class="hint">(unmigratable docs, stored with their full raw source — replay after a fix, or waive)</span></h2>
     <div id="dlq-status" style="margin-bottom:6px"></div>
-    <div id="dlq-fixloc" style="font-size:12.5px;color:var(--ink-2);margin-bottom:10px"></div>
+    <div id="dlq-fixloc" style="font-size:12.5px;color:var(--ink-2);margin-bottom:6px"></div>
+    <div id="dlq-replay-progress" style="font-size:12.5px;color:var(--ink-2);margin-bottom:10px"></div>
     <div id="dlq-errors"></div>
     <div id="dlq-samples"></div>
   </div>
@@ -698,10 +709,23 @@ let dlqOffset = 0;
 function dlqPage(delta) { dlqOffset = Math.max(0, dlqOffset + delta); slowTick(); }
 async function slowTick() {
   try {
-    const [dlq, report] = await Promise.all([
+    const [dlq, report, replay] = await Promise.all([
       fetch('/api/dlq?offset=' + dlqOffset).then(r => r.json()),
       fetch('/report').then(r => r.json()),
+      fetch('/api/replay').then(r => r.json()).catch(() => null),
     ]);
+    if (replay && replay.status === 'running') {
+      const rp = replay.progress || {};
+      document.getElementById('dlq-replay-progress').textContent =
+        '\u23f3 replay running: ' + fmt(rp.processed || 0) + ' processed \u00b7 ' + fmt(rp.replayed || 0) + ' replayed \u00b7 ' +
+        fmt(rp.alreadyLive || 0) + ' already live (skipped) \u00b7 ' + fmt(rp.stillFailing || 0) + ' still failing';
+    } else if (replay && replay.status === 'completed' && replay.result) {
+      document.getElementById('dlq-replay-progress').textContent =
+        '\u2705 last replay: ' + fmt(replay.result.replayed) + ' replayed \u00b7 ' + fmt(replay.result.alreadyLive || 0) +
+        ' already live \u00b7 ' + fmt(replay.result.stillFailing) + ' still failing';
+    } else {
+      document.getElementById('dlq-replay-progress').textContent = '';
+    }
     // If waives/replays shrank the queue below our offset, snap back
     if (dlqOffset > 0 && (dlq.samples || []).length === 0) { dlqOffset = 0; }
     const bs = dlq.byStatus || {};

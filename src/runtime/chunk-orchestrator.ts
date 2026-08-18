@@ -190,6 +190,7 @@ export class ChunkOrchestrator {
       );
     } else {
       await this.d.staging.runDedupCanary();
+      await this.checkDlqPressure(this.logger, true); // inherited mass-DLQ pauses a resumed run too
       this.startInvariantMonitor();
     }
 
@@ -512,6 +513,8 @@ export class ChunkOrchestrator {
         { docsRead: result.docsRead, docsSkipped: result.docsSkipped, dlq: result.docsDlq, rowsExpected },
         'Chunk done',
       );
+
+      await this.checkDlqPressure(clog);
     } catch (err) {
       const error = err as Error;
       const isPermanent = classifyError(err) === 'permanent';
@@ -1045,14 +1048,49 @@ export class ChunkOrchestrator {
   // -------------------------------------------------------------------------
 
   /**
+   * Global DLQ mass guard. The per-chunk circuit breaker (5% of one chunk)
+   * never trips on EVENLY-SPREAD failure — 1% of every chunk on a 10B-doc
+   * migration would silently accumulate ~100M raw docs. When total pending
+   * crosses the threshold, pause: that scale of DLQ means a systematic
+   * problem to fix in the transform/source, not data to collect.
+   */
+  async checkDlqPressure(log: Logger, force = false): Promise<boolean> {
+    const threshold = this.d.config.ledger.dlqPauseThreshold;
+    if (threshold <= 0 || this.paused || this.dryRun) return false;
+    if (!force && this.totalDocsDlq + this.totalDocsSkipped < threshold) return false; // cheap in-process pre-filter
+    const counts = await this.d.dlq.countByStatus(this.runId);
+    if ((counts.pending ?? 0) >= threshold) {
+      log.error(
+        { pending: counts.pending, threshold },
+        'DLQ MASS GUARD: pending dead-letter docs crossed the threshold — pausing. ' +
+        'This is a systematic problem: fix the cause, then either Retry failed chunks ' +
+        '(redo re-reads the source) or Replay DLQ. Raise LEDGER_DLQ_PAUSE_THRESHOLD to override.',
+      );
+      this.pause();
+      return true;
+    }
+    return false;
+  }
+
+  /** Live progress of a running DLQ replay (large queues take a while). */
+  readonly replayProgress = { running: false, processed: 0, replayed: 0, stillFailing: 0, alreadyLive: 0 };
+
+  /**
    * Replay pending DLQ entries: re-transform the stored raw docs under the
    * CURRENT transform version and insert them directly into the live table.
-   * Safe to run anytime after the affected chunks are done.
+   * Safe to run anytime after the affected chunks are done — entries whose
+   * rows are ALREADY live (e.g. a chunk redo with a fixed transform migrated
+   * them from the source first) are marked resolved without inserting, so
+   * redo-then-replay cannot duplicate.
    */
-  async replayDlq(): Promise<{ replayed: number; stillFailing: number }> {
+  async replayDlq(): Promise<{ replayed: number; stillFailing: number; alreadyLive: number }> {
     const { dlq, staging, retryPolicy, config } = this.d;
     let replayed = 0;
     let stillFailing = 0;
+    let alreadyLive = 0;
+    this.replayProgress.running = true;
+    Object.assign(this.replayProgress, { processed: 0, replayed: 0, stillFailing: 0, alreadyLive: 0 });
+    try {
 
     // Keyset drain: pages of 500 by _id so a large DLQ is fully processed
     // (a plain limited fetch silently replayed only the first page). Entries
@@ -1064,6 +1102,7 @@ export class ChunkOrchestrator {
       if (batch.length === 0) break;
       afterId = batch[batch.length - 1]._id;
       const batchKey = batch[0]._id;
+      this.replayProgress.processed += batch.length;
       const rows: OutputRow[] = [];
       const ids: string[] = [];
       for (const entry of batch) {
@@ -1075,7 +1114,28 @@ export class ChunkOrchestrator {
           stillFailing++;
         }
       }
-      if (rows.length === 0) continue;
+
+      // Skip rows already live as (_id, cd) pairs — a chunk redo with a
+      // fixed transform migrates DLQ'd docs from the source; replaying them
+      // on top would duplicate. Marked resolved: the doc IS migrated.
+      if (rows.length > 0) {
+        const liveCd = await staging.fetchLiveCdByIds(rows.map((r) => r._id));
+        const keep: OutputRow[] = [];
+        const keepIds: string[] = [];
+        const resolvedIds: string[] = [];
+        for (let j = 0; j < rows.length; j++) {
+          const cdMs = Date.parse(rows[j].cd.replace(' ', 'T') + 'Z');
+          if (liveCd.get(rows[j]._id) === cdMs) { resolvedIds.push(ids[j]); }
+          else { keep.push(rows[j]); keepIds.push(ids[j]); }
+        }
+        if (resolvedIds.length > 0) {
+          await dlq.markResolved(resolvedIds, config.transform.version + ' (already live — no insert)');
+          alreadyLive += resolvedIds.length;
+        }
+        rows.length = 0; rows.push(...keep);
+        ids.length = 0; ids.push(...keepIds);
+      }
+      if (rows.length === 0) { this.syncReplayProgress(replayed, stillFailing, alreadyLive); continue; }
       try {
         await retryPolicy.execute(
           () => staging.insertIntoLive(rows, `dlqreplay:${batchKey}`),
@@ -1100,10 +1160,20 @@ export class ChunkOrchestrator {
         }
         void err;
       }
+      this.syncReplayProgress(replayed, stillFailing, alreadyLive);
     }
 
-    this.logger.info({ replayed, stillFailing }, 'DLQ replay complete');
-    return { replayed, stillFailing };
+    this.logger.info({ replayed, stillFailing, alreadyLive }, 'DLQ replay complete');
+    return { replayed, stillFailing, alreadyLive };
+    } finally {
+      this.replayProgress.running = false;
+    }
+  }
+
+  private syncReplayProgress(replayed: number, stillFailing: number, alreadyLive: number): void {
+    this.replayProgress.replayed = replayed;
+    this.replayProgress.stillFailing = stillFailing;
+    this.replayProgress.alreadyLive = alreadyLive;
   }
 
   // -------------------------------------------------------------------------

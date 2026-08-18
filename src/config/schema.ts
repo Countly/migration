@@ -46,6 +46,9 @@ export const configSchema = z.object({
             // Circuit breaker: pause when >pct% of a chunk's docs fail, or
             // after N consecutive failed chunks (systematic-bug detection).
             breakerPct: numberFromEnv.default(5).pipe(z.number().min(0).max(100)),
+            // Per-chunk breakers miss EVENLY-SPREAD failure (1% of every
+            // chunk never trips 5%-of-one-chunk) — this is the global guard.
+            dlqPauseThreshold: numberFromEnv.default(1_000_000).pipe(z.number().min(0)),
             breakerConsecutive: positiveIntFromEnv.default(3),
             // Background invariant spot checks (0 disables).
             monitorIntervalMs: intFromEnv.default(900_000),

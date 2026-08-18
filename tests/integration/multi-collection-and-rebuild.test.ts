@@ -343,6 +343,51 @@ describe('multi-collection scoping + ledger rebuild', () => {
     await store.close();
   }, 30_000);
 
+  it('replay skips DLQ entries whose rows are already live (redo-then-replay cannot duplicate)', async () => {
+    const { DlqStore } = await import('../../src/state/dlq-store.ts');
+    const store = new DlqStore(MONGO_URI, DB, logger);
+    await store.connect();
+    // p_100 is already migrated; its DLQ entry simulates a doc that failed
+    // once but was later migrated by a chunk redo with a fixed transform.
+    const srcTs = BASE + 100 * 60_000;
+    await store.add([{
+      run_id: RUN, source_id: 'p_100', collection: COLL1, reason: 'insert_rejected',
+      error: 'old transform bug', transform_version: 'v-old',
+      raw_doc: { _id: 'p_100', uid: '100', did: 'd100', ts: srcTs, cd: new Date(srcTs), sg: { v: 100 }, c: 1 },
+    }]);
+
+    const res = await orchestrator.replayDlq();
+    expect(res.alreadyLive).toBe(1);
+    expect(res.replayed).toBe(0);
+    const count = await ch.query({
+      query: `SELECT count() AS c FROM ${DB}.drill_events WHERE _id = 'p_100'`, format: 'JSONEachRow',
+    });
+    expect(Number((await count.json<{ c: string }>())[0].c)).toBe(1); // still exactly one copy
+    await store.close();
+  }, 60_000);
+
+  it('DLQ mass guard pauses the engine when pending crosses the threshold', async () => {
+    const { DlqStore } = await import('../../src/state/dlq-store.ts');
+    const store = new DlqStore(MONGO_URI, DB, logger);
+    await store.connect();
+    await store.add(Array.from({ length: 6 }, (_, i) => ({
+      run_id: RUN, source_id: `mass_${i}`, collection: COLL1, reason: 'skipped' as const,
+      error: 'systematic', transform_version: 'v-test', raw_doc: { i },
+    })));
+
+    const prev = config.ledger.dlqPauseThreshold;
+    config.ledger.dlqPauseThreshold = 5;
+    try {
+      expect(await orchestrator.checkDlqPressure(logger, true)).toBe(true);  // tripped + paused
+      expect(await orchestrator.checkDlqPressure(logger, true)).toBe(false); // already paused — idempotent
+    } finally {
+      config.ledger.dlqPauseThreshold = prev;
+      orchestrator.resume();
+      await store.waive(RUN);
+      await store.close();
+    }
+  }, 30_000);
+
   it('attach-recovery pair check ignores live copies of the same _id (cross-cutover retry)', async () => {
     // The mixing vector: a crash during attach + an SDK retry that landed the
     // same _id in live (same ts → same month partition). Matching (_id, cd)

@@ -212,7 +212,22 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.get('/report', async () => orchestrator.getReport());
   app.post('/control/pause', async () => { orchestrator.pause(); return { status: orchestrator.getStatus() }; });
   app.post('/control/resume', async () => { orchestrator.resume(); return { status: orchestrator.getStatus() }; });
-  app.post('/control/replay-dlq', async () => orchestrator.replayDlq());
+  // Replay runs in the background: a mass DLQ (systematic failure on a
+  // 10B-doc run) can hold millions of entries — not one HTTP request's work.
+  const replayState: { status: string; result: Record<string, unknown> | null; error: string | null } =
+    { status: 'not_run', result: null, error: null };
+  app.post('/control/replay-dlq', async () => {
+    if (replayState.status === 'running') return { started: false, reason: 'replay already running' };
+    replayState.status = 'running'; replayState.result = null; replayState.error = null;
+    void orchestrator.replayDlq()
+      .then((r) => { replayState.result = r as unknown as Record<string, unknown>; replayState.status = 'completed'; })
+      .catch((e) => { replayState.error = (e as Error).message; replayState.status = 'failed'; });
+    return { started: true };
+  });
+  app.get('/api/replay', async () => ({
+    status: replayState.status, progress: orchestrator.replayProgress,
+    result: replayState.result, error: replayState.error,
+  }));
   app.post('/control/retry-failed', async () => orchestrator.retryFailed());
   app.post<{ Body: { ids?: string[] } }>('/control/waive-dlq', async (req) => ({
     waived: await dlq.waive(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId, req.body?.ids),
@@ -235,6 +250,8 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         hint: 'Concurrent inserts per chunk. Raise for high-latency ClickHouse; set 1 for a memory-tight one.' },
       { env: 'LEDGER_LEASE_SEC', value: config.ledger.leaseSec, def: 600,
         hint: 'Chunk claim lease — how long before other pods reclaim a dead pod\u2019s chunk.' },
+      { env: 'LEDGER_DLQ_PAUSE_THRESHOLD', value: config.ledger.dlqPauseThreshold, def: 1_000_000,
+        hint: 'Global guard the per-chunk breaker cannot provide: pause when total pending DLQ crosses this (evenly-spread failure never trips a per-chunk %). 0 disables.' },
       { env: 'LEDGER_BREAKER_PCT', value: config.ledger.breakerPct, def: 5,
         hint: 'Circuit breaker: pause when more than this % of a chunk\u2019s docs fail.' },
       { env: 'MONGO_READ_PREFERENCE', value: config.source.readPreference + (config.source.readPreferenceAuto ? ' (auto)' : ''), def: 'auto',
