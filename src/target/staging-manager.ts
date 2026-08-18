@@ -311,6 +311,18 @@ export class StagingManager {
     return rows.map((r) => ({ _id: r._id, copies: Number(r.c), migratedCopies: Number(r.mc), min_cd_ms: Number(r.lo), max_cd_ms: Number(r.hi) }));
   }
 
+  /** Rows live ingestion wrote recently (preflight: is new ingestion flowing?). */
+  async countRecentLive(minutes: number): Promise<number> {
+    const res = await this.ch().query({
+      query: `SELECT count() AS c FROM ${this.fq(this.config.table)}
+              WHERE cd >= now64(3) - INTERVAL {m:UInt32} MINUTE`,
+      query_params: { m: minutes },
+      format: 'JSONEachRow',
+    });
+    const rows = await res.json<{ c: string }>();
+    return Number(rows[0]?.c ?? 0);
+  }
+
   /** ClickHouse server wall-clock (preflight clock-skew check). */
   async serverNowMs(): Promise<number> {
     const res = await this.ch().query({

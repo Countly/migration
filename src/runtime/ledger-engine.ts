@@ -25,6 +25,28 @@ import { rebuildLedger, newRebuildProgress } from './ledger-rebuild.ts';
 export async function runLedgerEngine(config: Config, logger: Logger): Promise<void> {
   logger.info({ engine: 'ledger', runId: config.ledger.runId }, 'Starting ledger engine (no Redis)');
 
+  // Read preference 'auto' (the default): pick secondaryPreferred on replica
+  // sets — the source is frozen after cutover, so secondary reads are exact
+  // and the days-long scan stays off the primary. Explicit env wins.
+  if (config.source.readPreference === 'auto') {
+    const { MongoClient } = await import('mongodb');
+    const probe = new MongoClient(config.source.uri);
+    try {
+      await probe.connect();
+      const hello = await probe.db('admin').command({ hello: 1 });
+      config.source.readPreference = hello.setName ? 'secondaryPreferred' : 'primary';
+      config.source.readPreferenceAuto = true;
+      logger.info(
+        { readPreference: config.source.readPreference, replicaSet: hello.setName ?? null },
+        'Read preference auto-selected',
+      );
+    } catch {
+      config.source.readPreference = 'primary';
+    } finally {
+      await probe.close().catch(() => {});
+    }
+  }
+
   const mongoReader = new MongoReader(
     {
       uri: config.source.uri,
@@ -215,8 +237,8 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         hint: 'Chunk claim lease — how long before other pods reclaim a dead pod\u2019s chunk.' },
       { env: 'LEDGER_BREAKER_PCT', value: config.ledger.breakerPct, def: 5,
         hint: 'Circuit breaker: pause when more than this % of a chunk\u2019s docs fail.' },
-      { env: 'MONGO_READ_PREFERENCE', value: config.source.readPreference, def: 'primary',
-        hint: 'On replica sets set secondaryPreferred — offloads the primary; exact since the source is frozen after cutover.' },
+      { env: 'MONGO_READ_PREFERENCE', value: config.source.readPreference + (config.source.readPreferenceAuto ? ' (auto)' : ''), def: 'auto',
+        hint: 'Auto-selected: secondaryPreferred on replica sets (offloads the primary; exact since the source is frozen), primary otherwise. Set explicitly only to override.' },
     ],
     stateLocation: {
       ledger: `${config.state.manifestDb}.mig_ranges (MongoDB)`,

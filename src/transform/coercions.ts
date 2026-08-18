@@ -19,9 +19,17 @@ export class CoercionCounter {
   private counts = new Map<string, number>();
   private samples = new Map<string, CoercionSample>();
   private static readonly MAX_SAMPLED_KEYS = 200;
+  // Distinct (rule, field) keys are bounded so pathological data (millions of
+  // distinct field names) cannot grow this map without limit; the overflow
+  // bucket keeps the TOTAL exact either way.
+  private static readonly MAX_DISTINCT_KEYS = 10_000;
+  private static readonly OVERFLOW_KEY = 'other:distinct-key-cap-reached';
 
   record(rule: string, key: string, original: unknown, coerced: unknown): void {
-    const k = `${rule}:${key}`;
+    let k = `${rule}:${key}`;
+    if (!this.counts.has(k) && this.counts.size >= CoercionCounter.MAX_DISTINCT_KEYS) {
+      k = CoercionCounter.OVERFLOW_KEY;
+    }
     this.counts.set(k, (this.counts.get(k) ?? 0) + 1);
     if (!this.samples.has(k) && this.samples.size < CoercionCounter.MAX_SAMPLED_KEYS) {
       this.samples.set(k, { key, original: String(original).slice(0, 100), coerced: String(coerced).slice(0, 100) });

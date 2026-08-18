@@ -32,12 +32,19 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
   const runId = () => deps.config.ledger.dryRun ? `${deps.config.ledger.runId}-dry` : deps.config.ledger.runId;
 
   app.get('/api/chunks', async () => {
-    const chunks = await deps.ledger.listAll(runId());
-    return { runId: runId(), chunks };
+    // Summary is O(collections); full chunk details only while they're small
+    // enough to render (a 10TB run can have tens of thousands of chunks).
+    const summary = await deps.ledger.summarize(runId());
+    const truncated = summary.total > 2_000;
+    const chunks = truncated
+      ? await deps.ledger.listActive(runId(), 500)
+      : await deps.ledger.listAll(runId());
+    return { runId: runId(), summary, chunks, truncated };
   });
 
-  app.get('/api/dlq', async () => {
-    const pending = await deps.dlq.listPending(runId(), 20);
+  app.get<{ Querystring: { offset?: string } }>('/api/dlq', async (req) => {
+    const offset = Math.max(0, parseInt(req.query.offset ?? '0', 10) || 0);
+    const pending = await deps.dlq.listPending(runId(), 8, offset);
     return {
       byStatus: await deps.dlq.countByStatus(runId()),
       topErrors: await deps.dlq.topErrors(runId(), 8),
@@ -45,6 +52,7 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
       // never from the source. The source stays the untouched record.
       fixLocation: { db: deps.config.state.manifestDb, collection: 'mig_dlq_docs' },
       sourceDb: deps.config.source.db,
+      offset,
       samples: pending.map((p) => ({
         dlq_id: p._id,
         source_id: p.source_id,
@@ -568,8 +576,8 @@ async function tick() {
       fetch('/api/chunks').then(r => r.json()),
     ]);
     const chunks = chunkResp.chunks || [];
-    window.__ledgerDocsDone = chunks.filter(c => c.status === 'done')
-      .reduce((sum, c) => sum + (c.rows_expected || 0), 0);
+    const sum = chunkResp.summary || { total: 0, byStatus: {}, docsDone: 0, perCollection: [] };
+    window.__ledgerDocsDone = sum.docsDone;
 
     // Durable count from the ledger when available (process counters reset
     // on restart; the chunk ledger doesn't).
@@ -587,16 +595,17 @@ async function tick() {
     document.getElementById('s-skipped').textContent = fmt(stats.totalDocsSkipped);
     document.getElementById('s-failed').textContent = fmt(stats.chunksFailed);
 
-    const done = chunks.filter(c => c.status === 'done').length;
-    const active = chunks.filter(c => ['in_progress', 'written', 'attaching'].includes(c.status)).length;
-    const failedN = chunks.filter(c => c.status === 'failed').length;
-    const countable = chunks.filter(c => c.status !== 'superseded').length;
+    const bs = sum.byStatus;
+    const done = bs.done || 0;
+    const active = (bs.in_progress || 0) + (bs.written || 0) + (bs.attaching || 0);
+    const failedN = bs.failed || 0;
+    const countable = sum.total - (bs.superseded || 0);
     document.getElementById('s-chunks').textContent = done + ' / ' + countable;
 
-    const remainingDocs = chunks.filter(c => c.status !== 'done' && c.status !== 'superseded')
-      .reduce((s, c) => s + (c.rows_expected || 0), 0);
-    const knownRemaining = chunks.filter(c => c.status === 'pending').length;
-    const avgDone = done > 0 ? chunks.filter(c => c.status === 'done').reduce((s, c) => s + c.docs_read, 0) / done : 0;
+    const remainingDocs = sum.perCollection.reduce((s, c) => s + (c.nonDoneRowsExpected || 0), 0);
+    const knownRemaining = bs.pending || 0;
+    const doneDocsRead = sum.perCollection.reduce((s, c) => s + (c.doneDocsRead || 0), 0);
+    const avgDone = done > 0 ? doneDocsRead / done : 0;
     const etaDocs = remainingDocs + knownRemaining * avgDone;
     document.getElementById('s-eta').textContent =
       stats.status === 'completed' ? 'done' :
@@ -657,12 +666,16 @@ async function tick() {
   } catch { /* engine restarting — keep polling */ }
 }
 
+let dlqOffset = 0;
+function dlqPage(delta) { dlqOffset = Math.max(0, dlqOffset + delta); slowTick(); }
 async function slowTick() {
   try {
     const [dlq, report] = await Promise.all([
-      fetch('/api/dlq').then(r => r.json()),
+      fetch('/api/dlq?offset=' + dlqOffset).then(r => r.json()),
       fetch('/report').then(r => r.json()),
     ]);
+    // If waives/replays shrank the queue below our offset, snap back
+    if (dlqOffset > 0 && (dlq.samples || []).length === 0) { dlqOffset = 0; }
     const bs = dlq.byStatus || {};
     const pending = bs.pending || 0;
     document.getElementById('dlq-status').innerHTML =
@@ -687,7 +700,13 @@ async function slowTick() {
     document.getElementById('dlq-samples').innerHTML = (dlq.samples || []).slice(0, 8).map(sm =>
       '<details class="dlq-sample" data-id="' + esc(sm.dlq_id) + '"' + (openIds.has(sm.dlq_id) ? ' open' : '') + '><summary>' + esc(sm.source_id) + ' \\u00b7 ' + esc(sm.reason) + ' \\u00b7 ' + esc(sm.error) + '</summary>' +
       '<div style="font-size:11.5px;color:var(--ink-2);margin:4px 0 6px">source: <code>' + esc((dlq.sourceDb || '') + '.' + sm.collection) + '</code><br>fix: <code style="user-select:all">db.getSiblingDB("' + esc(dlq.fixLocation ? dlq.fixLocation.db : '') + '").mig_dlq_docs.updateOne({_id: "' + esc(sm.dlq_id) + '"}, {$set: {"raw_doc.&lt;field&gt;": &lt;value&gt;}})</code> then <b>Replay DLQ</b></div>' +
-      '<pre>' + esc(sm.raw_doc) + '</pre></details>').join('');
+      '<pre>' + esc(sm.raw_doc) + '</pre></details>').join('') +
+      ((bs.pending || 0) > 8
+        ? '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;font-size:12px;color:var(--ink-2)">' +
+          '<button class="btn" ' + (dlqOffset === 0 ? 'disabled' : '') + ' onclick="dlqPage(-8)">\u2190 Prev</button>' +
+          '<span>' + fmt(dlqOffset + 1) + '\u2013' + fmt(Math.min(dlqOffset + 8, bs.pending)) + ' of ' + fmt(bs.pending) + ' pending</span>' +
+          '<button class="btn" ' + (dlqOffset + 8 >= bs.pending ? 'disabled' : '') + ' onclick="dlqPage(8)">Next \u2192</button></div>'
+        : '');
 
     const co = (report.coercions || []).slice(0, 12);
     document.getElementById('coercions').innerHTML = co.length === 0

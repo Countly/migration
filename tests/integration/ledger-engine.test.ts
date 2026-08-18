@@ -71,6 +71,15 @@ describe('coercions (shared spec: only non-JSON-carriable values change)', () =>
     expect(counter.getTotal()).toBe(1);
     expect(counter.getReport()[0].rule_key).toBe('stringify_nonfinite:sg');
   });
+  it('caps distinct coercion keys; the overflow bucket keeps totals exact', () => {
+    const counter = new CoercionCounter();
+    for (let i = 0; i < 10_050; i++) counter.record('stringify_nonfinite', `field_${i}`, NaN, 'NaN');
+    expect(counter.getTotal()).toBe(10_050);
+    const report = counter.getReport();
+    expect(report.length).toBe(10_001); // 10k distinct + 1 overflow bucket
+    expect(report.some((r) => r.rule_key === 'other:distinct-key-cap-reached' && r.count === 50)).toBe(true);
+  });
+
   it('clamps the Countly-owned counter c to UInt32', () => {
     const counter = new CoercionCounter();
     const { row } = transformDocument(

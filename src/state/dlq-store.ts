@@ -75,8 +75,9 @@ export class DlqStore {
     }
   }
 
-  async listPending(runId: string, limit = 10_000): Promise<DlqDoc[]> {
-    return this.c().find({ run_id: runId, status: 'pending' }).limit(limit).toArray();
+  async listPending(runId: string, limit = 10_000, skip = 0): Promise<DlqDoc[]> {
+    // Stable order so pagination pages don't shuffle between polls
+    return this.c().find({ run_id: runId, status: 'pending' }).sort({ _id: 1 }).skip(skip).limit(limit).toArray();
   }
 
   async countByStatus(runId: string): Promise<Record<string, number>> {

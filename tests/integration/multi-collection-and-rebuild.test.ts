@@ -308,6 +308,38 @@ describe('multi-collection scoping + ledger rebuild', () => {
     await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'redelivered_1' OR (_id = 'p_5' AND cd >= fromUnixTimestamp64Milli(${nowMs})) OR (_id = 'p_6' AND cd = fromUnixTimestamp64Milli(${BASE + 6 * 60_000 + 1}))` });
   }, 60_000);
 
+  it('probeSourceFrozen detects writes landing between probes', async () => {
+    const db = mc.db(DB);
+    // frozen: nothing changes during the wait
+    const still = await orchestrator.probeSourceFrozen(db as never, [COLL1], 10);
+    expect(still.frozen).toBe(true);
+
+    // not frozen: a write lands during the wait window
+    const busy = await orchestrator.probeSourceFrozen(db as never, [COLL1], 10, async () => {
+      await db.collection(COLL1).insertOne({ _id: 'late_arrival', uid: 'u', ts: Date.now(), cd: new Date() } as never);
+    });
+    expect(busy.frozen).toBe(false);
+    expect(busy.grew).toContain(COLL1);
+    await db.collection(COLL1).deleteOne({ _id: 'late_arrival' } as never);
+  }, 30_000);
+
+  it('DLQ pending listing paginates stably', async () => {
+    const { DlqStore } = await import('../../src/state/dlq-store.ts');
+    const store = new DlqStore(MONGO_URI, DB, logger);
+    await store.connect();
+    await store.add(Array.from({ length: 12 }, (_, i) => ({
+      run_id: RUN, source_id: `pg_${String(i).padStart(2, '0')}`, collection: COLL1,
+      reason: 'skipped' as const, error: 'test', raw_doc: { i }, transform_version: 'v-test',
+    })));
+    const page1 = await store.listPending(RUN, 5, 0);
+    const page2 = await store.listPending(RUN, 5, 5);
+    expect(page1.length).toBe(5);
+    expect(page2.length).toBe(5);
+    expect(new Set([...page1, ...page2].map((d) => d._id)).size).toBe(10); // no overlap
+    await store.waive(RUN);
+    await store.close();
+  }, 30_000);
+
   it('attach-recovery pair check ignores live copies of the same _id (cross-cutover retry)', async () => {
     // The mixing vector: a crash during attach + an SDK retry that landed the
     // same _id in live (same ts → same month partition). Matching (_id, cd)

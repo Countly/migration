@@ -861,6 +861,40 @@ export class ChunkOrchestrator {
     }
   }
 
+  /**
+   * Double-probe the source for writes: snapshot per-collection newest cd +
+   * estimated count, wait, snapshot again. Any advance means old ingestion
+   * is still running. Public-ish for tests (delay injectable).
+   */
+  async probeSourceFrozen(
+    db: ReturnType<MongoReader['getDatabase']>,
+    collections: string[],
+    probeMs: number,
+    wait: (ms: number) => Promise<void> = (ms) => sleep(ms),
+  ): Promise<{ frozen: boolean; grew: string[]; probeMs: number }> {
+    const snapshot = async (): Promise<Map<string, { maxCd: number; est: number }>> => {
+      const out = new Map<string, { maxCd: number; est: number }>();
+      for (const name of collections) {
+        const [top] = await db.collection(name).find({ cd: { $type: 'date' } })
+          .sort({ cd: -1 }).limit(1).project({ cd: 1 }).toArray();
+        out.set(name, {
+          maxCd: top?.cd instanceof Date ? top.cd.getTime() : 0,
+          est: await db.collection(name).estimatedDocumentCount(),
+        });
+      }
+      return out;
+    };
+    const before = await snapshot();
+    await wait(probeMs);
+    const after = await snapshot();
+    const grew: string[] = [];
+    for (const [name, b] of before) {
+      const a = after.get(name)!;
+      if (a.maxCd > b.maxCd || a.est > b.est) grew.push(name);
+    }
+    return { frozen: grew.length === 0, grew, probeMs };
+  }
+
   /** Drop staging tables orphaned by crash-between-done-and-drop. */
   private async sweepOrphanStaging(collection: string): Promise<void> {
     if (this.dryRun) return;
@@ -1184,6 +1218,34 @@ export class ChunkOrchestrator {
           ? `newest source cd ${maxSourceCd ? new Date(maxSourceCd).toISOString() : 'n/a'} is safely behind ClickHouse server time`
           : `newest source cd ${new Date(maxSourceCd).toISOString()} is within 60s of ClickHouse server time (${new Date(chNow).toISOString()}) — source still ingesting or clocks skewed; the migrated/live cd boundary is NOT trustworthy yet`,
       });
+      // Old ingestion stopped? Probe twice: if any collection's newest cd or
+      // estimated count advances between probes, the source is still being
+      // written — cutover step 'stop old ingestion' has not happened.
+      const frozen = await this.probeSourceFrozen(db, collections, 4_000);
+      checks.push({
+        id: 'frozen',
+        label: 'Old ingestion stopped (source frozen)',
+        status: frozen.frozen ? 'pass' : 'fail',
+        detail: frozen.frozen
+          ? `no writes observed during a ${Math.round(frozen.probeMs / 1000)}s probe`
+          : `STILL RECEIVING WRITES: ${frozen.grew.join(', ')} — stop old ingestion before migrating (works the same for new-cluster and same-cluster setups)`,
+      });
+
+      // New ingestion flowing? Post-cutover rows carry recent cd. Zero recent
+      // rows is a warning, not a failure — traffic may legitimately be zero,
+      // or preflight may be running before the SDK flip (both topologies).
+      try {
+        const recent = await this.d.staging.countRecentLive(15);
+        checks.push({
+          id: 'live-ingest',
+          label: 'New ingestion flowing into ClickHouse',
+          status: recent > 0 ? 'pass' : 'warn',
+          detail: recent > 0
+            ? `${recent.toLocaleString('en-US')} rows ingested in the last 15 min`
+            : 'no rows with recent cd in the last 15 min — either the SDK flip has not happened yet or traffic is zero; fine to migrate, but verify live ingestion separately',
+        });
+      } catch { /* table missing — already reported by the table check */ }
+
       checks.push({
         id: 'nullcd',
         label: 'Documents without cd (outliers)',
@@ -1208,8 +1270,8 @@ export class ChunkOrchestrator {
           label: `Replica set detected (${hello.setName})`,
           status: onPrimary ? 'warn' : 'pass',
           detail: onPrimary
-            ? `reading from the PRIMARY — set MONGO_READ_PREFERENCE=secondaryPreferred to offload it (source is frozen after cutover, so secondary reads are exact)`
-            : `read preference: ${config.source.readPreference}`,
+            ? `MONGO_READ_PREFERENCE=primary was forced by env — remove it to let the engine auto-select secondaryPreferred (it does this by default on replica sets; source is frozen, so secondary reads are exact)`
+            : `read preference: ${config.source.readPreference}${config.source.readPreferenceAuto ? ' (auto-selected — replica set detected)' : ''}`,
         });
       }
     } catch { /* standalone or no permission — nothing to suggest */ }
