@@ -29,6 +29,7 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
 
         service: {
             name: env.SERVICE_NAME,
+            dashboardPassword: env.DASHBOARD_PASSWORD,
             port: env.SERVICE_PORT,
             host: env.SERVICE_HOST,
             gracefulShutdownTimeoutMs: env.GRACEFUL_SHUTDOWN_TIMEOUT_MS,
