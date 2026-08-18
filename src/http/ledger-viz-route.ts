@@ -41,7 +41,12 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
     return {
       byStatus: await deps.dlq.countByStatus(runId()),
       topErrors: await deps.dlq.topErrors(runId(), 8),
+      // Where fixes go: Replay re-transforms raw_doc FROM THIS COLLECTION —
+      // never from the source. The source stays the untouched record.
+      fixLocation: { db: deps.config.state.manifestDb, collection: 'mig_dlq_docs' },
+      sourceDb: deps.config.source.db,
       samples: pending.map((p) => ({
+        dlq_id: p._id,
         source_id: p.source_id,
         collection: p.collection,
         reason: p.reason,
@@ -246,7 +251,8 @@ const PAGE = `<!doctype html>
 
   <div class="card">
     <h2>Dead-letter queue <span class="hint">(unmigratable docs, stored with their full raw source — replay after a fix, or waive)</span></h2>
-    <div id="dlq-status" style="margin-bottom:10px"></div>
+    <div id="dlq-status" style="margin-bottom:6px"></div>
+    <div id="dlq-fixloc" style="font-size:12.5px;color:var(--ink-2);margin-bottom:10px"></div>
     <div id="dlq-errors"></div>
     <div id="dlq-samples"></div>
   </div>
@@ -562,9 +568,22 @@ async function tick() {
       fetch('/api/chunks').then(r => r.json()),
     ]);
     const chunks = chunkResp.chunks || [];
+    window.__ledgerDocsDone = chunks.filter(c => c.status === 'done')
+      .reduce((sum, c) => sum + (c.rows_expected || 0), 0);
 
-    document.getElementById('s-rows').textContent = fmt(stats.totalRowsInserted);
-    document.getElementById('s-dps').textContent = fmt(stats.docsPerSecond);
+    // Durable count from the ledger when available (process counters reset
+    // on restart; the chunk ledger doesn't).
+    if (window.__ledgerDocsDone !== undefined && window.__ledgerDocsDone >= stats.totalRowsInserted) {
+      document.getElementById('s-rows').textContent = fmt(window.__ledgerDocsDone);
+    } else {
+      document.getElementById('s-rows').textContent = fmt(stats.totalRowsInserted);
+    }
+    var dpsEl = document.getElementById('s-dps');
+    if (stats.totalRowsInserted === 0 && stats.status !== 'running') {
+      dpsEl.textContent = '\u2013';
+    } else {
+      dpsEl.textContent = fmt(stats.docsPerSecond) + (stats.status === 'completed' ? ' avg' : '');
+    }
     document.getElementById('s-skipped').textContent = fmt(stats.totalDocsSkipped);
     document.getElementById('s-failed').textContent = fmt(stats.chunksFailed);
 
@@ -658,8 +677,16 @@ async function slowTick() {
     document.getElementById('dlq-errors').innerHTML = errs.length === 0 ? '' :
       '<table><tr><th>Error</th><th>Docs</th></tr>' +
       errs.map(e => '<tr><td class="err">' + esc(e.error) + '</td><td>' + fmt(e.n) + '</td></tr>').join('') + '</table>';
+    var fixLoc = dlq.fixLocation ? dlq.fixLocation.db + '.' + dlq.fixLocation.collection : '';
+    document.getElementById('dlq-fixloc').innerHTML = fixLoc
+      ? 'To fix a document, edit its <code>raw_doc</code> in <b><code>' + esc(fixLoc) + '</code></b> and press Replay \u2014 replay re-transforms the stored raw doc, NOT the source. ' +
+        'The original stays untouched in <code>' + esc(dlq.sourceDb || '') + '.&lt;collection shown per entry&gt;</code> as the record.'
+      : '';
+    // Preserve which entries the operator has expanded across re-renders
+    var openIds = new Set(Array.from(document.querySelectorAll('#dlq-samples details[open]')).map(d => d.dataset.id));
     document.getElementById('dlq-samples').innerHTML = (dlq.samples || []).slice(0, 8).map(sm =>
-      '<details class="dlq-sample"><summary>' + esc(sm.source_id) + ' \\u00b7 ' + esc(sm.reason) + ' \\u00b7 ' + esc(sm.error) + '</summary>' +
+      '<details class="dlq-sample" data-id="' + esc(sm.dlq_id) + '"' + (openIds.has(sm.dlq_id) ? ' open' : '') + '><summary>' + esc(sm.source_id) + ' \\u00b7 ' + esc(sm.reason) + ' \\u00b7 ' + esc(sm.error) + '</summary>' +
+      '<div style="font-size:11.5px;color:var(--ink-2);margin:4px 0 6px">source: <code>' + esc((dlq.sourceDb || '') + '.' + sm.collection) + '</code><br>fix: <code style="user-select:all">db.getSiblingDB("' + esc(dlq.fixLocation ? dlq.fixLocation.db : '') + '").mig_dlq_docs.updateOne({_id: "' + esc(sm.dlq_id) + '"}, {$set: {"raw_doc.&lt;field&gt;": &lt;value&gt;}})</code> then <b>Replay DLQ</b></div>' +
       '<pre>' + esc(sm.raw_doc) + '</pre></details>').join('');
 
     const co = (report.coercions || []).slice(0, 12);

@@ -117,6 +117,7 @@ export class ChunkOrchestrator {
   private status = 'idle';
   private fatalError: string | null = null;
   private multiCollection = false;
+  private finishedAt = 0;
   private stopping = false;
   private paused = false;
   private currentCollection: string | null = null;
@@ -166,6 +167,7 @@ export class ChunkOrchestrator {
   markFatal(message: string): void {
     this.status = 'failed';
     this.fatalError = message;
+    this.finishedAt = Date.now();
   }
 
   // -------------------------------------------------------------------------
@@ -175,6 +177,7 @@ export class ChunkOrchestrator {
   async run(): Promise<void> {
     this.status = 'running';
     this.startedAt = Date.now();
+    this.finishedAt = 0;
     const { config } = this.d;
 
     if (this.dryRun) {
@@ -207,6 +210,7 @@ export class ChunkOrchestrator {
 
     if (this.monitorTimer) clearInterval(this.monitorTimer);
     this.status = this.stopping ? 'stopped' : 'completed';
+    this.finishedAt = Date.now();
     this.logger.info(
       {
         status: this.status,
@@ -1347,7 +1351,10 @@ export class ChunkOrchestrator {
   // -------------------------------------------------------------------------
 
   getStats(): LedgerEngineStats {
-    const elapsedSec = this.startedAt > 0 ? (Date.now() - this.startedAt) / 1000 : 0;
+    // Freeze the clock at completion: docs/second is the run's average
+    // afterwards, not a number decaying while the finished engine idles.
+    const endMs = this.finishedAt > 0 ? this.finishedAt : Date.now();
+    const elapsedSec = this.startedAt > 0 ? (endMs - this.startedAt) / 1000 : 0;
     return {
       engine: 'ledger',
       runId: this.runId,
