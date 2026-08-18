@@ -1060,11 +1060,18 @@ export class ChunkOrchestrator {
     if (!force && this.totalDocsDlq + this.totalDocsSkipped < threshold) return false; // cheap in-process pre-filter
     const counts = await this.d.dlq.countByStatus(this.runId);
     if ((counts.pending ?? 0) >= threshold) {
+      const storage = await this.d.dlq.storageStats().catch(() => null);
       log.error(
-        { pending: counts.pending, threshold },
+        {
+          pending: counts.pending,
+          threshold,
+          dlqStorageMB: storage ? Math.round(storage.dlqBytes / 1e6) : null,
+          manifestDbDiskFreePct: storage?.diskFreePct ?? null,
+        },
         'DLQ MASS GUARD: pending dead-letter docs crossed the threshold — pausing. ' +
         'This is a systematic problem: fix the cause, then either Retry failed chunks ' +
-        '(redo re-reads the source) or Replay DLQ. Raise LEDGER_DLQ_PAUSE_THRESHOLD to override.',
+        '(redo re-reads the source) or Replay DLQ. Raise LEDGER_DLQ_PAUSE_THRESHOLD only ' +
+        'if the disk numbers above say you can afford to keep collecting.',
       );
       this.pause();
       return true;

@@ -87,6 +87,22 @@ export class DlqStore {
     return this.c().find({ run_id: runId, status: 'pending' }).sort({ _id: 1 }).skip(skip).limit(limit).toArray();
   }
 
+  /** Disk cost of the DLQ (raw docs are stored whole) + manifest-DB headroom. */
+  async storageStats(): Promise<{ dlqBytes: number; dlqDocs: number; diskFreePct: number | null }> {
+    const db = this.client.db(this.dbName);
+    let dlqBytes = 0, dlqDocs = 0, diskFreePct: number | null = null;
+    try {
+      const cs = await db.command({ collStats: 'mig_dlq_docs' });
+      dlqBytes = cs.storageSize ?? 0;
+      dlqDocs = cs.count ?? 0;
+    } catch { /* collection may not exist yet */ }
+    try {
+      const ds = await db.stats();
+      if (ds.fsTotalSize) diskFreePct = Math.round(((ds.fsTotalSize - ds.fsUsedSize) / ds.fsTotalSize) * 100);
+    } catch { /* no permission — omit */ }
+    return { dlqBytes, dlqDocs, diskFreePct };
+  }
+
   async countByStatus(runId: string): Promise<Record<string, number>> {
     const rows = await this.c()
       .aggregate<{ _id: string; n: number }>([

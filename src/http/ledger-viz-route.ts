@@ -44,7 +44,7 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
 
   // Counts + grouped errors are aggregations — cheap at thousands, real
   // work at a hundred million. Cache 15s so the 2s poll stays harmless.
-  let dlqAggCache: { at: number; byStatus: Record<string, number>; topErrors: unknown[] } | null = null;
+  let dlqAggCache: { at: number; byStatus: Record<string, number>; topErrors: unknown[]; storage: { dlqBytes: number; dlqDocs: number; diskFreePct: number | null } | null } | null = null;
   app.get<{ Querystring: { offset?: string } }>('/api/dlq', async (req) => {
     const offset = Math.max(0, parseInt(req.query.offset ?? '0', 10) || 0);
     const pending = await deps.dlq.listPending(runId(), 8, offset);
@@ -53,11 +53,13 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
         at: Date.now(),
         byStatus: await deps.dlq.countByStatus(runId()),
         topErrors: await deps.dlq.topErrors(runId(), 8),
+        storage: await deps.dlq.storageStats().catch(() => null),
       };
     }
     return {
       byStatus: dlqAggCache.byStatus,
       topErrors: dlqAggCache.topErrors,
+      storage: dlqAggCache.storage,
       // Where fixes go: Replay re-transforms raw_doc FROM THIS COLLECTION —
       // never from the source. The source stays the untouched record.
       fixLocation: { db: deps.config.state.manifestDb, collection: 'mig_dlq_docs' },
@@ -734,7 +736,11 @@ async function slowTick() {
       ['pending', 'resolved', 'waived'].map(k =>
         '<span class="pill ' + k + '">' + k + ': ' + fmt(bs[k] || 0) + '</span>').join('') +
       (pending === 0 ? ' <span style="color:var(--green);font-size:12px;font-weight:600">ready for sign-off</span>'
-                     : ' <span style="color:#A05A16;font-size:12px">sign-off requires pending = 0 (fix &amp; replay, or waive)</span>');
+                     : ' <span style="color:#A05A16;font-size:12px">sign-off requires pending = 0 (fix &amp; replay, or waive)</span>') +
+      (dlq.storage && dlq.storage.dlqBytes > 0
+        ? ' <span class="pill" style="background:var(--bg)">storage: ' + (dlq.storage.dlqBytes > 1e9 ? (dlq.storage.dlqBytes / 1e9).toFixed(1) + ' GB' : Math.max(1, Math.round(dlq.storage.dlqBytes / 1e6)) + ' MB') +
+          (dlq.storage.diskFreePct !== null ? ' \u00b7 manifest-db disk ' + dlq.storage.diskFreePct + '% free' : '') + '</span>'
+        : '');
     document.getElementById('g2-ic').textContent = pending === 0 ? '\\u2705' : '\\u274c';
     document.getElementById('g2-det').textContent = pending === 0 ? 'clean' : fmt(pending) + ' pending \\u2014 fix & replay, or waive (Overview tab)';
 
