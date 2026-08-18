@@ -16,7 +16,10 @@ therefore act as this repo's frozen spec. The platform PR remains desirable for
 platform-side replay paths (anything feeding old drill docs through
 KafkaEventSink on main today re-stamps `cd` to insert time and skips
 sanitization) — but that is hardening for the platform, not a dependency of
-the migration.
+the migration. The cd re-stamping specifically is fixed by the surgical
+[countly-platform#1105](https://github.com/Countly/countly-platform/pull/1105),
+split out of the branch because it also affects LIVE rows: without it,
+Kafka offset replay and connector redelivery re-date live events too.
 
 **Vendored files — do not edit here:** `corpus.json`, `goldens.json`, `decode.mjs`,
 `canonicalize.mjs` are synced byte-identical from countly-platform
