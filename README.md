@@ -22,6 +22,16 @@ the fix one click away.
 To scale: start more instances with the same `.env` and a unique `POD_ID`
 each, on separate machines (see Scaling with pods below).
 
+**Kubernetes**: ready-to-apply manifests live in `k8s/` —
+`k8s/migration.yaml` (Deployment + Service: pods keep serving the dashboard
+after completion for verification and sign-off; scale with
+`kubectl scale deployment/drill-migrator --replicas=N`) and `k8s/job.yaml`
+(fire-and-forget Job using `EXIT_ON_COMPLETE`). Pods coordinate through
+chunk leases in MongoDB, `POD_ID` defaults to the pod name, and abrupt
+kills/evictions are safe by design (chunk redo). Reach the dashboard with
+`kubectl port-forward svc/drill-migrator 8080:8080` — any pod shows the
+whole run.
+
 This README covers what you need BEFORE the dashboard exists (installing,
 env vars, starting the service, automation reference). Everything after —
 running, monitoring, troubleshooting, verifying — lives in the dashboard,

@@ -1,0 +1,39 @@
+# Drill migration on Kubernetes — Job variant (fire-and-forget automation).
+#
+# Requires the ConfigMap and Secret from k8s/migration.yaml.
+#
+# EXIT_ON_COMPLETE=true makes each pod exit 0 once every chunk of the run is
+# terminal, so the Job completes on its own. A crashed pod restarts
+# (OnFailure) and resumes from the ledger — crash-redo is the designed path.
+#
+# Note: when the Job finishes, the dashboard goes away with the pods. For an
+# operator-driven migration (watch progress, verify, sign off in the UI),
+# prefer the Deployment in k8s/migration.yaml.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: drill-migration
+spec:
+  parallelism: 3          # = pods working the run; scale across nodes
+  completions: 3          # keep equal to parallelism (every pod exits 0 on completion)
+  backoffLimit: 50        # crash-redo is normal operation, not failure — be generous
+  template:
+    metadata:
+      labels: { app: drill-migrator }
+    spec:
+      restartPolicy: OnFailure
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: migrator
+          image: your-registry/drill-migrator:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: EXIT_ON_COMPLETE
+              value: "true"
+          envFrom:
+            - configMapRef: { name: drill-migrator-config }
+            - secretRef: { name: drill-migrator-secrets }
+          resources:
+            requests: { cpu: "2", memory: 2Gi }
+            limits: { cpu: "4", memory: 6Gi }
