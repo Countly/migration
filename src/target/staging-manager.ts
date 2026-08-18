@@ -289,27 +289,6 @@ export class StagingManager {
     } catch { return null; }
   }
 
-  /**
-   * Sample of duplicate _id groups with their cd spread, for attribution:
-   * copies whose cd is all recent are live at-least-once artifacts (the
-   * platform's nightly EventDeduplicationJob cleans those); a copy with
-   * HISTORICAL cd involves migrated data and needs investigation.
-   */
-  async duplicateSample(boundaryMs: number, limit = 20): Promise<Array<{ _id: string; copies: number; migratedCopies: number; min_cd_ms: number; max_cd_ms: number }>> {
-    const res = await this.ch().query({
-      query: `SELECT _id, count() AS c,
-                     countIf(cd < fromUnixTimestamp64Milli({b:Int64})) AS mc,
-                     toUnixTimestamp64Milli(min(cd)) AS lo,
-                     toUnixTimestamp64Milli(max(cd)) AS hi
-              FROM ${this.fq(this.config.table)}
-              GROUP BY _id HAVING c > 1
-              ORDER BY mc DESC, c DESC LIMIT {lim:UInt32}`,
-      query_params: { b: boundaryMs, lim: limit },
-      format: 'JSONEachRow',
-    });
-    const rows = await res.json<{ _id: string; c: string; mc: string; lo: string; hi: string }>();
-    return rows.map((r) => ({ _id: r._id, copies: Number(r.c), migratedCopies: Number(r.mc), min_cd_ms: Number(r.lo), max_cd_ms: Number(r.hi) }));
-  }
 
   /** Rows live ingestion wrote recently (preflight: is new ingestion flowing?). */
   async countRecentLive(minutes: number): Promise<number> {
@@ -333,15 +312,50 @@ export class StagingManager {
     return Number(rows[0]?.n ?? 0);
   }
 
-  /** Total + distinct-id counts of the live table (exact, one query). */
-  async countAndUniq(): Promise<{ count: number; uniq: number }> {
-    const res = await this.ch().query({
-      query: `SELECT count() AS c, uniqExact(_id) AS u FROM ${this.fq(this.config.table)}`,
+  /**
+   * Exact duplicate statistics, memory-bounded for billion-row tables:
+   * scans partition by partition (legitimate duplicate copies always share
+   * their ts month — same document ⇒ same ts ⇒ same partition — so
+   * per-partition GROUP BY is exact for every duplicate class we act on,
+   * while a global uniqExact/GROUP BY over billions of ids is not safe).
+   */
+  async duplicateStats(boundaryMs: number, sampleLimit = 20): Promise<{
+    rows: number; duplicates: number;
+    sample: Array<{ _id: string; copies: number; migratedCopies: number; min_cd_ms: number; max_cd_ms: number }>;
+  }> {
+    const parts = await this.ch().query({
+      query: `SELECT partition_id AS partition, sum(rows) AS r FROM system.parts
+              WHERE database = {db:String} AND table = {t:String} AND active
+              GROUP BY partition_id ORDER BY partition_id`,
+      query_params: { db: this.config.database, t: this.config.table },
       format: 'JSONEachRow',
     });
-    const rows = await res.json<{ c: string; u: string }>();
-    return { count: Number(rows[0]?.c ?? 0), uniq: Number(rows[0]?.u ?? 0) };
+    const partitions = await parts.json<{ partition: string; r: string }>();
+    let rows = 0, duplicates = 0;
+    const sample: Array<{ _id: string; copies: number; migratedCopies: number; min_cd_ms: number; max_cd_ms: number }> = [];
+    for (const p of partitions) {
+      rows += Number(p.r);
+      const res = await this.ch().query({
+        query: `SELECT _id, count() AS c, countIf(cd < fromUnixTimestamp64Milli({b:Int64})) AS mc,
+                       toUnixTimestamp64Milli(min(cd)) AS lo, toUnixTimestamp64Milli(max(cd)) AS hi,
+                       sum(c - 1) OVER () AS excess
+                FROM (SELECT _id, cd FROM ${this.fq(this.config.table)} WHERE _partition_id = {p:String})
+                GROUP BY _id HAVING c > 1
+                ORDER BY mc DESC, c DESC LIMIT {lim:UInt32}`,
+        query_params: { b: boundaryMs, p: p.partition, lim: sampleLimit },
+        format: 'JSONEachRow',
+        clickhouse_settings: { max_bytes_before_external_group_by: '4000000000' },
+      });
+      const groups = await res.json<{ _id: string; c: string; mc: string; lo: string; hi: string; excess: string }>();
+      if (groups.length > 0) duplicates += Number(groups[0].excess);
+      for (const g of groups) {
+        if (sample.length >= sampleLimit) break;
+        sample.push({ _id: g._id, copies: Number(g.c), migratedCopies: Number(g.mc), min_cd_ms: Number(g.lo), max_cd_ms: Number(g.hi) });
+      }
+    }
+    return { rows, duplicates, sample };
   }
+
 
   /** Does the live target table exist / how many rows does it hold? */
   async targetTableInfo(): Promise<{ exists: boolean; rows: number }> {

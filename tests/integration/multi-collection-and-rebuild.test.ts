@@ -271,17 +271,20 @@ describe('multi-collection scoping + ledger rebuild', () => {
 
   it('verify attributes duplicates by cd boundary: live artifact / cross-cutover retry / migration defect', async () => {
     const nowMs = Date.now();
-    const mk = (id: string, cdMs: number) =>
-      `('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', '${id}', ${nowMs}, fromUnixTimestamp64Milli(${cdMs}))`;
+    // A duplicate always shares its ts with the original (a retry RESENDS the
+    // same event) — that shared ts month is what makes per-partition
+    // duplicate scanning exact.
+    const mk = (id: string, tsMs: number, cdMs: number) =>
+      `('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', '${id}', ${tsMs}, fromUnixTimestamp64Milli(${cdMs}))`;
     // 1) live at-least-once redelivery: same _id twice, NO migrated copy
     await ch.command({
       query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
-              VALUES ${mk('redelivered_1', nowMs)}, ${mk('redelivered_1', nowMs + 500)}`,
+              VALUES ${mk('redelivered_1', nowMs, nowMs)}, ${mk('redelivered_1', nowMs, nowMs + 500)}`,
     });
-    // 2) cross-cutover SDK retry: live copy of an event the migration copied
+    // 2) cross-cutover SDK retry: same event ts, post-cutover cd
     await ch.command({
       query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
-              VALUES ${mk('p_5', nowMs)}`,
+              VALUES ${mk('p_5', BASE + 5 * 60_000, nowMs)}`,
     });
 
     let verify = await orchestrator.verifyMigration();

@@ -118,6 +118,8 @@ export class ChunkOrchestrator {
   private fatalError: string | null = null;
   private multiCollection = false;
   private finishedAt = 0;
+  /** Live progress of a running verify (billion-scale runs take minutes). */
+  readonly verifyProgress = { running: false, checked: 0, total: 0, phase: '' };
   private stopping = false;
   private paused = false;
   private currentCollection: string | null = null;
@@ -1049,12 +1051,19 @@ export class ChunkOrchestrator {
    */
   async replayDlq(): Promise<{ replayed: number; stillFailing: number }> {
     const { dlq, staging, retryPolicy, config } = this.d;
-    const pending = await dlq.listPending(this.runId);
     let replayed = 0;
     let stillFailing = 0;
 
-    for (let i = 0; i < pending.length; i += 500) {
-      const batch = pending.slice(i, i + 500);
+    // Keyset drain: pages of 500 by _id so a large DLQ is fully processed
+    // (a plain limited fetch silently replayed only the first page). Entries
+    // that fail again keep status pending but sort behind the advancing
+    // cursor, so the loop always terminates.
+    let afterId: string | null = null;
+    for (;;) {
+      const batch = await dlq.listPendingAfter(this.runId, afterId, 500);
+      if (batch.length === 0) break;
+      afterId = batch[batch.length - 1]._id;
+      const batchKey = batch[0]._id;
       const rows: OutputRow[] = [];
       const ids: string[] = [];
       for (const entry of batch) {
@@ -1069,8 +1078,8 @@ export class ChunkOrchestrator {
       if (rows.length === 0) continue;
       try {
         await retryPolicy.execute(
-          () => staging.insertIntoLive(rows, `dlqreplay:${this.runId}:${i}`),
-          `dlq-replay-${i}`,
+          () => staging.insertIntoLive(rows, `dlqreplay:${batchKey}`),
+          `dlq-replay-${batchKey}`,
           this.logger,
           undefined,
           classifyError,
@@ -1081,7 +1090,7 @@ export class ChunkOrchestrator {
         // Isolate row-level failures within the replay batch too.
         for (let j = 0; j < rows.length; j++) {
           try {
-            await staging.insertIntoLive([rows[j]], `dlqreplay:${this.runId}:${i}:${j}`);
+            await staging.insertIntoLive([rows[j]], `dlqreplay:${batchKey}:${j}`);
             await dlq.markResolved([ids[j]], config.transform.version);
             replayed++;
           } catch (rowErr) {
@@ -1352,60 +1361,75 @@ export class ChunkOrchestrator {
     let unscopedSkipped = 0;
     const collectionCount = new Set(all.map((c) => c.collection)).size;
     const mismatches: Array<{ chunk: string; expected: number; live: number }> = [];
-    for (const chunk of all) {
-      if (chunk.status !== 'done' || this.isNullCdChunk(chunk as ChunkDoc)) continue;
-      const scope = this.scopeOf(chunk as ChunkDoc);
-      if (!scope && collectionCount > 1) { unscopedSkipped++; continue; }
-      const live = await staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd, scope);
-      const relaxed = byCollection.get(chunk.collection) === true;
-      const bad = relaxed ? live < chunk.rows_expected : live !== chunk.rows_expected;
-      checked++;
-      if (bad) mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live });
-    }
+    const targets = all.filter((chunk) => chunk.status === 'done' && !this.isNullCdChunk(chunk as ChunkDoc));
+    this.verifyProgress.running = true;
+    this.verifyProgress.total = targets.length;
+    this.verifyProgress.checked = 0;
+    this.verifyProgress.phase = 'recounting chunk windows';
+    try {
+      // Bounded concurrency: each window count is minmax-pruned and cheap,
+      // but a 10TB run has tens of thousands of them — sequential would take
+      // hours, unbounded would hammer ClickHouse.
+      const CONCURRENCY = 8;
+      let cursor = 0;
+      await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
+        for (;;) {
+          const i = cursor++;
+          if (i >= targets.length) return;
+          const chunk = targets[i];
+          const scope = this.scopeOf(chunk as ChunkDoc);
+          if (!scope && collectionCount > 1) { unscopedSkipped++; continue; }
+          const live = await staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd, scope);
+          const relaxed = byCollection.get(chunk.collection) === true;
+          const bad = relaxed ? live < chunk.rows_expected : live !== chunk.rows_expected;
+          checked++;
+          this.verifyProgress.checked = checked;
+          if (bad) mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live });
+        }
+      }));
 
-    const totals = await staging.countAndUniq();
+      this.verifyProgress.phase = 'scanning for duplicates (per partition)';
 
-    // Attribute duplicates by PROVENANCE, derived from cd: migrated rows all
-    // carry cd below the ledger's highest chunk window (the frozen source's
-    // max cd); live rows are stamped at post-cutover insert time. Copies
-    // below that boundary are migration-written. Three cases:
-    //   0 copies below → live at-least-once artifact (connector redelivery);
-    //     the platform's nightly EventDeduplicationJob cleans these.
-    //   1 copy below   → cross-cutover SDK retry: the same event reached
-    //     both stacks. One benign extra copy; reported, not our defect.
-    //   2+ copies below → the migration inserted the same doc twice — OUR
-    //     defect; verification fails.
-    // (Preflight's clock-skew check guards the boundary's validity.)
-    let duplicateSample: Array<Record<string, unknown>> = [];
+    // Duplicate detection + attribution, partition by partition — exact for
+    // every duplicate class we act on (copies of the same document share
+    // their ts month) and memory-bounded on billion-row tables, unlike a
+    // global uniqExact/GROUP BY. Attribution by cd against the ledger's
+    // end-of-migrated-data boundary:
+    //   0 copies below → live at-least-once artifact (nightly job cleans)
+    //   1 copy below   → cross-cutover SDK retry (benign, reported)
+    //   2+ copies below → migration defect; verification fails.
+    const boundaryMs = all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
+    const dup = await staging.duplicateStats(boundaryMs);
     let migrationDuplicates = 0;
-    if (totals.count !== totals.uniq) {
-      const boundaryMs = all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
-      duplicateSample = (await staging.duplicateSample(boundaryMs)).map((d) => {
-        if (d.migratedCopies >= 2) migrationDuplicates++;
-        return {
-          _id: d._id,
-          copies: d.copies,
-          migratedCopies: d.migratedCopies,
-          minCd: new Date(d.min_cd_ms).toISOString(),
-          maxCd: new Date(d.max_cd_ms).toISOString(),
-          verdict: d.migratedCopies === 0
-            ? 'live at-least-once artifact (nightly dedup job cleans these)'
-            : d.migratedCopies === 1
-              ? 'cross-cutover retry duplicate (event reached both stacks — one benign live copy)'
-              : 'MIGRATION DEFECT: same document migrated more than once — investigate',
-        };
-      });
-    }
+    const duplicateSample = dup.sample.map((d) => {
+      if (d.migratedCopies >= 2) migrationDuplicates++;
+      return {
+        _id: d._id,
+        copies: d.copies,
+        migratedCopies: d.migratedCopies,
+        minCd: new Date(d.min_cd_ms).toISOString(),
+        maxCd: new Date(d.max_cd_ms).toISOString(),
+        verdict: d.migratedCopies === 0
+          ? 'live at-least-once artifact (nightly dedup job cleans these)'
+          : d.migratedCopies === 1
+            ? 'cross-cutover retry duplicate (event reached both stacks — one benign live copy)'
+            : 'MIGRATION DEFECT: same document migrated more than once — investigate',
+      };
+    });
 
     return {
       ok: mismatches.length === 0 && migrationDuplicates === 0,
       checkedChunks: checked,
       unscopedSkipped,
       mismatches,
-      table: { rows: totals.count, distinctIds: totals.uniq, duplicates: totals.count - totals.uniq },
+      table: { rows: dup.rows, distinctIds: dup.rows - dup.duplicates, duplicates: dup.duplicates },
       duplicateSample,
       migrationDuplicates,
     };
+    } finally {
+      this.verifyProgress.running = false;
+      this.verifyProgress.phase = '';
+    }
   }
 
   // -------------------------------------------------------------------------

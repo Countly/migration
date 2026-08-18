@@ -65,7 +65,25 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
   });
 
   app.get('/api/preflight', async () => deps.orchestrator.preflight());
-  app.get('/api/verify', async () => deps.orchestrator.verifyMigration());
+
+  // Verify runs as a background task: a 10TB run recounts tens of thousands
+  // of windows — minutes of work that must not sit inside one HTTP request.
+  const verifyState: { status: string; result: Record<string, unknown> | null; error: string | null } =
+    { status: 'not_run', result: null, error: null };
+  app.post('/control/verify', async () => {
+    if (verifyState.status === 'running') return { started: false, reason: 'already running' };
+    verifyState.status = 'running'; verifyState.result = null; verifyState.error = null;
+    void deps.orchestrator.verifyMigration()
+      .then((r) => { verifyState.result = r; verifyState.status = 'completed'; })
+      .catch((e) => { verifyState.error = (e as Error).message; verifyState.status = 'failed'; });
+    return { started: true };
+  });
+  app.get('/api/verify', async () => ({
+    status: verifyState.status,
+    progress: deps.orchestrator.verifyProgress,
+    result: verifyState.result,
+    error: verifyState.error,
+  }));
 
   // The console IS the product's front door — serve it at the root.
   // /viz stays as an alias (docs, bookmarks, muscle memory).
@@ -505,7 +523,17 @@ async function runPreflight(btn) {
 async function runVerify(btn) {
   btn.disabled = true; btn.textContent = 'Verifying…';
   try {
-    const v = await fetch('/api/verify').then(r => r.json());
+    await fetch('/control/verify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    let vr;
+    for (;;) {
+      vr = await fetch('/api/verify').then(r => r.json());
+      if (vr.status === 'completed' || vr.status === 'failed') break;
+      const p = vr.progress || {};
+      btn.textContent = 'Verifying\u2026 ' + fmt(p.checked || 0) + '/' + fmt(p.total || 0) + (p.phase ? ' \u00b7 ' + p.phase : '');
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    if (vr.status === 'failed') { toast('\u274c verify failed: ' + vr.error); btn.disabled = false; btn.textContent = 'Verify migration'; return; }
+    const v = vr.result;
     const ok = v.ok;
     document.getElementById('verify-result').innerHTML =
       '<div class="check"><span class="ic">' + (ok ? '\\u2705' : '\\u274c') + '</span><span class="lbl">' +

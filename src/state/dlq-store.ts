@@ -75,6 +75,13 @@ export class DlqStore {
     }
   }
 
+  /** Keyset page for full-drain loops: pending entries with _id > after. */
+  async listPendingAfter(runId: string, afterId: string | null, limit = 500): Promise<DlqDoc[]> {
+    const filter: Record<string, unknown> = { run_id: runId, status: 'pending' };
+    if (afterId) filter._id = { $gt: afterId };
+    return this.c().find(filter).sort({ _id: 1 }).limit(limit).toArray();
+  }
+
   async listPending(runId: string, limit = 10_000, skip = 0): Promise<DlqDoc[]> {
     // Stable order so pagination pages don't shuffle between polls
     return this.c().find({ run_id: runId, status: 'pending' }).sort({ _id: 1 }).skip(skip).limit(limit).toArray();
