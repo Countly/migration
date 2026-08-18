@@ -242,7 +242,11 @@ export class ChunkOrchestrator {
       while (this.paused && !this.stopping) await sleep(1_000);
       await this.reclaimExpiredLeases(collection, log);
 
-      const chunk = await ledger.claimNext(this.runId, collection, this.podId, config.ledger.leaseSec);
+      // The null-cd sweep must run strictly after every regular chunk is
+      // terminal — its rows land inside regular chunks' cd windows and would
+      // poison their verify-then-attach checks.
+      const regularsRemaining = await ledger.countRegularNonTerminal(this.runId, collection);
+      const chunk = await ledger.claimNext(this.runId, collection, this.podId, config.ledger.leaseSec, regularsRemaining > 0);
       if (chunk && chunk.attempts > MAX_CHUNK_ATTEMPTS && this.isSplittable(chunk)) {
         // Poison-pill quarantine: this chunk keeps killing the process (a
         // clean data error would have failed it long before exhausting
@@ -288,6 +292,7 @@ export class ChunkOrchestrator {
       this.lastStatusCounts = await ledger.statusCounts(this.runId, collection);
     }
 
+    await this.sweepOrphanStaging(collection);
     this.lastStatusCounts = await ledger.statusCounts(this.runId, collection);
     log.info({ statusCounts: this.lastStatusCounts }, 'Collection complete');
     this.currentCollection = null;
@@ -776,6 +781,39 @@ export class ChunkOrchestrator {
     this.chunksDone++;
   }
 
+  /** Delete the live rows of a collection's null-cd docs, precisely by id. */
+  private async purgeNullCdRows(collection: string): Promise<void> {
+    const { MongoClient } = await import('mongodb');
+    const mc = new MongoClient(this.d.config.source.uri);
+    try {
+      await mc.connect();
+      const coll = mc.db(this.d.config.source.db).collection(collection);
+      const cursor = coll.find(
+        { $or: [{ cd: null }, { cd: { $exists: false } }] },
+        { projection: { _id: 1 } },
+      ).batchSize(10_000);
+      let batch: string[] = [];
+      for await (const doc of cursor) {
+        batch.push(String(doc._id));
+        if (batch.length >= 10_000) { await this.d.staging.deleteLiveByIds(batch); batch = []; }
+      }
+      if (batch.length > 0) await this.d.staging.deleteLiveByIds(batch);
+    } finally {
+      await mc.close().catch(() => {});
+    }
+  }
+
+  /** Drop staging tables orphaned by crash-between-done-and-drop. */
+  private async sweepOrphanStaging(collection: string): Promise<void> {
+    if (this.dryRun) return;
+    const prefix = `${this.d.config.target.table}__stg_${shortHash(`${this.runId}:${collection}`)}_`;
+    const orphans = await this.d.staging.listStagingTables(prefix).catch(() => [] as string[]);
+    for (const t of orphans) {
+      await this.d.staging.dropStaging(t).catch(() => {});
+    }
+    if (orphans.length > 0) this.logger.info({ orphans: orphans.length }, 'Dropped orphaned staging tables');
+  }
+
   // -------------------------------------------------------------------------
   // Circuit breaker bookkeeping
   // -------------------------------------------------------------------------
@@ -859,9 +897,11 @@ export class ChunkOrchestrator {
       const all = await ledger.listAll(this.runId);
       for (const c of all) if (c.status === 'failed') { collections.add(c.collection); failedAll.push(c as ChunkDoc); }
     }
+    const collectionsNeedingSweepReset = new Set<string>();
     for (const chunk of failedAll) {
       if (!this.isNullCdChunk(chunk as ChunkDoc) && !this.dryRun) {
         await staging.deleteLiveCdRange(chunk.lower_cd, chunk.upper_cd);
+        collectionsNeedingSweepReset.add(chunk.collection);
       }
       const reset = await ledger.transition(chunk._id, 'failed', 'pending', {
         pod_id: null,
@@ -873,6 +913,20 @@ export class ChunkOrchestrator {
         last_error: null,
       });
       if (reset) retried++;
+    }
+
+    // A regular chunk's cd-window purge also deletes any null-cd sweep rows
+    // whose derived cd fell inside that window — reset the sweep too, purging
+    // its remaining rows precisely by id (it has no cd window of its own).
+    for (const collection of collectionsNeedingSweepReset) {
+      const sentinel = await ledger.getSentinel(this.runId, collection);
+      if (!sentinel || sentinel.status !== 'done') continue;
+      await this.purgeNullCdRows(collection);
+      await ledger.transition(sentinel._id, 'done', 'pending', {
+        pod_id: null, staging_table: null, partitions: [], attached: [],
+        attach_method: null, attempts: 0, last_error: 'reset alongside regular-chunk retry (cd-window purge overlaps sweep rows)',
+      });
+      this.logger.info({ collection }, 'Null-cd sweep reset alongside regular-chunk retry');
     }
     this.consecutiveFailed = 0;
     this.resume();

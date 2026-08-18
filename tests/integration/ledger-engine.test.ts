@@ -184,6 +184,11 @@ describe('ledger engine end-to-end', () => {
     // Docs with no cd value — must be picked up by the null-cd sweep chunk
     docs.push({ _id: 'nocd_1', a: 'app1', e: 'legacy_event', uid: 'u1', did: 'd', ts: base - 86_400_000 });
     docs.push({ _id: 'nocd_2', a: 'app1', e: 'legacy_event', uid: 'u2', did: 'd', ts: base - 86_400_000, cd: null });
+    // REGRESSION: null-cd doc whose derived cd (from ts) lands INSIDE the
+    // regular chunks' windows. If the sweep ran before regular chunks, its
+    // row would poison their verify-then-attach check → silently missing
+    // data. The sweep must be ordered strictly last.
+    docs.push({ _id: 'nocd_overlap', a: 'app1', e: 'legacy_event', uid: 'u3', did: 'd', ts: base + 120_000 });
     await coll.insertMany(docs as never[]);
     await coll.createIndex({ cd: 1, _id: 1 });
 
@@ -240,16 +245,16 @@ describe('ledger engine end-to-end', () => {
       format: 'JSONEachRow',
     });
     const [row] = await res.json<{ t: string; u: string }>();
-    // clean docs + coercion doc + 2 null-cd docs land; the 3 poisoned do not
-    expect(Number(row.t)).toBe(CLEAN_DOCS + 3);
-    expect(Number(row.u)).toBe(CLEAN_DOCS + 3); // zero duplicates
+    // clean docs + coercion doc + 3 null-cd docs land; the 3 poisoned do not
+    expect(Number(row.t)).toBe(CLEAN_DOCS + 4);
+    expect(Number(row.u)).toBe(CLEAN_DOCS + 4); // zero duplicates
 
     // Null-cd docs arrived via the sweep chunk
     const nocd = await ch.query({
       query: `SELECT count() AS c FROM ${DB}.drill_events WHERE _id LIKE 'nocd_%'`,
       format: 'JSONEachRow',
     });
-    expect(Number((await nocd.json<{ c: string }>())[0].c)).toBe(2);
+    expect(Number((await nocd.json<{ c: string }>())[0].c)).toBe(3);
 
     // DLQ carries the poisoned docs WITH their raw source docs
     const pending = await dlq.listPending('e2e-1');

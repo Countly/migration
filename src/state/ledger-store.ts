@@ -127,9 +127,16 @@ export class LedgerStore {
     collection: string,
     podId: string,
     leaseSec: number,
+    excludeSentinel = false,
   ): Promise<ChunkDoc | null> {
+    const filter: Record<string, unknown> = { run_id: runId, collection, status: 'pending' };
+    // The null-cd sweep (sentinel bounds lower_cd=-1) must run strictly AFTER
+    // all regular chunks: its rows carry cd derived from ts, which lands
+    // inside regular chunks' cd windows and would poison their
+    // verify-then-attach checks.
+    if (excludeSentinel) filter.lower_cd = { $gte: 0 };
     return this.c().findOneAndUpdate(
-      { run_id: runId, collection, status: 'pending' },
+      filter,
       {
         $set: {
           status: 'in_progress',
@@ -267,6 +274,21 @@ export class LedgerStore {
       )
       .sort({ collection: 1, idx: 1 })
       .toArray() as never;
+  }
+
+  /** Non-terminal REGULAR (non-sentinel) chunks — gates the null-cd sweep. */
+  async countRegularNonTerminal(runId: string, collection: string): Promise<number> {
+    return this.c().countDocuments({
+      run_id: runId,
+      collection,
+      lower_cd: { $gte: 0 },
+      status: { $in: ['pending', 'in_progress', 'written', 'attaching'] },
+    });
+  }
+
+  /** The null-cd sentinel chunk of a collection, if any. */
+  async getSentinel(runId: string, collection: string): Promise<ChunkDoc | null> {
+    return this.c().findOne({ run_id: runId, collection, lower_cd: -1, upper_cd: 0 });
   }
 
   /** Per-pod activity summary (Pods panel): who did what, who is alive. */

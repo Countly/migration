@@ -312,6 +312,26 @@ export class StagingManager {
     }
   }
 
+  /** Precise purge by row ids (null-cd sweep redo — no cd window exists). */
+  async deleteLiveByIds(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.ch().command({
+      query: `DELETE FROM ${this.fq(this.config.table)} WHERE _id IN {ids:Array(String)}`,
+      query_params: { ids },
+    });
+  }
+
+  /** Staging tables left behind by crashes (crash between done and drop). */
+  async listStagingTables(prefix: string): Promise<string[]> {
+    const res = await this.ch().query({
+      query: `SELECT name FROM system.tables WHERE database = {db:String} AND name LIKE {p:String}`,
+      query_params: { db: this.config.database, p: `${prefix}%` },
+      format: 'JSONEachRow',
+    });
+    const rows = await res.json<{ name: string }>();
+    return rows.map((r) => r.name);
+  }
+
   /** Grouped verification: rows in the live table within given cd bounds. */
   async countLiveInCdRange(lowerCdMs: number, upperCdMs: number): Promise<number> {
     const res = await this.ch().query({
