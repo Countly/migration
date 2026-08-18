@@ -259,7 +259,7 @@ const PAGE = `<!doctype html>
     <button class="btn" id="btn-pause" onclick="control('pause', 'Paused', this)">Pause</button>
     <button class="btn primary" id="btn-resume" onclick="control('resume', 'Resumed', this)">Resume</button>
     <button class="btn" id="btn-retry" onclick="control('retry-failed', 'Failed chunks queued for redo', this, true)">Retry failed chunks</button>
-    <button class="btn" id="btn-replay" onclick="control('replay-dlq', 'DLQ replay finished', this)">Replay DLQ</button>
+    <button class="btn" id="btn-replay" onclick="control('replay-dlq', 'DLQ replay started — progress in the DLQ panel below', this)">Replay DLQ</button>
     <button class="btn" id="btn-waive" onclick="control('waive-dlq', 'Pending DLQ entries waived', this, true)">Waive pending DLQ</button>
     <span class="btn-note">Destructive actions ask for a second click. Every action shows a receipt.</span>
   </div>
@@ -389,7 +389,7 @@ const PAGE = `<!doctype html>
   <details class="scenario"><summary>📄 Some documents won't migrate (DLQ pending &gt; 0)</summary>
     <div class="body"><p><b>What happened:</b> documents ClickHouse or the transform rejected were isolated automatically and stored in the dead-letter queue <b>with their full raw source</b> — inspect them in the Overview tab.</p>
     <p><b>Do:</b> after a transform fix (or after editing the stored raw docs):</p>
-    <span class="act"><button class="btn" onclick="control('replay-dlq','DLQ replay finished',this)">Replay DLQ</button>
+    <span class="act"><button class="btn" onclick="control('replay-dlq','DLQ replay started — progress in the Overview DLQ panel',this)">Replay DLQ</button>
     <button class="btn" onclick="control('waive-dlq','Pending DLQ entries waived',this,true)">Waive pending DLQ</button></span>
     <p>Waiving is the explicit decision that they will not migrate — raw docs are kept as the record.</p>
     <p><b>Always replay here, in the tool</b> — replaying historical documents through Countly's own ingestion would re-stamp their <code>cd</code> to today and duplicate history at the wrong date.</p></div>
