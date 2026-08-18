@@ -267,7 +267,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     expect(verify.ok).toBe(true);
   }, 120_000);
 
-  it('verify attributes duplicates by provenance: live artifact / cross-cutover retry / migration defect', async () => {
+  it('verify attributes duplicates by cd boundary: live artifact / cross-cutover retry / migration defect', async () => {
     const nowMs = Date.now();
     const mk = (id: string, cdMs: number) =>
       `('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', '${id}', ${nowMs}, fromUnixTimestamp64Milli(${cdMs}))`;
@@ -293,22 +293,23 @@ describe('multi-collection scoping + ledger rebuild', () => {
     expect(byId.get('p_5')!.migratedCopies).toBe(1);
     expect(byId.get('p_5')!.verdict).toContain('cross-cutover retry');
 
-    // 3) a REAL migration defect: two migrated-flagged copies of one _id
+    // 3) a REAL migration defect looks like: two copies BELOW the boundary
+    // (both written by migration — same doc migrated twice)
     await ch.command({
-      query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd, migrated)
-              VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', 'p_6', ${nowMs}, fromUnixTimestamp64Milli(${nowMs}), true)`,
+      query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
+              VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', 'p_6', ${BASE + 6 * 60_000}, fromUnixTimestamp64Milli(${BASE + 6 * 60_000 + 1}))`,
     });
     verify = await orchestrator.verifyMigration();
     expect(verify.migrationDuplicates).toBe(1);
     expect(verify.ok).toBe(false);
 
-    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'redelivered_1' OR (_id IN ('p_5','p_6') AND cd >= fromUnixTimestamp64Milli(${nowMs}))` });
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'redelivered_1' OR (_id = 'p_5' AND cd >= fromUnixTimestamp64Milli(${nowMs})) OR (_id = 'p_6' AND cd = fromUnixTimestamp64Milli(${BASE + 6 * 60_000 + 1}))` });
   }, 60_000);
 
-  it('attach-recovery staged-ids check ignores live copies of the same _id (cross-cutover retry)', async () => {
+  it('attach-recovery pair check ignores live copies of the same _id (cross-cutover retry)', async () => {
     // The mixing vector: a crash during attach + an SDK retry that landed the
-    // same _id in live (same ts → same month partition). Without provenance
-    // filtering, recovery would see the live copy and skip the attach.
+    // same _id in live (same ts → same month partition). Matching (_id, cd)
+    // pairs is exact: the retry copy's cd differs by construction.
     const tsMs = BASE + 42 * 60_000;
     const stagingTable = 'drill_events__stg_precision_test';
     await staging.createStaging(stagingTable);
@@ -325,7 +326,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
       query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
               VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u', 'd', 'retry_victim', ${tsMs}, fromUnixTimestamp64Milli(${Date.now()}))`,
     });
-    expect(await staging.countLiveByStagedIds(stagingTable, partitionId)).toBe(0); // pre-fix: 1 → skipped attach → data loss
+    expect(await staging.countLiveByStagedIds(stagingTable, partitionId)).toBe(0); // id-only matching: 1 → skipped attach → data loss
 
     // once the migrated copy IS live, recovery correctly reports it
     await staging.insertIntoLive([{

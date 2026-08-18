@@ -25,6 +25,7 @@ import type { Config } from '../config/schema.ts';
 import type { MongoReader } from '../source/mongo-reader.ts';
 import type { HashResolver, CollectionDefaults } from '../transform/hash-resolver.ts';
 import { chScopeOf, type ChScope } from '../transform/hash-resolver.ts';
+import { toEpochMillis, clampDateTime64 } from '../transform/validators.ts';
 import type { RetryPolicy } from './retry-policy.ts';
 import type { ClickHousePressure, PressureState } from '../target/clickhouse-pressure.ts';
 import { LedgerStore, type ChunkDoc } from '../state/ledger-store.ts';
@@ -184,15 +185,6 @@ export class ChunkOrchestrator {
       );
     } else {
       await this.d.staging.runDedupCanary();
-      const counts = await this.d.ledger.statusCounts(this.runId);
-      if ((counts.done ?? 0) > 0 && (await this.d.staging.countMigrated()) === 0) {
-        throw new Error(
-          'This run has completed chunks but the live table has zero migrated-flagged rows — ' +
-          'it predates the provenance flag. Either backfill the flag ' +
-          '(ALTER TABLE <live table> UPDATE migrated = true WHERE cd < <cutover time>) ' +
-          'or start a fresh LEDGER_RUN_ID.',
-        );
-      }
       this.startInvariantMonitor();
     }
 
@@ -829,14 +821,14 @@ export class ChunkOrchestrator {
     const db = this.d.mongoReader.getDatabase();
     const cursor = db.collection(collection).find(
       { cd: { $gte: new Date(lowerCd), $lt: new Date(upperCd) } },
-      { projection: { _id: 1 } },
+      { projection: { _id: 1, cd: 1 } },
     ).batchSize(10_000);
-    let ids: string[] = [];
+    let pairs: Array<{ id: string; cdMs: number }> = [];
     for await (const doc of cursor) {
-      ids.push(String(doc._id));
-      if (ids.length >= 10_000) { await this.d.staging.deleteLiveByIds(ids); ids = []; }
+      pairs.push({ id: String(doc._id), cdMs: (doc.cd as Date).getTime() });
+      if (pairs.length >= 10_000) { await this.d.staging.deleteLiveByPairs(pairs); pairs = []; }
     }
-    await this.d.staging.deleteLiveByIds(ids);
+    await this.d.staging.deleteLiveByPairs(pairs);
   }
 
   private async purgeNullCdRows(collection: string): Promise<void> {
@@ -845,16 +837,21 @@ export class ChunkOrchestrator {
     try {
       await mc.connect();
       const coll = mc.db(this.d.config.source.db).collection(collection);
+      // The sweep wrote these rows with cd derived from ts (the transform's
+      // fallback) — reconstruct the same pairs so the purge is provenance-
+      // exact and can never touch a live row sharing an id.
       const cursor = coll.find(
         { $or: [{ cd: null }, { cd: { $exists: false } }] },
-        { projection: { _id: 1 } },
+        { projection: { _id: 1, ts: 1 } },
       ).batchSize(10_000);
-      let batch: string[] = [];
+      let batch: Array<{ id: string; cdMs: number }> = [];
       for await (const doc of cursor) {
-        batch.push(String(doc._id));
-        if (batch.length >= 10_000) { await this.d.staging.deleteLiveByIds(batch); batch = []; }
+        const tsMillis = toEpochMillis(doc.ts);
+        if (tsMillis === null || tsMillis <= 0) continue; // never transformed → never inserted
+        batch.push({ id: String(doc._id), cdMs: clampDateTime64(tsMillis) });
+        if (batch.length >= 10_000) { await this.d.staging.deleteLiveByPairs(batch); batch = []; }
       }
-      if (batch.length > 0) await this.d.staging.deleteLiveByIds(batch);
+      if (batch.length > 0) await this.d.staging.deleteLiveByPairs(batch);
     } finally {
       await mc.close().catch(() => {});
     }
@@ -1163,6 +1160,26 @@ export class ChunkOrchestrator {
       for (const name of collections) {
         nullCd += await db.collection(name).countDocuments({ cd: null }).catch(() => 0);
       }
+      // Clock sanity: every provenance decision rests on live cd (insert
+      // time) being newer than all source cd. A source containing cd values
+      // at/over ClickHouse's present means skewed clocks or a source that is
+      // still ingesting — both invalidate the boundary.
+      let maxSourceCd = 0;
+      for (const name of collections) {
+        const [top] = await db.collection(name).find({ cd: { $type: 'date' } })
+          .sort({ cd: -1 }).limit(1).project({ cd: 1 }).toArray();
+        if (top?.cd instanceof Date) maxSourceCd = Math.max(maxSourceCd, top.cd.getTime());
+      }
+      const chNow = await this.d.staging.serverNowMs().catch(() => 0);
+      const skewOk = maxSourceCd === 0 || chNow === 0 || maxSourceCd < chNow - 60_000;
+      checks.push({
+        id: 'clock',
+        label: 'Source frozen & clocks sane (cd boundary)',
+        status: skewOk ? 'pass' : 'fail',
+        detail: skewOk
+          ? `newest source cd ${maxSourceCd ? new Date(maxSourceCd).toISOString() : 'n/a'} is safely behind ClickHouse server time`
+          : `newest source cd ${new Date(maxSourceCd).toISOString()} is within 60s of ClickHouse server time (${new Date(chNow).toISOString()}) — source still ingesting or clocks skewed; the migrated/live cd boundary is NOT trustworthy yet`,
+      });
       checks.push({
         id: 'nullcd',
         label: 'Documents without cd (outliers)',
@@ -1282,20 +1299,22 @@ export class ChunkOrchestrator {
 
     const totals = await staging.countAndUniq();
 
-    // Attribute duplicates by PROVENANCE (the migrated flag — exact, not
-    // heuristic). Three cases:
-    //   0 migrated copies  → live at-least-once artifact (connector
-    //     redelivery); the platform's nightly EventDeduplicationJob cleans
-    //     these. Not a migration defect.
-    //   1 migrated copy    → cross-cutover SDK retry: the same event reached
-    //     the old stack (→ migrated) and the new stack (→ live). One benign
-    //     extra copy; reported, not a migration defect.
-    //   2+ migrated copies → the migration inserted the same doc twice —
-    //     OUR defect; verification fails.
+    // Attribute duplicates by PROVENANCE, derived from cd: migrated rows all
+    // carry cd below the ledger's highest chunk window (the frozen source's
+    // max cd); live rows are stamped at post-cutover insert time. Copies
+    // below that boundary are migration-written. Three cases:
+    //   0 copies below → live at-least-once artifact (connector redelivery);
+    //     the platform's nightly EventDeduplicationJob cleans these.
+    //   1 copy below   → cross-cutover SDK retry: the same event reached
+    //     both stacks. One benign extra copy; reported, not our defect.
+    //   2+ copies below → the migration inserted the same doc twice — OUR
+    //     defect; verification fails.
+    // (Preflight's clock-skew check guards the boundary's validity.)
     let duplicateSample: Array<Record<string, unknown>> = [];
     let migrationDuplicates = 0;
     if (totals.count !== totals.uniq) {
-      duplicateSample = (await staging.duplicateSample()).map((d) => {
+      const boundaryMs = all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
+      duplicateSample = (await staging.duplicateSample(boundaryMs)).map((d) => {
         if (d.migratedCopies >= 2) migrationDuplicates++;
         return {
           _id: d._id,

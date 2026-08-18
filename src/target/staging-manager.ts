@@ -51,14 +51,7 @@ export class StagingManager {
       request_timeout: this.config.queryTimeoutMs,
     });
     await this.client.ping();
-    // Provenance column: migrated rows are flagged so no check can ever
-    // confuse them with live-ingested rows (same _id via cross-cutover SDK
-    // retries lands in the same ts-month partition). Metadata-only ALTER —
-    // instant on any size table; live inserts simply default to false.
-    await this.client.command({
-      query: `ALTER TABLE ${this.fq(this.config.table)} ADD COLUMN IF NOT EXISTS migrated Bool DEFAULT false`,
-    });
-    this.logger.info('StagingManager connected (sync inserts, migrated column ensured)');
+    this.logger.info('StagingManager connected (sync inserts)');
   }
 
   async close(): Promise<void> {
@@ -155,7 +148,7 @@ export class StagingManager {
   async insertIntoLive(rows: OutputRow[], dedupToken: string): Promise<void> {
     await this.ch().insert({
       table: this.config.table,
-      values: rows.map((r) => ({ ...r, migrated: true })),
+      values: rows,
       format: 'JSONEachRow',
       clickhouse_settings: { insert_deduplication_token: dedupToken },
     });
@@ -185,7 +178,7 @@ export class StagingManager {
   ): Promise<void> {
     await this.ch().insert({
       table: stagingTable,
-      values: rows.map((r) => ({ ...r, migrated: true })),
+      values: rows,
       format: 'JSONEachRow',
       clickhouse_settings: { insert_deduplication_token: dedupToken },
       query_id: queryId,
@@ -220,15 +213,18 @@ export class StagingManager {
   }
 
   /**
-   * Attach-recovery check: are any of this staging partition's row ids
-   * already live? Id-based, so it is precise for THIS chunk regardless of
-   * sibling collections sharing the month partition and cd window.
+   * Attach-recovery check: are any of this staging partition's rows already
+   * live? Matches (_id, cd) PAIRS — exact provenance with no schema changes:
+   * an id alone is ambiguous (a cross-cutover SDK retry lands the same _id
+   * in the same ts-month partition), but the retry copy's cd is stamped at
+   * post-cutover insert time and can never equal the staged row's historical
+   * cd. Also precise across sibling collections sharing the partition.
    */
   async countLiveByStagedIds(stagingTable: string, partitionId: string): Promise<number> {
     const res = await this.ch().query({
       query: `SELECT count() AS c FROM ${this.fq(this.config.table)}
-              WHERE _partition_id = {pid:String} AND migrated
-                AND _id IN (SELECT _id FROM ${this.fq(stagingTable)} WHERE _partition_id = {pid:String} LIMIT 100)`,
+              WHERE _partition_id = {pid:String}
+                AND (_id, cd) IN (SELECT _id, cd FROM ${this.fq(stagingTable)} WHERE _partition_id = {pid:String} LIMIT 100)`,
       query_params: { pid: partitionId },
       format: 'JSONEachRow',
     });
@@ -276,7 +272,6 @@ export class StagingManager {
       query: `DELETE FROM ${this.fq(this.config.table)}
               WHERE cd >= fromUnixTimestamp64Milli({lo:Int64})
                 AND cd <  fromUnixTimestamp64Milli({hi:Int64})
-                AND migrated
                 ${this.scopeSql(scope)}`,
       query_params: { lo: lowerCdMs, hi: upperCdMs, ...this.scopeParams(scope) },
     });
@@ -300,29 +295,30 @@ export class StagingManager {
    * platform's nightly EventDeduplicationJob cleans those); a copy with
    * HISTORICAL cd involves migrated data and needs investigation.
    */
-  async duplicateSample(limit = 20): Promise<Array<{ _id: string; copies: number; migratedCopies: number; min_cd_ms: number; max_cd_ms: number }>> {
+  async duplicateSample(boundaryMs: number, limit = 20): Promise<Array<{ _id: string; copies: number; migratedCopies: number; min_cd_ms: number; max_cd_ms: number }>> {
     const res = await this.ch().query({
-      query: `SELECT _id, count() AS c, countIf(migrated) AS mc,
+      query: `SELECT _id, count() AS c,
+                     countIf(cd < fromUnixTimestamp64Milli({b:Int64})) AS mc,
                      toUnixTimestamp64Milli(min(cd)) AS lo,
                      toUnixTimestamp64Milli(max(cd)) AS hi
               FROM ${this.fq(this.config.table)}
               GROUP BY _id HAVING c > 1
               ORDER BY mc DESC, c DESC LIMIT {lim:UInt32}`,
-      query_params: { lim: limit },
+      query_params: { b: boundaryMs, lim: limit },
       format: 'JSONEachRow',
     });
     const rows = await res.json<{ _id: string; c: string; mc: string; lo: string; hi: string }>();
     return rows.map((r) => ({ _id: r._id, copies: Number(r.c), migratedCopies: Number(r.mc), min_cd_ms: Number(r.lo), max_cd_ms: Number(r.hi) }));
   }
 
-  /** Total migrated-flagged rows in the live table. */
-  async countMigrated(): Promise<number> {
+  /** ClickHouse server wall-clock (preflight clock-skew check). */
+  async serverNowMs(): Promise<number> {
     const res = await this.ch().query({
-      query: `SELECT count() AS c FROM ${this.fq(this.config.table)} WHERE migrated`,
+      query: `SELECT toUnixTimestamp64Milli(now64(3)) AS n`,
       format: 'JSONEachRow',
     });
-    const rows = await res.json<{ c: string }>();
-    return Number(rows[0]?.c ?? 0);
+    const rows = await res.json<{ n: string }>();
+    return Number(rows[0]?.n ?? 0);
   }
 
   /** Total + distinct-id counts of the live table (exact, one query). */
@@ -345,12 +341,21 @@ export class StagingManager {
     }
   }
 
-  /** Precise purge by row ids (null-cd sweep redo — no cd window exists). */
-  async deleteLiveByIds(ids: string[]): Promise<void> {
-    if (ids.length === 0) return;
+  /**
+   * Precise purge by (_id, cd) pairs — used where no cd window exists (the
+   * null-cd sweep) or the collection is unresolvable. Pair matching means a
+   * live cross-cutover retry copy (same _id, post-cutover cd) is untouchable.
+   */
+  async deleteLiveByPairs(pairs: Array<{ id: string; cdMs: number }>): Promise<void> {
+    if (pairs.length === 0) return;
+    // Two parallel arrays zipped server-side — the HTTP interface cannot
+    // parse a JS array-of-arrays as Array(Tuple(...)).
     await this.ch().command({
-      query: `DELETE FROM ${this.fq(this.config.table)} WHERE migrated AND _id IN {ids:Array(String)}`,
-      query_params: { ids },
+      query: `DELETE FROM ${this.fq(this.config.table)}
+              WHERE (_id, toUnixTimestamp64Milli(cd)) IN (
+                SELECT arrayJoin(arrayZip({ids:Array(String)}, {cds:Array(Int64)}))
+              )`,
+      query_params: { ids: pairs.map((p) => p.id), cds: pairs.map((p) => p.cdMs) },
     });
   }
 
@@ -371,7 +376,6 @@ export class StagingManager {
       query: `SELECT count() AS c FROM ${this.fq(this.config.table)}
               WHERE cd >= fromUnixTimestamp64Milli({lo:Int64})
                 AND cd <  fromUnixTimestamp64Milli({hi:Int64})
-                AND migrated
                 ${this.scopeSql(scope)}`,
       query_params: { lo: lowerCdMs, hi: upperCdMs, ...this.scopeParams(scope) },
       format: 'JSONEachRow',
@@ -391,7 +395,7 @@ export class StagingManager {
       const page = ids.slice(i, i + 10_000);
       const res = await this.ch().query({
         query: `SELECT _id, toUnixTimestamp64Milli(cd) AS cd_ms FROM ${this.fq(this.config.table)}
-                WHERE migrated AND _id IN {ids:Array(String)}`,
+                WHERE _id IN {ids:Array(String)}`,
         query_params: { ids: page },
         format: 'JSONEachRow',
       });
