@@ -346,7 +346,8 @@ const PAGE = `<!doctype html>
     <p><b>Do:</b> after a transform fix (or after editing the stored raw docs):</p>
     <span class="act"><button class="btn" onclick="control('replay-dlq','DLQ replay finished',this)">Replay DLQ</button>
     <button class="btn" onclick="control('waive-dlq','Pending DLQ entries waived',this,true)">Waive pending DLQ</button></span>
-    <p>Waiving is the explicit decision that they will not migrate — raw docs are kept as the record.</p></div>
+    <p>Waiving is the explicit decision that they will not migrate — raw docs are kept as the record.</p>
+    <p><b>Always replay here, in the tool</b> — replaying historical documents through Countly's own ingestion would re-stamp their <code>cd</code> to today and duplicate history at the wrong date.</p></div>
   </details>
 
   <details class="scenario"><summary>⛔ The engine paused itself (circuit breaker)</summary>

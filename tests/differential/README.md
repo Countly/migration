@@ -4,10 +4,19 @@ Drill migration overhaul item **D4** ([#6](https://github.com/Countly/migration/
 
 `differential.test.ts` asserts that this repo's transform
 (`src/transform/normalize.ts`) reproduces, for every document in the shared fixture
-corpus, exactly the canonical `countly_drill.drill_events` row that countly-platform's
-live ingestion normalization (`api/utils/eventTransformer.ts`) produces. During
-cutover the same Mongo document can reach ClickHouse through both pipelines, so the
-rows must be byte-identical or dedup breaks.
+corpus, exactly the canonical `countly_drill.drill_events` row of the agreed
+normalization spec.
+
+**Status of the platform side:** the spec was co-developed with a rewrite of
+countly-platform's `api/utils/eventTransformer.ts` (branch
+`claude/jovial-shannon-b3dd29`), and these goldens were generated from that code.
+That platform PR is currently UNMERGED, and this tool does not require it: the
+migrator writes ClickHouse directly and never runs platform code. The goldens
+therefore act as this repo's frozen spec. The platform PR remains desirable for
+platform-side replay paths (anything feeding old drill docs through
+KafkaEventSink on main today re-stamps `cd` to insert time and skips
+sanitization) — but that is hardening for the platform, not a dependency of
+the migration.
 
 **Vendored files — do not edit here:** `corpus.json`, `goldens.json`, `decode.mjs`,
 `canonicalize.mjs` are synced byte-identical from countly-platform

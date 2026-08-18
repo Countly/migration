@@ -5,15 +5,25 @@
  * applying field validation, event-name derivation, and timestamp
  * normalization.
  *
- * This module implements the shared drill-event normalization spec that
- * countly-platform's live ingestion transformer
- * (api/utils/eventTransformer.ts) also implements. Both sides must produce
- * IDENTICAL countly_drill.drill_events rows for the same input document so
- * that migrated history and live/replayed ingestion deduplicate cleanly.
- * The differential harness in tests/differential/ enforces this in CI —
- * if you change normalization behavior here, it must first land on the
- * platform side (which owns the goldens) and the synced fixtures must be
- * updated together.
+ * This module implements the drill-event normalization spec. The spec was
+ * defined together with a matching rewrite of countly-platform's
+ * api/utils/eventTransformer.ts (branch claude/jovial-shannon-b3dd29) and the
+ * goldens in tests/differential/ were generated from that code — but this
+ * tool does NOT depend on that branch merging. It writes ClickHouse directly;
+ * platform code never runs on the migration path. The differential harness
+ * pins THIS repo's behavior against the frozen goldens.
+ *
+ * What consistency actually requires (and why it holds against platform
+ * main unmerged): row semantics that span history + live queries — custom
+ * events as e='[CLY]_custom' with the name in n (confirmed live behavior),
+ * uid_canon left to the identity machinery (both sides), cd = historical
+ * time for migrated rows vs receive-time for live rows. Everything else in
+ * this spec (NaN/Decimal128/Long stringification, ts heuristics, clamps,
+ * skip rules) concerns BSON-only shapes that live SDK ingestion can never
+ * receive through JSON — divergence there is unobservable.
+ *
+ * If the platform PR merges with behavior changes, regenerate goldens there
+ * and re-sync tests/differential/.
  */
 
 import { SkipReason, SkipCounter } from './skip-reasons.ts';
