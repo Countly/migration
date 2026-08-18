@@ -54,6 +54,11 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
   app.get('/api/preflight', async () => deps.orchestrator.preflight());
   app.get('/api/verify', async () => deps.orchestrator.verifyMigration());
 
+  // The console IS the product's front door — serve it at the root.
+  // /viz stays as an alias (docs, bookmarks, muscle memory).
+  app.get('/', async (_req, reply) => {
+    reply.type('text/html').send(PAGE);
+  });
   app.get('/viz', async (_req, reply) => {
     reply.type('text/html').send(PAGE);
   });

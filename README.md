@@ -13,7 +13,7 @@ docker compose up --build
 # or, with Node 25+:  npm install && npm start
 ```
 
-Then open **http://localhost:8080/viz** — from here the dashboard takes over:
+Then open **http://localhost:8080** — from here the dashboard takes over:
 the **Migration Guide** tab walks the whole procedure (preflight checks,
 index building, dry run, cutover checklist, live progress, verification and
 sign-off gates), and **Help & Recovery** covers every failure scenario with

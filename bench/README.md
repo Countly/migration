@@ -36,4 +36,4 @@ migration completes, then verifies zero loss and zero duplicates:
 node --experimental-strip-types bench/kill-drill.ts
 ```
 
-Watch progress on the dashboard: `http://localhost:18081/viz`.
+Watch progress on the dashboard: `http://localhost:18081`.
