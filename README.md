@@ -22,6 +22,24 @@ the fix one click away.
 To scale: start more instances with the same `.env` and a unique `POD_ID`
 each, on separate machines (see Scaling with pods below).
 
+**Docker (no Kubernetes)**: scaling works the same way — pods are just
+processes coordinating through chunk leases in MongoDB, and `POD_ID`
+defaults to the container hostname (unique automatically). Run one
+container per machine with the same `.env`:
+
+```bash
+docker run -d --env-file .env --name drill-migrator \
+  -p 8080:8080 europe-docker.pkg.dev/<registry>/drill-migrator:<tag>
+```
+
+Add machines by running the same command there — nothing to configure,
+each container's dashboard shows the whole run. Scale across MACHINES,
+not on one host: a single container saturates ~4 cores on BSON decode,
+so `docker compose --scale migration=N` on one box only makes sense for
+testing (and requires dropping the fixed published port). Set
+`EXIT_ON_COMPLETE=true` for fire-and-forget runs — containers exit 0
+when every chunk is done.
+
 **Kubernetes**: ready-to-apply manifests live in `k8s/` —
 `k8s/migration.yaml` (Deployment + Service: pods keep serving the dashboard
 after completion for verification and sign-off; scale with
