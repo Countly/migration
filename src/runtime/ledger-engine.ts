@@ -202,27 +202,6 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
 
   // HTTP surface: health + stats + report + controls + branded dashboard (/viz)
   const app = Fastify({ logger: false });
-
-  // Optional Basic auth (DASHBOARD_PASSWORD): everything but /healthz.
-  // Constant-time comparison; username is ignored.
-  if (config.service.dashboardPassword) {
-    const { timingSafeEqual } = await import('node:crypto');
-    const expected = Buffer.from(config.service.dashboardPassword);
-    app.addHook('onRequest', async (req, reply) => {
-      if (req.url === '/healthz') return;
-      const header = req.headers.authorization ?? '';
-      let ok = false;
-      if (header.startsWith('Basic ')) {
-        const given = Buffer.from(Buffer.from(header.slice(6), 'base64').toString('utf8').split(':').slice(1).join(':'));
-        ok = given.length === expected.length && timingSafeEqual(given, expected);
-      }
-      if (!ok) {
-        reply.header('WWW-Authenticate', 'Basic realm="drill-migrator"').code(401).send({ error: 'auth required' });
-      }
-    });
-    logger.info('Dashboard auth enabled (HTTP Basic via DASHBOARD_PASSWORD)');
-  }
-
   app.get('/healthz', async () => {
     const stats = orchestrator.getStats();
     return stats.fatalError
