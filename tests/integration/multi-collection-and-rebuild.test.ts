@@ -27,7 +27,8 @@ import { loadConfig } from '../../src/config/loader.ts';
 import type { Config } from '../../src/config/schema.ts';
 
 const MONGO_URI = 'mongodb://localhost:27017/?directConnection=true';
-const CH_URL = 'http://localhost:8123';
+const CH_URL = process.env.TEST_CLICKHOUSE_URL ?? 'http://localhost:8123';
+const CH_PASSWORD = process.env.TEST_CLICKHOUSE_PASSWORD ?? '';
 const DB = 'test_mig_multi';
 const RUN = 'multi-1';
 const logger = pino({ level: 'silent' });
@@ -77,7 +78,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     await mc.db(`${DB}_countly`).collection('apps').insertOne({ _id: APP } as never);
     await mc.db(`${DB}_countly`).collection('events').insertOne({ _id: APP, list: [EV1, EV2] } as never);
 
-    ch = createClient({ url: CH_URL });
+    ch = createClient({ url: CH_URL, password: CH_PASSWORD });
     await ch.command({ query: `CREATE DATABASE IF NOT EXISTS ${DB}` });
     await ch.command({ query: `DROP TABLE IF EXISTS ${DB}.drill_events` });
     await ch.command({
@@ -117,6 +118,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     process.env.MONGO_COUNTLY_DB = `${DB}_countly`;
     process.env.MANIFEST_DB = DB;
     process.env.CLICKHOUSE_URL = CH_URL;
+    process.env.CLICKHOUSE_PASSWORD = CH_PASSWORD;
     process.env.CLICKHOUSE_DB = DB;
     process.env.LEDGER_RUN_ID = RUN;
     process.env.LEDGER_CHUNK_DOCS_TARGET = '250';
@@ -131,7 +133,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     ledger = new LedgerStore(MONGO_URI, DB, logger);
     const dlq = new DlqStore(MONGO_URI, DB, logger);
     staging = new StagingManager({
-      url: CH_URL, database: DB, table: 'drill_events', username: 'default', password: '', queryTimeoutMs: 60_000,
+      url: CH_URL, database: DB, table: 'drill_events', username: 'default', password: CH_PASSWORD, queryTimeoutMs: 60_000,
     }, logger);
     const retryPolicy = new RetryPolicy({ maxRetries: 2, baseDelayMs: 50, maxDelayMs: 200 });
     hashResolver = new HashResolver({ uri: MONGO_URI, countlyDb: `${DB}_countly` }, logger);

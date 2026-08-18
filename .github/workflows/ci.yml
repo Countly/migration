@@ -34,3 +34,45 @@ jobs:
       # Pure unit tests — no MongoDB/ClickHouse/Redis required.
       - name: Ingestion-matching differential harness
         run: npx vitest run tests/differential
+
+  integration:
+    name: Integration (MongoDB 7 + ClickHouse 26.4)
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7
+        ports: ['27017:27017']
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1})'"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      clickhouse:
+        # Production ClickHouse version (deploy/compose/images.standard.env
+        # in countly-platform). 26.4 requires a password for non-localhost
+        # clients — the tests read TEST_CLICKHOUSE_PASSWORD.
+        image: clickhouse/clickhouse-server:26.4
+        env:
+          CLICKHOUSE_PASSWORD: ci-pass
+        ports: ['8123:8123']
+        options: >-
+          --health-cmd "clickhouse-client --password ci-pass --query 'SELECT 1'"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      TEST_CLICKHOUSE_PASSWORD: ci-pass
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '25'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Full engine suite: ledger store semantics, e2e chunk pipeline with
+      # DLQ/coercions/null-cd sweep, multi-collection scoping regressions,
+      # ledger rebuild, duplicate attribution, pair-based attach recovery.
+      - name: Integration tests
+        run: npx vitest run tests/integration

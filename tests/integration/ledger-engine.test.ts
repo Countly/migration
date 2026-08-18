@@ -23,7 +23,8 @@ import { ChunkOrchestrator } from '../../src/runtime/chunk-orchestrator.ts';
 import { loadConfig } from '../../src/config/loader.ts';
 
 const MONGO_URI = 'mongodb://localhost:27017/?directConnection=true';
-const CH_URL = 'http://localhost:8123';
+const CH_URL = process.env.TEST_CLICKHOUSE_URL ?? 'http://localhost:8123';
+const CH_PASSWORD = process.env.TEST_CLICKHOUSE_PASSWORD ?? '';
 const DB = 'test_mig_ledger';
 const logger = pino({ level: 'silent' });
 
@@ -148,7 +149,7 @@ describe('ledger engine end-to-end', () => {
     await mc.connect();
     await mc.db(DB).dropDatabase();
 
-    ch = createClient({ url: CH_URL });
+    ch = createClient({ url: CH_URL, password: CH_PASSWORD });
     await ch.command({ query: `CREATE DATABASE IF NOT EXISTS ${DB}` });
     await ch.command({ query: `DROP TABLE IF EXISTS ${DB}.drill_events` });
     await ch.command({
@@ -198,6 +199,7 @@ describe('ledger engine end-to-end', () => {
     process.env.MONGO_DB = DB;
     process.env.MANIFEST_DB = DB;
     process.env.CLICKHOUSE_URL = CH_URL;
+    process.env.CLICKHOUSE_PASSWORD = CH_PASSWORD;
     process.env.CLICKHOUSE_DB = DB;
     process.env.LEDGER_RUN_ID = 'e2e-1';
     process.env.LEDGER_CHUNK_DOCS_TARGET = '500';
@@ -212,7 +214,7 @@ describe('ledger engine end-to-end', () => {
     const ledger = new LedgerStore(MONGO_URI, DB, logger);
     dlq = new DlqStore(MONGO_URI, DB, logger);
     const staging = new StagingManager({
-      url: CH_URL, database: DB, table: 'drill_events', username: 'default', password: '', queryTimeoutMs: 60_000,
+      url: CH_URL, database: DB, table: 'drill_events', username: 'default', password: CH_PASSWORD, queryTimeoutMs: 60_000,
     }, logger);
     const retryPolicy = new RetryPolicy({ maxRetries: 2, baseDelayMs: 50, maxDelayMs: 200 });
     const hashResolver = new HashResolver({ uri: MONGO_URI, countlyDb: `${DB}_countly` }, logger);
