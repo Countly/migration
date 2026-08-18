@@ -265,4 +265,34 @@ describe('multi-collection scoping + ledger rebuild', () => {
     const verify = await orchestrator.verifyMigration();
     expect(verify.ok).toBe(true);
   }, 120_000);
+
+  it('verify attributes duplicates: recent pairs are live artifacts (ok stays true), historical ones fail', async () => {
+    // A live at-least-once redelivery: same _id twice, both copies with cd≈now
+    const nowMs = Date.now();
+    const mk = (id: string, cdMs: number) =>
+      `('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', '${id}', ${nowMs}, fromUnixTimestamp64Milli(${cdMs}))`;
+    await ch.command({
+      query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
+              VALUES ${mk('redelivered_1', nowMs)}, ${mk('redelivered_1', nowMs + 500)}`,
+    });
+
+    let verify = await orchestrator.verifyMigration();
+    expect(verify.table.duplicates).toBe(1);
+    expect(verify.migrationDuplicates).toBe(0);
+    expect(verify.ok).toBe(true); // live artifact — nightly platform job cleans it, not our defect
+    const sample = (verify.duplicateSample as Array<{ _id: string; verdict: string }>);
+    expect(sample[0]._id).toBe('redelivered_1');
+    expect(sample[0].verdict).toContain('live at-least-once artifact');
+
+    // A duplicate with one HISTORICAL copy — that would mean migrated data is involved
+    await ch.command({
+      query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
+              VALUES ${mk('p_5', nowMs)}`,
+    });
+    verify = await orchestrator.verifyMigration();
+    expect(verify.migrationDuplicates).toBeGreaterThanOrEqual(1);
+    expect(verify.ok).toBe(false);
+
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id IN ('redelivered_1') OR (_id = 'p_5' AND cd >= fromUnixTimestamp64Milli(${nowMs}))` });
+  }, 60_000);
 });

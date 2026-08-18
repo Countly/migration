@@ -286,6 +286,27 @@ export class StagingManager {
     } catch { return null; }
   }
 
+  /**
+   * Sample of duplicate _id groups with their cd spread, for attribution:
+   * copies whose cd is all recent are live at-least-once artifacts (the
+   * platform's nightly EventDeduplicationJob cleans those); a copy with
+   * HISTORICAL cd involves migrated data and needs investigation.
+   */
+  async duplicateSample(limit = 20): Promise<Array<{ _id: string; copies: number; min_cd_ms: number; max_cd_ms: number }>> {
+    const res = await this.ch().query({
+      query: `SELECT _id, count() AS c,
+                     toUnixTimestamp64Milli(min(cd)) AS lo,
+                     toUnixTimestamp64Milli(max(cd)) AS hi
+              FROM ${this.fq(this.config.table)}
+              GROUP BY _id HAVING c > 1
+              ORDER BY c DESC LIMIT {lim:UInt32}`,
+      query_params: { lim: limit },
+      format: 'JSONEachRow',
+    });
+    const rows = await res.json<{ _id: string; c: string; lo: string; hi: string }>();
+    return rows.map((r) => ({ _id: r._id, copies: Number(r.c), min_cd_ms: Number(r.lo), max_cd_ms: Number(r.hi) }));
+  }
+
   /** Total + distinct-id counts of the live table (exact, one query). */
   async countAndUniq(): Promise<{ count: number; uniq: number }> {
     const res = await this.ch().query({

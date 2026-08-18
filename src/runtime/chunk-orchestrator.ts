@@ -1272,12 +1272,41 @@ export class ChunkOrchestrator {
     }
 
     const totals = await staging.countAndUniq();
+
+    // Attribute duplicates: live ingestion is at-least-once, so a handful of
+    // duplicate ids with all-RECENT cd are ordinary connector redelivery —
+    // the platform's nightly EventDeduplicationJob cleans them and they are
+    // NOT a migration defect. A duplicate involving HISTORICAL cd is.
+    let duplicateSample: Array<Record<string, unknown>> = [];
+    let migrationDuplicates = 0;
+    if (totals.count !== totals.uniq) {
+      // Exact boundary from the ledger: migrated rows all carry cd below the
+      // highest chunk window — a duplicate group living entirely above it
+      // cannot involve migrated data.
+      const migratedUpperMs = all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
+      duplicateSample = (await staging.duplicateSample()).map((d) => {
+        const liveArtifact = d.min_cd_ms >= migratedUpperMs;
+        if (!liveArtifact) migrationDuplicates++;
+        return {
+          _id: d._id,
+          copies: d.copies,
+          minCd: new Date(d.min_cd_ms).toISOString(),
+          maxCd: new Date(d.max_cd_ms).toISOString(),
+          verdict: liveArtifact
+            ? 'live at-least-once artifact (all copies recent — nightly dedup job cleans these)'
+            : 'involves historical data — investigate',
+        };
+      });
+    }
+
     return {
-      ok: mismatches.length === 0 && totals.count === totals.uniq,
+      ok: mismatches.length === 0 && migrationDuplicates === 0,
       checkedChunks: checked,
       unscopedSkipped,
       mismatches,
       table: { rows: totals.count, distinctIds: totals.uniq, duplicates: totals.count - totals.uniq },
+      duplicateSample,
+      migrationDuplicates,
     };
   }
 
