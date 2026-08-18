@@ -184,6 +184,15 @@ export class ChunkOrchestrator {
       );
     } else {
       await this.d.staging.runDedupCanary();
+      const counts = await this.d.ledger.statusCounts(this.runId);
+      if ((counts.done ?? 0) > 0 && (await this.d.staging.countMigrated()) === 0) {
+        throw new Error(
+          'This run has completed chunks but the live table has zero migrated-flagged rows — ' +
+          'it predates the provenance flag. Either backfill the flag ' +
+          '(ALTER TABLE <live table> UPDATE migrated = true WHERE cd < <cutover time>) ' +
+          'or start a fresh LEDGER_RUN_ID.',
+        );
+      }
       this.startInvariantMonitor();
     }
 
@@ -1273,28 +1282,32 @@ export class ChunkOrchestrator {
 
     const totals = await staging.countAndUniq();
 
-    // Attribute duplicates: live ingestion is at-least-once, so a handful of
-    // duplicate ids with all-RECENT cd are ordinary connector redelivery —
-    // the platform's nightly EventDeduplicationJob cleans them and they are
-    // NOT a migration defect. A duplicate involving HISTORICAL cd is.
+    // Attribute duplicates by PROVENANCE (the migrated flag — exact, not
+    // heuristic). Three cases:
+    //   0 migrated copies  → live at-least-once artifact (connector
+    //     redelivery); the platform's nightly EventDeduplicationJob cleans
+    //     these. Not a migration defect.
+    //   1 migrated copy    → cross-cutover SDK retry: the same event reached
+    //     the old stack (→ migrated) and the new stack (→ live). One benign
+    //     extra copy; reported, not a migration defect.
+    //   2+ migrated copies → the migration inserted the same doc twice —
+    //     OUR defect; verification fails.
     let duplicateSample: Array<Record<string, unknown>> = [];
     let migrationDuplicates = 0;
     if (totals.count !== totals.uniq) {
-      // Exact boundary from the ledger: migrated rows all carry cd below the
-      // highest chunk window — a duplicate group living entirely above it
-      // cannot involve migrated data.
-      const migratedUpperMs = all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
       duplicateSample = (await staging.duplicateSample()).map((d) => {
-        const liveArtifact = d.min_cd_ms >= migratedUpperMs;
-        if (!liveArtifact) migrationDuplicates++;
+        if (d.migratedCopies >= 2) migrationDuplicates++;
         return {
           _id: d._id,
           copies: d.copies,
+          migratedCopies: d.migratedCopies,
           minCd: new Date(d.min_cd_ms).toISOString(),
           maxCd: new Date(d.max_cd_ms).toISOString(),
-          verdict: liveArtifact
-            ? 'live at-least-once artifact (all copies recent — nightly dedup job cleans these)'
-            : 'involves historical data — investigate',
+          verdict: d.migratedCopies === 0
+            ? 'live at-least-once artifact (nightly dedup job cleans these)'
+            : d.migratedCopies === 1
+              ? 'cross-cutover retry duplicate (event reached both stacks — one benign live copy)'
+              : 'MIGRATION DEFECT: same document migrated more than once — investigate',
         };
       });
     }

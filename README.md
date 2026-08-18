@@ -32,6 +32,13 @@ kills/evictions are safe by design (chunk redo). Reach the dashboard with
 `kubectl port-forward svc/drill-migrator 8080:8080` — any pod shows the
 whole run.
 
+On first connect the migrator adds a `migrated Bool DEFAULT false` column to
+the live table (instant metadata-only ALTER; live ingestion is unaffected and
+defaults to `false`). Every migrated row is flagged `true`, and every check,
+purge, and recovery query filters on it — so migrated and live-ingested data
+can never be confused, even when the same event reached both stacks (SDK
+retries across the cutover produce the same `_id` in the same partition).
+
 This README covers what you need BEFORE the dashboard exists (installing,
 env vars, starting the service, automation reference). Everything after —
 running, monitoring, troubleshooting, verifying — lives in the dashboard,

@@ -98,6 +98,13 @@ export interface OutputRow {
   dur: number;
   lu?: string;
   cd: string;
+  /**
+   * Provenance flag, set by the INSERT layer (never by the transform — the
+   * normalization spec and its goldens don't know about it). Distinguishes
+   * migrated rows from live-ingested rows with 100% certainty; every
+   * migration-side count/purge/recovery check filters on it.
+   */
+  migrated?: boolean;
 }
 
 export interface TransformResult {

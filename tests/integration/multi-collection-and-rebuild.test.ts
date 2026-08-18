@@ -47,6 +47,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
   let orchestrator: ChunkOrchestrator;
   let ledger: LedgerStore;
   let hashResolver: HashResolver;
+  let staging: StagingManager;
   let config: Config;
   const closers: Array<() => Promise<void>> = [];
 
@@ -129,7 +130,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     }, logger);
     ledger = new LedgerStore(MONGO_URI, DB, logger);
     const dlq = new DlqStore(MONGO_URI, DB, logger);
-    const staging = new StagingManager({
+    staging = new StagingManager({
       url: CH_URL, database: DB, table: 'drill_events', username: 'default', password: '', queryTimeoutMs: 60_000,
     }, logger);
     const retryPolicy = new RetryPolicy({ maxRetries: 2, baseDelayMs: 50, maxDelayMs: 200 });
@@ -266,33 +267,76 @@ describe('multi-collection scoping + ledger rebuild', () => {
     expect(verify.ok).toBe(true);
   }, 120_000);
 
-  it('verify attributes duplicates: recent pairs are live artifacts (ok stays true), historical ones fail', async () => {
-    // A live at-least-once redelivery: same _id twice, both copies with cd≈now
+  it('verify attributes duplicates by provenance: live artifact / cross-cutover retry / migration defect', async () => {
     const nowMs = Date.now();
     const mk = (id: string, cdMs: number) =>
       `('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', '${id}', ${nowMs}, fromUnixTimestamp64Milli(${cdMs}))`;
+    // 1) live at-least-once redelivery: same _id twice, NO migrated copy
     await ch.command({
       query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
               VALUES ${mk('redelivered_1', nowMs)}, ${mk('redelivered_1', nowMs + 500)}`,
     });
-
-    let verify = await orchestrator.verifyMigration();
-    expect(verify.table.duplicates).toBe(1);
-    expect(verify.migrationDuplicates).toBe(0);
-    expect(verify.ok).toBe(true); // live artifact — nightly platform job cleans it, not our defect
-    const sample = (verify.duplicateSample as Array<{ _id: string; verdict: string }>);
-    expect(sample[0]._id).toBe('redelivered_1');
-    expect(sample[0].verdict).toContain('live at-least-once artifact');
-
-    // A duplicate with one HISTORICAL copy — that would mean migrated data is involved
+    // 2) cross-cutover SDK retry: live copy of an event the migration copied
     await ch.command({
       query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
               VALUES ${mk('p_5', nowMs)}`,
     });
+
+    let verify = await orchestrator.verifyMigration();
+    expect(verify.table.duplicates).toBe(2);
+    expect(verify.migrationDuplicates).toBe(0);
+    expect(verify.ok).toBe(true); // neither is a migration defect
+    const sample = (verify.duplicateSample as Array<{ _id: string; migratedCopies: number; verdict: string }>);
+    const byId = new Map(sample.map((d) => [d._id, d]));
+    expect(byId.get('redelivered_1')!.migratedCopies).toBe(0);
+    expect(byId.get('redelivered_1')!.verdict).toContain('live at-least-once artifact');
+    expect(byId.get('p_5')!.migratedCopies).toBe(1);
+    expect(byId.get('p_5')!.verdict).toContain('cross-cutover retry');
+
+    // 3) a REAL migration defect: two migrated-flagged copies of one _id
+    await ch.command({
+      query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd, migrated)
+              VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', 'p_6', ${nowMs}, fromUnixTimestamp64Milli(${nowMs}), true)`,
+    });
     verify = await orchestrator.verifyMigration();
-    expect(verify.migrationDuplicates).toBeGreaterThanOrEqual(1);
+    expect(verify.migrationDuplicates).toBe(1);
     expect(verify.ok).toBe(false);
 
-    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id IN ('redelivered_1') OR (_id = 'p_5' AND cd >= fromUnixTimestamp64Milli(${nowMs}))` });
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'redelivered_1' OR (_id IN ('p_5','p_6') AND cd >= fromUnixTimestamp64Milli(${nowMs}))` });
+  }, 60_000);
+
+  it('attach-recovery staged-ids check ignores live copies of the same _id (cross-cutover retry)', async () => {
+    // The mixing vector: a crash during attach + an SDK retry that landed the
+    // same _id in live (same ts → same month partition). Without provenance
+    // filtering, recovery would see the live copy and skip the attach.
+    const tsMs = BASE + 42 * 60_000;
+    const stagingTable = 'drill_events__stg_precision_test';
+    await staging.createStaging(stagingTable);
+    await staging.insertBatch(stagingTable, [{
+      _id: 'retry_victim', a: APP, e: '[CLY]_custom', n: EV1, uid: 'u', did: 'd',
+      ts: new Date(tsMs).toISOString().replace('T', ' ').replace('Z', ''),
+      c: 1, s: 0, dur: 0,
+      cd: new Date(tsMs).toISOString().replace('T', ' ').replace('Z', ''),
+    } as never], 'precision-test', 'precision-q1');
+    const [partitionId] = await staging.listPartitions(stagingTable);
+
+    // live retry copy: same _id, same ts (same partition), NOT migrated
+    await ch.command({
+      query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
+              VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u', 'd', 'retry_victim', ${tsMs}, fromUnixTimestamp64Milli(${Date.now()}))`,
+    });
+    expect(await staging.countLiveByStagedIds(stagingTable, partitionId)).toBe(0); // pre-fix: 1 → skipped attach → data loss
+
+    // once the migrated copy IS live, recovery correctly reports it
+    await staging.insertIntoLive([{
+      _id: 'retry_victim', a: APP, e: '[CLY]_custom', n: EV1, uid: 'u', did: 'd',
+      ts: new Date(tsMs).toISOString().replace('T', ' ').replace('Z', ''),
+      c: 1, s: 0, dur: 0,
+      cd: new Date(tsMs).toISOString().replace('T', ' ').replace('Z', ''),
+    } as never], 'precision-test-live');
+    expect(await staging.countLiveByStagedIds(stagingTable, partitionId)).toBe(1);
+
+    await staging.dropStaging(stagingTable);
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'retry_victim'` });
   }, 60_000);
 });
