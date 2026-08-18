@@ -164,6 +164,29 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.get('/api/index-progress', async () => orchestrator.indexBuildProgress());
   app.post('/control/dry-run', async () => startDryRun());
   app.get('/api/dryrun', async () => dryState);
+  app.get('/api/config', async () => ({
+    knobs: [
+      { env: 'LEDGER_CHUNK_DOCS_TARGET', value: config.ledger.chunkDocsTarget, def: 2_000_000,
+        hint: 'Docs per chunk — the unit of crash-redo and pod parallelism. Lower on unstable infra (cheaper redo); raise to shave per-chunk overhead.' },
+      { env: 'LEDGER_MAX_CHUNK_DAYS', value: config.ledger.maxChunkDays, def: 7,
+        hint: 'Max time span per chunk — guards sizing against bad doc estimates.' },
+      { env: 'MONGO_PAGE_SIZE', value: config.source.mongoPageSize, def: 10_000,
+        hint: 'Docs per read page / insert batch (held in memory whole). Lower to ≤1,000 for very large documents.' },
+      { env: 'LEDGER_INSERT_INFLIGHT', value: config.ledger.insertInflight, def: 3,
+        hint: 'Concurrent inserts per chunk. Raise for high-latency ClickHouse; set 1 for a memory-tight one.' },
+      { env: 'LEDGER_LEASE_SEC', value: config.ledger.leaseSec, def: 600,
+        hint: 'Chunk claim lease — how long before other pods reclaim a dead pod\u2019s chunk.' },
+      { env: 'LEDGER_BREAKER_PCT', value: config.ledger.breakerPct, def: 5,
+        hint: 'Circuit breaker: pause when more than this % of a chunk\u2019s docs fail.' },
+      { env: 'MONGO_READ_PREFERENCE', value: config.source.readPreference, def: 'primary',
+        hint: 'On replica sets set secondaryPreferred — offloads the primary; exact since the source is frozen after cutover.' },
+    ],
+    stateLocation: {
+      ledger: `${config.state.manifestDb}.mig_ranges (MongoDB)`,
+      dlq: `${config.state.manifestDb}.mig_dlq_docs (MongoDB)`,
+      note: 'Progress state is ~50-100 tiny documents with your MongoDB\u2019s durability. Recovery never trusts it blindly \u2014 chunks are count-verified. Changing a knob requires an engine restart (env vars).',
+    },
+  }));
   app.get('/api/pods', async () => ({
     pods: await ledger.podActivity(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId),
     leaseSec: config.ledger.leaseSec,

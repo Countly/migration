@@ -302,6 +302,11 @@ const PAGE = `<!doctype html>
     </div>
   </details>
 
+  <div class="card">
+    <h2>Configuration <span class="hint">— current values; change via env vars + restart</span></h2>
+    <div id="config-knobs"><div class="empty">–</div></div>
+  </div>
+
   <details class="phase" id="phase-6"><summary><span class="num">6</span> Verify &amp; sign off <span class="ph-status" id="ph6-s">gated</span></summary>
     <div class="body">
       <p>Three gates, all must be green:</p>
@@ -607,6 +612,15 @@ async function slowTick() {
             return '<tr><td>' + esc(p.pod) + (alive ? ' <span class="pill resolved">alive</span>' : ' <span class="pill waived">idle/gone</span>') +
               '</td><td>' + fmt(p.done) + '</td><td>' + fmt(p.active) + '</td><td>' + (ago === null ? '–' : ago + 's ago') + '</td></tr>';
           }).join('') + '</table>';
+    }
+    const cfg = await fetch('/api/config').then(r => r.json()).catch(() => null);
+    if (cfg && cfg.knobs) {
+      document.getElementById('config-knobs').innerHTML =
+        '<table><tr><th>Setting</th><th>Value</th><th>Default</th><th>When to change</th></tr>' +
+        cfg.knobs.map(k => '<tr><td class="err">' + esc(k.env) + '</td><td><b>' + esc(k.value) + '</b>' +
+          (String(k.value) !== String(k.def) ? ' <span class="pill pending">changed</span>' : '') +
+          '</td><td>' + esc(k.def) + '</td><td style="font-size:12px;color:var(--ink-2)">' + esc(k.hint) + '</td></tr>').join('') +
+        '</table><p class="hint" style="margin:10px 0 0">Progress state: ' + esc(cfg.stateLocation.ledger) + ' \u00b7 DLQ: ' + esc(cfg.stateLocation.dlq) + '. ' + esc(cfg.stateLocation.note) + '</p>';
     }
     if (dry) {
       const el = document.getElementById('dry-status');
