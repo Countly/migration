@@ -24,6 +24,7 @@ import type { Logger } from 'pino';
 import type { Config } from '../config/schema.ts';
 import type { MongoReader } from '../source/mongo-reader.ts';
 import type { HashResolver, CollectionDefaults } from '../transform/hash-resolver.ts';
+import { chScopeOf, type ChScope } from '../transform/hash-resolver.ts';
 import type { RetryPolicy } from './retry-policy.ts';
 import type { ClickHousePressure, PressureState } from '../target/clickhouse-pressure.ts';
 import { LedgerStore, type ChunkDoc } from '../state/ledger-store.ts';
@@ -72,6 +73,32 @@ export interface LedgerEngineStats {
   chunkStatusCounts: Record<string, number>;
 }
 
+/**
+ * Chunk grid from cd span + doc estimate. Two independent sizing signals:
+ * doc estimate AND time span — the span floor protects against a corrupted
+ * estimate (metadata fastcount resets after unclean mongod shutdowns)
+ * producing a whole-collection chunk. Pure; shared with ledger rebuild.
+ */
+export function computeChunkBounds(
+  lowerCd: number,
+  upperCd: number,
+  estimated: number,
+  chunkDocsTarget: number,
+  maxChunkDays: number,
+): Array<{ lowerCd: number; upperCd: number }> {
+  const spanMs = upperCd + 1 - lowerCd;
+  const byDocs = Math.ceil(estimated / chunkDocsTarget);
+  const bySpan = Math.ceil(spanMs / (maxChunkDays * 86_400_000));
+  const chunkCount = Math.max(1, Math.min(50_000, Math.max(byDocs, bySpan)));
+  const bounds: Array<{ lowerCd: number; upperCd: number }> = [];
+  for (let i = 0; i < chunkCount; i++) {
+    const lo = lowerCd + Math.floor((spanMs * i) / chunkCount);
+    const hi = i === chunkCount - 1 ? upperCd + 1 : lowerCd + Math.floor((spanMs * (i + 1)) / chunkCount);
+    if (hi > lo) bounds.push({ lowerCd: lo, upperCd: hi });
+  }
+  return bounds;
+}
+
 const MAX_CHUNK_ATTEMPTS = 3;
 const BISECT_LOG_THRESHOLD = 1;
 
@@ -88,6 +115,7 @@ export class ChunkOrchestrator {
 
   private status = 'idle';
   private fatalError: string | null = null;
+  private multiCollection = false;
   private stopping = false;
   private paused = false;
   private currentCollection: string | null = null;
@@ -127,6 +155,12 @@ export class ChunkOrchestrator {
   resume(): void { this.paused = false; if (this.status === 'paused') this.status = 'running'; }
   getStatus(): string { return this.status; }
 
+  /** ClickHouse row-identity scope of a chunk's collection; null when unresolvable. */
+  private scopeOf(chunk: ChunkDoc): ChScope | null {
+    if (!chunk.scope_a || !chunk.scope_e) return null;
+    return { a: chunk.scope_a, e: chunk.scope_e, ...(chunk.scope_n ? { n: chunk.scope_n } : {}) };
+  }
+
   /** A startup/config failure should not kill the console — surface it instead. */
   markFatal(message: string): void {
     this.status = 'failed';
@@ -162,6 +196,7 @@ export class ChunkOrchestrator {
       return !(defaults && skipEventNames.has(defaults.e));
     });
 
+    this.multiCollection = collections.length > 1;
     this.logger.info({ collections: collections.length, runId: this.runId, dryRun: this.dryRun }, 'Ledger engine starting');
 
     for (const collection of collections) {
@@ -210,19 +245,7 @@ export class ChunkOrchestrator {
     }
 
     const estimated = await mongoReader.getEstimatedCount();
-    const spanMs = upper.cd + 1 - lower.cd;
-    // Two independent sizing signals: doc estimate AND time span. The span
-    // floor protects against a wrong estimate (metadata fastcount resets
-    // after unclean mongod shutdowns) producing a whole-collection chunk.
-    const byDocs = Math.ceil(estimated / config.ledger.chunkDocsTarget);
-    const bySpan = Math.ceil(spanMs / (config.ledger.maxChunkDays * 86_400_000));
-    const chunkCount = Math.max(1, Math.min(50_000, Math.max(byDocs, bySpan)));
-    let bounds: Array<{ lowerCd: number; upperCd: number }> = [];
-    for (let i = 0; i < chunkCount; i++) {
-      const lo = lower.cd + Math.floor((spanMs * i) / chunkCount);
-      const hi = i === chunkCount - 1 ? upper.cd + 1 : lower.cd + Math.floor((spanMs * (i + 1)) / chunkCount);
-      if (hi > lo) bounds.push({ lowerCd: lo, upperCd: hi });
-    }
+    let bounds = computeChunkBounds(lower.cd, upper.cd, estimated, config.ledger.chunkDocsTarget, config.ledger.maxChunkDays);
 
     // Dry run: keep every k-th chunk so old and new data shapes are both covered.
     if (this.dryRun) {
@@ -238,10 +261,9 @@ export class ChunkOrchestrator {
       log.info('Collection has null-cd documents — added null-cd sweep chunk');
     }
 
-    const created = await ledger.initChunks(this.runId, collection, bounds, config.transform.version);
-    log.info({ estimated, chunks: bounds.length, created, dryRun: this.dryRun }, 'Chunk list ready');
-
     const defaults = this.d.hashResolver.resolveCollectionName(collection, config.source.collectionPrefix) ?? undefined;
+    const created = await ledger.initChunks(this.runId, collection, bounds, config.transform.version, defaults ? chScopeOf(defaults) : null);
+    log.info({ estimated, chunks: bounds.length, created, scoped: !!defaults, dryRun: this.dryRun }, 'Chunk list ready');
 
     await this.recoverChunks(collection, log);
 
@@ -760,11 +782,10 @@ export class ChunkOrchestrator {
     const remaining = chunk.partitions.filter((p) => !attachedSet.has(p));
     for (const partitionId of remaining) {
       // Verify-then-attach: never attach a partition whose rows are already
-      // live. Regular chunks check their cd window (fast, minmax-indexed);
-      // the null-cd sweep has no cd window, so it checks staged ids instead.
-      const already = this.isNullCdChunk(chunk)
-        ? await staging.countLiveByStagedIds(stagingTable, partitionId)
-        : await staging.countLiveInChunkPartition(partitionId, chunk.lower_cd, chunk.upper_cd);
+      // live. Checked by staged row ids — precise for THIS chunk even when
+      // sibling collections share the month partition and cd window (a
+      // window-count here once skipped attaches on multi-collection runs).
+      const already = await staging.countLiveByStagedIds(stagingTable, partitionId);
       if (already > 0) {
         await ledger.recordAttached(chunk._id, partitionId);
         continue;
@@ -790,6 +811,25 @@ export class ChunkOrchestrator {
   }
 
   /** Delete the live rows of a collection's null-cd docs, precisely by id. */
+  /**
+   * Purge a chunk's live rows by their Mongo ids (paged). Fallback for
+   * unresolvable collections in multi-collection runs, where a cd-window
+   * DELETE would also hit sibling collections' rows.
+   */
+  private async purgeWindowByIds(collection: string, lowerCd: number, upperCd: number): Promise<void> {
+    const db = this.d.mongoReader.getDatabase();
+    const cursor = db.collection(collection).find(
+      { cd: { $gte: new Date(lowerCd), $lt: new Date(upperCd) } },
+      { projection: { _id: 1 } },
+    ).batchSize(10_000);
+    let ids: string[] = [];
+    for await (const doc of cursor) {
+      ids.push(String(doc._id));
+      if (ids.length >= 10_000) { await this.d.staging.deleteLiveByIds(ids); ids = []; }
+    }
+    await this.d.staging.deleteLiveByIds(ids);
+  }
+
   private async purgeNullCdRows(collection: string): Promise<void> {
     const { MongoClient } = await import('mongodb');
     const mc = new MongoClient(this.d.config.source.uri);
@@ -865,7 +905,11 @@ export class ChunkOrchestrator {
       .sort(() => Math.random() - 0.5)
       .slice(0, 5);
     for (const chunk of samples) {
-      const live = await this.d.staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd);
+      const scope = this.scopeOf(chunk);
+      // Sibling collections overlap in cd — an unscoped window count is only
+      // meaningful when this collection is the whole table.
+      if (!scope && this.multiCollection) continue;
+      const live = await this.d.staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd, scope);
       const violated = hasNullCd ? live < chunk.rows_expected : live !== chunk.rows_expected;
       if (violated) {
         this.logger.error(
@@ -908,7 +952,15 @@ export class ChunkOrchestrator {
     const collectionsNeedingSweepReset = new Set<string>();
     for (const chunk of failedAll) {
       if (!this.isNullCdChunk(chunk as ChunkDoc) && !this.dryRun) {
-        await staging.deleteLiveCdRange(chunk.lower_cd, chunk.upper_cd);
+        // Purge must never touch sibling collections' rows in the same cd
+        // window: scope by (a, e) when the collection resolves; otherwise
+        // purge precisely by the window's Mongo ids.
+        const scope = this.scopeOf(chunk as ChunkDoc);
+        if (scope || !this.multiCollection) {
+          await staging.deleteLiveCdRange(chunk.lower_cd, chunk.upper_cd, scope);
+        } else {
+          await this.purgeWindowByIds(chunk.collection, chunk.lower_cd, chunk.upper_cd);
+        }
         collectionsNeedingSweepReset.add(chunk.collection);
       }
       const reset = await ledger.transition(chunk._id, 'failed', 'pending', {
@@ -1205,10 +1257,14 @@ export class ChunkOrchestrator {
     }
 
     let checked = 0;
+    let unscopedSkipped = 0;
+    const collectionCount = new Set(all.map((c) => c.collection)).size;
     const mismatches: Array<{ chunk: string; expected: number; live: number }> = [];
     for (const chunk of all) {
       if (chunk.status !== 'done' || this.isNullCdChunk(chunk as ChunkDoc)) continue;
-      const live = await staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd);
+      const scope = this.scopeOf(chunk as ChunkDoc);
+      if (!scope && collectionCount > 1) { unscopedSkipped++; continue; }
+      const live = await staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd, scope);
       const relaxed = byCollection.get(chunk.collection) === true;
       const bad = relaxed ? live < chunk.rows_expected : live !== chunk.rows_expected;
       checked++;
@@ -1219,6 +1275,7 @@ export class ChunkOrchestrator {
     return {
       ok: mismatches.length === 0 && totals.count === totals.uniq,
       checkedChunks: checked,
+      unscopedSkipped,
       mismatches,
       table: { rows: totals.count, distinctIds: totals.uniq, duplicates: totals.count - totals.uniq },
     };

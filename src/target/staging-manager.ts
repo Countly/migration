@@ -213,26 +213,9 @@ export class StagingManager {
   }
 
   /**
-   * Rows already present in the LIVE table for this partition within the
-   * chunk's cd bounds. Used by attach-recovery: historical cd ranges contain
-   * only migrated rows, so >0 here means "this partition was already attached".
-   */
-  async countLiveInChunkPartition(partitionId: string, lowerCdMs: number, upperCdMs: number): Promise<number> {
-    const res = await this.ch().query({
-      query: `SELECT count() AS c FROM ${this.fq(this.config.table)}
-              WHERE _partition_id = {pid:String}
-                AND cd >= fromUnixTimestamp64Milli({lo:Int64})
-                AND cd <  fromUnixTimestamp64Milli({hi:Int64})`,
-      query_params: { pid: partitionId, lo: lowerCdMs, hi: upperCdMs },
-      format: 'JSONEachRow',
-    });
-    const rows = await res.json<{ c: string }>();
-    return Number(rows[0]?.c ?? 0);
-  }
-
-  /**
-   * Attach-recovery check for chunks WITHOUT a usable cd window (the null-cd
-   * sweep): are any of this staging partition's row ids already live?
+   * Attach-recovery check: are any of this staging partition's row ids
+   * already live? Id-based, so it is precise for THIS chunk regardless of
+   * sibling collections sharing the month partition and cd window.
    */
   async countLiveByStagedIds(stagingTable: string, partitionId: string): Promise<number> {
     const res = await this.ch().query({
@@ -271,12 +254,23 @@ export class StagingManager {
    * Used when retrying a chunk that was already (partially) promoted — redo
    * must start from a clean window or verify-then-attach would skip it.
    */
-  async deleteLiveCdRange(lowerCdMs: number, upperCdMs: number): Promise<void> {
+  private scopeSql(scope?: { a: string; e: string; n?: string } | null): string {
+    if (!scope) return '';
+    return 'AND a = {sa:String} AND e = {se:String}' + (scope.n !== undefined ? ' AND n = {sn:String}' : '');
+  }
+
+  private scopeParams(scope?: { a: string; e: string; n?: string } | null): Record<string, string> {
+    if (!scope) return {};
+    return { sa: scope.a, se: scope.e, ...(scope.n !== undefined ? { sn: scope.n } : {}) };
+  }
+
+  async deleteLiveCdRange(lowerCdMs: number, upperCdMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<void> {
     await this.ch().command({
       query: `DELETE FROM ${this.fq(this.config.table)}
               WHERE cd >= fromUnixTimestamp64Milli({lo:Int64})
-                AND cd <  fromUnixTimestamp64Milli({hi:Int64})`,
-      query_params: { lo: lowerCdMs, hi: upperCdMs },
+                AND cd <  fromUnixTimestamp64Milli({hi:Int64})
+                ${this.scopeSql(scope)}`,
+      query_params: { lo: lowerCdMs, hi: upperCdMs, ...this.scopeParams(scope) },
     });
   }
 
@@ -333,15 +327,37 @@ export class StagingManager {
   }
 
   /** Grouped verification: rows in the live table within given cd bounds. */
-  async countLiveInCdRange(lowerCdMs: number, upperCdMs: number): Promise<number> {
+  async countLiveInCdRange(lowerCdMs: number, upperCdMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
     const res = await this.ch().query({
       query: `SELECT count() AS c FROM ${this.fq(this.config.table)}
               WHERE cd >= fromUnixTimestamp64Milli({lo:Int64})
-                AND cd <  fromUnixTimestamp64Milli({hi:Int64})`,
-      query_params: { lo: lowerCdMs, hi: upperCdMs },
+                AND cd <  fromUnixTimestamp64Milli({hi:Int64})
+                ${this.scopeSql(scope)}`,
+      query_params: { lo: lowerCdMs, hi: upperCdMs, ...this.scopeParams(scope) },
       format: 'JSONEachRow',
     });
     const rows = await res.json<{ c: string }>();
     return Number(rows[0]?.c ?? 0);
+  }
+
+  /**
+   * Which of these ids exist in the live table, and at what cd? Paged IN
+   * queries; used by ledger rebuild to attribute null-cd sweep rows (their
+   * cd is ts-derived and lands inside regular chunks' windows).
+   */
+  async fetchLiveCdByIds(ids: string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    for (let i = 0; i < ids.length; i += 10_000) {
+      const page = ids.slice(i, i + 10_000);
+      const res = await this.ch().query({
+        query: `SELECT _id, toUnixTimestamp64Milli(cd) AS cd_ms FROM ${this.fq(this.config.table)}
+                WHERE _id IN {ids:Array(String)}`,
+        query_params: { ids: page },
+        format: 'JSONEachRow',
+      });
+      const rows = await res.json<{ _id: string; cd_ms: string }>();
+      for (const r of rows) out.set(r._id, Number(r.cd_ms));
+    }
+    return out;
   }
 }

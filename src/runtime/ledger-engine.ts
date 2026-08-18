@@ -20,6 +20,7 @@ import { StagingManager } from '../target/staging-manager.ts';
 import { ClickHousePressure } from '../target/clickhouse-pressure.ts';
 import { ChunkOrchestrator } from './chunk-orchestrator.ts';
 import { wireExitOnComplete } from './exit-on-complete.ts';
+import { rebuildLedger, newRebuildProgress } from './ledger-rebuild.ts';
 
 export async function runLedgerEngine(config: Config, logger: Logger): Promise<void> {
   logger.info({ engine: 'ledger', runId: config.ledger.runId }, 'Starting ledger engine (no Redis)');
@@ -148,6 +149,35 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     return { started: true };
   }
 
+  // ── Ledger rebuild (disaster recovery, UI action) ─────────────────────
+  // Regenerates mig_ranges from Mongo + ClickHouse counts when the ledger is
+  // lost. Guarded hard: single active pod, engine not copying, and an
+  // existing ledger is only replaced with force=true.
+  const rebuildState = newRebuildProgress();
+
+  async function startRebuild(force: boolean): Promise<{ started: boolean; reason?: string; existingChunks?: number }> {
+    if (rebuildState.status === 'running') return { started: false, reason: 'rebuild already running' };
+    if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — a rebuild only makes sense when progress state is lost; stop/pause first' };
+    if (dryState.status === 'running') return { started: false, reason: 'dry run in progress — wait for it to finish' };
+    const pods = await ledger.podActivity(config.ledger.runId);
+    const others = pods.filter((row) => row.pod !== config.worker.podId && row.active > 0);
+    if (others.length > 0) return { started: false, reason: `other pods hold active chunks (${others.map((row) => row.pod).join(', ')}) — stop them first` };
+    const existing = await ledger.countForRun(config.ledger.runId);
+    if (existing > 0 && !force) {
+      return { started: false, reason: `ledger already has ${existing} chunks for run "${config.ledger.runId}" — rebuilding replaces them; confirm with force`, existingChunks: existing };
+    }
+    Object.assign(rebuildState, newRebuildProgress(), { status: 'running', startedAt: Date.now() });
+    void rebuildLedger({ config, logger, ledger, hashResolver, progress: rebuildState })
+      .then(() => { rebuildState.status = 'completed'; rebuildState.finishedAt = Date.now(); })
+      .catch((err) => {
+        rebuildState.status = 'failed';
+        rebuildState.error = (err as Error).message;
+        rebuildState.finishedAt = Date.now();
+        logger.error({ err }, 'Ledger rebuild failed');
+      });
+    return { started: true };
+  }
+
   // HTTP surface: health + stats + report + controls + branded dashboard (/viz)
   const app = Fastify({ logger: false });
   app.get('/healthz', async () => {
@@ -168,6 +198,8 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.post('/control/build-indexes', async () => orchestrator.startIndexBuilds());
   app.get('/api/index-progress', async () => orchestrator.indexBuildProgress());
   app.post('/control/dry-run', async () => startDryRun());
+  app.post<{ Body: { force?: boolean } }>('/control/rebuild-ledger', async (req) => startRebuild(req.body?.force === true));
+  app.get('/api/rebuild', async () => rebuildState);
   app.get('/api/dryrun', async () => dryState);
   app.get('/api/config', async () => ({
     knobs: [

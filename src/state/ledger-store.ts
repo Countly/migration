@@ -23,6 +23,13 @@ export interface ChunkDoc {
   _id: string;                 // `${runId}:${collection}:${idx}`
   run_id: string;
   collection: string;
+  // Collection identity in ClickHouse terms. Hashed collections map 1:1 to an
+  // (app, event) pair — every cd-window query against the LIVE table must be
+  // scoped by these, because collections overlap in wall-clock time and the
+  // live table holds them all. Null for unresolvable/base collections.
+  scope_a: string | null;
+  scope_e: string | null;
+  scope_n: string | null;         // set for custom events (e='[CLY]_custom')
   idx: number;
   lower_cd: number;            // inclusive, epoch ms
   upper_cd: number;            // exclusive, epoch ms
@@ -72,6 +79,17 @@ export class LedgerStore {
     return this.coll;
   }
 
+  /** Rebuild support: replace this run's entire ledger with regenerated chunks. */
+  async replaceAllForRun(runId: string, docs: ChunkDoc[]): Promise<number> {
+    await this.c().deleteMany({ run_id: runId });
+    if (docs.length > 0) await this.c().insertMany(docs, { ordered: false });
+    return docs.length;
+  }
+
+  async countForRun(runId: string): Promise<number> {
+    return this.c().countDocuments({ run_id: runId });
+  }
+
   /**
    * Idempotently create the chunk list for a collection. If any chunks
    * already exist for (runId, collection) this is a no-op — resume keeps
@@ -82,6 +100,7 @@ export class LedgerStore {
     collection: string,
     bounds: Array<{ lowerCd: number; upperCd: number }>,
     transformVersion: string,
+    scope?: { a: string; e: string; n?: string } | null,
   ): Promise<number> {
     const existing = await this.c().countDocuments({ run_id: runId, collection }, { limit: 1 });
     if (existing > 0) return 0;
@@ -91,6 +110,9 @@ export class LedgerStore {
       _id: `${runId}:${collection}:${idx}`,
       run_id: runId,
       collection,
+      scope_a: scope?.a ?? null,
+      scope_e: scope?.e ?? null,
+      scope_n: scope?.n ?? null,
       idx,
       lower_cd: b.lowerCd,
       upper_cd: b.upperCd,
@@ -236,6 +258,9 @@ export class LedgerStore {
         _id: `${chunk.run_id}:${chunk.collection}:${baseIdx + i}`,
         run_id: chunk.run_id,
         collection: chunk.collection,
+        scope_a: chunk.scope_a ?? null,
+        scope_e: chunk.scope_e ?? null,
+        scope_n: chunk.scope_n ?? null,
         idx: baseIdx + i,
         lower_cd: lo,
         upper_cd: hi,
@@ -264,12 +289,12 @@ export class LedgerStore {
 
   /** All chunks of a run (dashboard feed) — trimmed projection, idx order. */
   async listAll(runId: string): Promise<Array<Pick<ChunkDoc,
-    '_id' | 'collection' | 'idx' | 'status' | 'lower_cd' | 'upper_cd' |
+    '_id' | 'collection' | 'scope_a' | 'scope_e' | 'scope_n' | 'idx' | 'status' | 'lower_cd' | 'upper_cd' |
     'docs_read' | 'docs_skipped' | 'rows_expected' | 'attempts' | 'last_error' | 'pod_id' | 'updated_at'>>> {
     return this.c()
       .find(
         { run_id: runId },
-        { projection: { collection: 1, idx: 1, status: 1, lower_cd: 1, upper_cd: 1,
+        { projection: { collection: 1, scope_a: 1, scope_e: 1, scope_n: 1, idx: 1, status: 1, lower_cd: 1, upper_cd: 1,
           docs_read: 1, docs_skipped: 1, rows_expected: 1, attempts: 1, last_error: 1, pod_id: 1, updated_at: 1 } },
       )
       .sort({ collection: 1, idx: 1 })

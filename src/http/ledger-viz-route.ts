@@ -369,6 +369,16 @@ const PAGE = `<!doctype html>
     <p>A flagged chunk is healed with <b>Retry failed chunks</b> (its live window is purged and redone cleanly).</p></div>
   </details>
 
+  <details class="scenario"><summary>🗂️ Migration progress state lost (mig_ranges gone or corrupted)</summary>
+    <div class="body"><p><b>What happened:</b> the chunk ledger in MongoDB was dropped, restored from an old backup, or otherwise no longer matches reality. Your data is intact — only the notes about <i>which windows were already copied</i> are gone.</p>
+    <p><b>Do:</b> rebuild the ledger from the data itself. The source is frozen, so every chunk window can be recounted in MongoDB and compared against the live ClickHouse rows for the same collection and time window: equal → done, empty → pending, partial → failed (its redo purges the window first). New events ingested since cutover carry newer timestamps than any migrated window, so they are never counted or touched.</p>
+    <p>Requires: engine not copying (pause or restart into a lost-ledger state is fine) and no other pods active. Windows that had DLQ'd or skipped documents re-run and re-capture them — that is expected. Afterwards, resume the run: it finishes only what the rebuild marked pending or failed.</p>
+    <span class="act"><button class="btn" id="btn-rebuild" onclick="startRebuild(this, false)">Rebuild ledger from data</button>
+    <button class="btn" id="btn-rebuild-force" style="display:none" onclick="startRebuild(this, true)">Overwrite existing ledger</button></span>
+    <div id="rebuild-progress" style="margin-top:10px;font-size:12.5px;color:var(--ink-2)"></div>
+    <div id="rebuild-summary" style="margin-top:8px"></div>
+  </details>
+
   <details class="scenario"><summary>🔥 Live ClickHouse itself must be rebuilt (worst case)</summary>
     <div class="body"><p><b>What happened:</b> catastrophic loss of the target. Your data still exists twice: live events since cutover sit in the Kafka log; history sits in the frozen source MongoDB.</p>
     <p><b>Do:</b> recreate the table → reset ONLY the ClickHouse-sink connector's offsets to earliest (Kafka replays the live window; aggregator groups untouched) → re-run this migrator for history. Zero data loss. See <code>docs/RUNBOOK.md</code>.</p></div>
@@ -414,6 +424,55 @@ async function control(action, okMsg, btn, needsConfirm) {
     tick(); slowTick();
   } catch (e) { toast('\\u274c ' + action + ' failed: ' + e.message); }
   if (btn) btn.disabled = false;
+}
+
+let rebuildTimer = null;
+async function startRebuild(btn, force) {
+  if (!armed.get(btn)) {
+    armed.set(btn, true);
+    btn.dataset.label = btn.textContent;
+    btn.textContent = 'Click again to confirm';
+    btn.classList.add('armed');
+    setTimeout(() => { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 4000);
+    return;
+  }
+  armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); btn.disabled = true;
+  try {
+    const res = await fetch('/control/rebuild-ledger', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ force: force }) });
+    const body = await res.json().catch(() => ({}));
+    if (body.started) {
+      toast('\u2705 Rebuild started');
+      document.getElementById('btn-rebuild-force').style.display = 'none';
+      if (rebuildTimer) clearInterval(rebuildTimer);
+      rebuildTimer = setInterval(pollRebuild, 2000);
+      pollRebuild();
+    } else {
+      toast('\u26a0\ufe0f ' + (body.reason || 'could not start'));
+      if (body.existingChunks) document.getElementById('btn-rebuild-force').style.display = '';
+    }
+  } catch (e) { toast('\u274c rebuild failed to start: ' + e.message); }
+  btn.disabled = false;
+}
+async function pollRebuild() {
+  try {
+    const st = await fetch('/api/rebuild').then(r => r.json());
+    const prog = document.getElementById('rebuild-progress');
+    if (st.status === 'running') {
+      prog.textContent = '\u23f3 ' + st.phase + ' \u00b7 ' + st.collectionsDone + '/' + st.collectionsTotal + ' collections';
+    } else if (st.status === 'failed') {
+      prog.textContent = '\u274c rebuild failed: ' + st.error;
+      if (rebuildTimer) { clearInterval(rebuildTimer); rebuildTimer = null; }
+    } else if (st.status === 'completed') {
+      prog.textContent = '\u2705 rebuild complete \u2014 resume the run to finish pending/failed chunks';
+      if (rebuildTimer) { clearInterval(rebuildTimer); rebuildTimer = null; }
+      tick(); slowTick();
+    } else { return; }
+    const rows = (st.summary || []).map(c =>
+      '<tr><td>' + esc(c.collection) + (c.scoped ? '' : ' <span class="badge warn">unscoped</span>') + '</td><td>' + c.done + '</td><td>' + c.pending + '</td><td>' + c.failed + '</td><td>' + fmt(c.mongoDocs) + '</td><td>' + fmt(c.liveRows) + '</td><td>' + (c.nullCdDocs ? (c.nullCdSwept + '/' + c.nullCdDocs) : '\u2013') + '</td></tr>').join('');
+    document.getElementById('rebuild-summary').innerHTML = rows
+      ? '<table><thead><tr><th>collection</th><th>done</th><th>pending</th><th>failed</th><th>mongo docs</th><th>live rows</th><th>null-cd swept</th></tr></thead><tbody>' + rows + '</tbody></table>'
+      : '';
+  } catch (e) { /* transient poll error */ }
 }
 
 async function runPreflight(btn) {
