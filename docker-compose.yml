@@ -1,53 +1,10 @@
+# Runs ONLY the migrator. It connects to YOUR existing MongoDB and ClickHouse
+# via env vars — copy .env.example to .env and point it at them.
+# (From a container, "localhost" on the host machine is host.docker.internal.)
 services:
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis-data:/data
-    command: redis-server --appendonly yes
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
-  mongodb:
-    image: mongo:7
-    volumes:
-      - mongo-data:/data/db
-    ports:
-      - "27017:27017"
-    healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1})"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   migration:
     build: .
+    env_file: .env
     ports:
-      - "8080:8080"
-    env_file:
-      - path: .env
-        required: false
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      redis:
-        condition: service_healthy
-      mongodb:
-        condition: service_healthy
+      - "${SERVICE_PORT:-8080}:${SERVICE_PORT:-8080}"
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/healthz').then(r=>{if(!r.ok)throw 1})"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-
-volumes:
-  redis-data:
-  mongo-data:

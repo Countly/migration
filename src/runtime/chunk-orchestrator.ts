@@ -1088,7 +1088,20 @@ export class ChunkOrchestrator {
           ? 'all indexed'
           : `${collections.length - indexed} collection(s) missing the index — the service builds it automatically, but pre-building avoids a long pause (see Guide step 2)`,
       });
-      checks.push({ id: 'docs', label: 'Estimated documents to migrate', status: 'pass', detail: totalDocs.toLocaleString('en-US') });
+      checks.push({ id: 'docs', label: 'Estimated documents to migrate', status: 'pass', detail: `${totalDocs.toLocaleString('en-US')} (estimate; can be off after an unclean mongod shutdown — chunk sizing is span-guarded)` });
+      // cd should essentially always exist; the sweep handles outliers, last.
+      let nullCd = 0;
+      for (const name of collections) {
+        nullCd += await db.collection(name).countDocuments({ cd: null }).catch(() => 0);
+      }
+      checks.push({
+        id: 'nullcd',
+        label: 'Documents without cd (outliers)',
+        status: nullCd === 0 ? 'pass' : 'warn',
+        detail: nullCd === 0
+          ? 'none — every document carries cd'
+          : `${nullCd.toLocaleString('en-US')} — a dedicated sweep chunk migrates them, strictly after all regular chunks`,
+      });
     } catch (err) {
       checks.push({ id: 'mongo', label: 'MongoDB source reachable', status: 'fail', detail: (err as Error).message });
     }
