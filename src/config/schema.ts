@@ -64,7 +64,7 @@ export const configSchema = z.object({
 
     // ── Service ──────────────────────────────────────────────────────────
     service: z.object({
-        name: z.string().min(1),
+        name: z.string().min(1).default("drill-migrator"),
         port: positiveIntFromEnv.default(8080),
         host: z.string().default("0.0.0.0"),
         gracefulShutdownTimeoutMs: intFromEnv.default(60_000),
