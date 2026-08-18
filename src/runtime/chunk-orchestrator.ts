@@ -55,6 +55,7 @@ export interface LedgerEngineStats {
   runId: string;
   podId: string;
   status: string;
+  fatalError: string | null;
   dryRun: boolean;
   currentCollection: string | null;
   currentChunk: string | null;
@@ -86,6 +87,7 @@ export class ChunkOrchestrator {
   private readonly dryRun: boolean;
 
   private status = 'idle';
+  private fatalError: string | null = null;
   private stopping = false;
   private paused = false;
   private currentCollection: string | null = null;
@@ -124,6 +126,12 @@ export class ChunkOrchestrator {
   pause(): void { this.paused = true; if (this.status === 'running') this.status = 'paused'; }
   resume(): void { this.paused = false; if (this.status === 'paused') this.status = 'running'; }
   getStatus(): string { return this.status; }
+
+  /** A startup/config failure should not kill the console — surface it instead. */
+  markFatal(message: string): void {
+    this.status = 'failed';
+    this.fatalError = message;
+  }
 
   // -------------------------------------------------------------------------
   // Main
@@ -1227,6 +1235,7 @@ export class ChunkOrchestrator {
       runId: this.runId,
       podId: this.podId,
       status: this.status,
+      fatalError: this.fatalError,
       dryRun: this.dryRun,
       currentCollection: this.currentCollection,
       currentChunk: this.currentChunk,

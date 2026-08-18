@@ -150,7 +150,12 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
 
   // HTTP surface: health + stats + report + controls + branded dashboard (/viz)
   const app = Fastify({ logger: false });
-  app.get('/healthz', async () => ({ status: 'ok', engine: 'ledger' }));
+  app.get('/healthz', async () => {
+    const stats = orchestrator.getStats();
+    return stats.fatalError
+      ? { status: 'error', engine: 'ledger', error: stats.fatalError }
+      : { status: 'ok', engine: 'ledger' };
+  });
   app.get('/stats', async () => orchestrator.getStats());
   app.get('/report', async () => orchestrator.getReport());
   app.post('/control/pause', async () => { orchestrator.pause(); return { status: orchestrator.getStatus() }; });
@@ -198,8 +203,10 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
 
   const runPromise = orchestrator.run();
   runPromise.catch((err) => {
-    logger.fatal({ err }, 'ChunkOrchestrator crashed unexpectedly');
-    process.exit(1);
+    // Keep the HTTP console alive: an operator with a typo'd MONGO_DB or a
+    // missing target table needs to SEE the error, not a dead process.
+    logger.fatal({ err }, 'ChunkOrchestrator crashed — console stays up so the error is visible at /');
+    orchestrator.markFatal((err as Error).message);
   });
   wireExitOnComplete(runPromise, config.service.exitOnComplete, logger);
 

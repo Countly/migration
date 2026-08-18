@@ -189,6 +189,10 @@ const PAGE = `<!doctype html>
     <span class="badge" id="b-dedup" style="display:none">dedup verified</span>
     <span class="badge grey" id="b-status">starting…</span>
   </div>
+  <div id="fatal-banner" style="display:none;margin:10px 0 0;padding:12px 16px;border:1px solid #E57373;border-radius:8px;background:#FDECEA;color:#B71C1C;font-size:13px;line-height:1.5">
+    <strong>Engine stopped:</strong> <span id="fatal-msg"></span><br>
+    Fix the configuration (env vars) and restart the service — progress state in MongoDB is untouched and the run resumes where it left off.
+  </div>
 </header>
 <nav class="tabs">
   <button class="tab active" data-pane="overview" onclick="showTab('overview')">Overview</button>
@@ -521,6 +525,11 @@ async function tick() {
 
     const st = document.getElementById('b-status');
     st.textContent = stats.status;
+    var fb = document.getElementById('fatal-banner');
+    if (stats.fatalError) {
+      fb.style.display = 'block';
+      document.getElementById('fatal-msg').textContent = stats.fatalError;
+    } else { fb.style.display = 'none'; }
     st.className = 'badge ' + (stats.status === 'completed' ? '' : stats.status === 'running' ? 'grey' : 'warn');
 
     if (stats.dedupWorks !== null) {
