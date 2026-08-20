@@ -509,6 +509,26 @@ export class ChunkOrchestrator {
       );
       this.consecutiveFailed = 0;
 
+      // Per-commit under-read guard: the tally-independent check. Everything
+      // else compares against docs READ; this one asks the SOURCE how many
+      // docs the window holds. A silently truncated cursor (tally == staging
+      // == live, all short) is caught here, at commit time, for the price of
+      // one indexed count (~1% of chunk duration).
+      if (config.ledger.sourceCountCheck && !this.isNullCdChunk(chunk)) {
+        const srcCount = await this.d.mongoReader.getDatabase().collection(chunk.collection)
+          .countDocuments({ cd: { $gte: new Date(chunk.lower_cd), $lt: new Date(chunk.upper_cd) } });
+        if (srcCount !== result.docsRead) {
+          clog.error(
+            { sourceCount: srcCount, docsRead: result.docsRead },
+            'SOURCE-COUNT MISMATCH: window holds more/fewer docs than were read — flagging chunk for redo',
+          );
+          await ledger.transition(chunk._id, 'done', 'failed', {
+            last_error: `source-count mismatch: source=${srcCount} read=${result.docsRead} — under/over-read; retry redoes the window`,
+          });
+          this.noteChunkFailure(clog);
+        }
+      }
+
       clog.info(
         { docsRead: result.docsRead, docsSkipped: result.docsSkipped, dlq: result.docsDlq, rowsExpected },
         'Chunk done',
@@ -1136,12 +1156,16 @@ export class ChunkOrchestrator {
           if (row) expected.set(row._id, row);
         }
         if (expected.size === 0) continue;
-        const live = await staging.fetchRowsByIds([...expected.keys()]);
+        const expCds = [...expected.values()].map((r) => Date.parse(r.cd.replace(' ', 'T') + 'Z'));
+        const live = await staging.fetchRowsByIds(
+          [...expected.keys()],
+          { loMs: Math.min(...expCds), hiMs: Math.max(...expCds) },
+        );
 
         for (const [id, exp] of expected) {
           p.sampled++;
           const got = live.get(id);
-          if (!got || String(got.cd) !== exp.cd) {
+          if (!got || String(got.cd_txt) !== exp.cd) {
             missing++;
             if (p.mismatches.length < 100) p.mismatches.push({ _id: id, collection, kind: 'missing (no live row with this (_id, cd))' });
             continue;
@@ -1155,7 +1179,7 @@ export class ChunkOrchestrator {
           if (!eq(got.uid_canon, exp.uid_canon)) bad.push('uid_canon');
           if (!eq(got.did, exp.did)) bad.push('did');
           if (!eq(got.lsid, exp.lsid)) bad.push('lsid');
-          if (String(got.ts) !== exp.ts) bad.push('ts');
+          if (String(got.ts_txt) !== exp.ts) bad.push('ts');
           if (Number(got.c) !== exp.c) bad.push('c');
           if (Number(got.s) !== exp.s) bad.push('s');
           if (Number(got.dur) !== exp.dur) bad.push('dur');
@@ -1226,7 +1250,12 @@ export class ChunkOrchestrator {
       // fixed transform migrates DLQ'd docs from the source; replaying them
       // on top would duplicate. Marked resolved: the doc IS migrated.
       if (rows.length > 0) {
-        const liveCd = await staging.fetchLiveCdByIds(rows.map((r) => r._id));
+        const cdMsOf = (r: OutputRow): number => Date.parse(r.cd.replace(' ', 'T') + 'Z');
+        const cdVals = rows.map(cdMsOf);
+        const liveCd = await staging.fetchLiveCdByIds(
+          rows.map((r) => r._id),
+          { loMs: Math.min(...cdVals), hiMs: Math.max(...cdVals) },
+        );
         const keep: OutputRow[] = [];
         const keepIds: string[] = [];
         const resolvedIds: string[] = [];

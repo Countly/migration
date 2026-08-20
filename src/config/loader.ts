@@ -19,6 +19,7 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             leaseSec: env.LEDGER_LEASE_SEC,
             breakerPct: env.LEDGER_BREAKER_PCT,
             dlqPauseThreshold: env.LEDGER_DLQ_PAUSE_THRESHOLD,
+            sourceCountCheck: env.LEDGER_SOURCE_COUNT_CHECK,
             breakerConsecutive: env.LEDGER_BREAKER_CONSECUTIVE,
             monitorIntervalMs: env.LEDGER_MONITOR_INTERVAL_MS,
             maxChunkDays: env.LEDGER_MAX_CHUNK_DAYS,

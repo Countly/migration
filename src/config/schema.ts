@@ -49,6 +49,9 @@ export const configSchema = z.object({
             // Per-chunk breakers miss EVENLY-SPREAD failure (1% of every
             // chunk never trips 5%-of-one-chunk) — this is the global guard.
             dlqPauseThreshold: numberFromEnv.default(1_000_000).pipe(z.number().min(0)),
+            // Tally-independent per-commit guard: after each chunk promotes,
+            // ask the SOURCE how many docs its window holds. ~1% overhead.
+            sourceCountCheck: booleanFromEnv.default(true),
             breakerConsecutive: positiveIntFromEnv.default(3),
             // Background invariant spot checks (0 disables).
             monitorIntervalMs: intFromEnv.default(900_000),

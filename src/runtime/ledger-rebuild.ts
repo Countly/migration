@@ -34,6 +34,7 @@ import { StagingManager } from '../target/staging-manager.ts';
 import { discoverCollections } from '../source/discover-collections.ts';
 import { computeChunkBounds } from './chunk-orchestrator.ts';
 import { chScopeOf } from '../transform/hash-resolver.ts';
+import { toEpochMillis, clampDateTime64 } from '../transform/validators.ts';
 
 export interface RebuildCollectionSummary {
   collection: string;
@@ -138,15 +139,24 @@ export async function rebuildLedger(opts: {
       // Null-cd outliers: fetch ids + live cd values so sweep rows can be
       // subtracted from the regular windows their ts-derived cd landed in.
       const nullCdIds: string[] = [];
-      const idCursor = coll.find({ cd: null }, { projection: { _id: 1 } }).batchSize(10_000);
+      let derivedLo = Infinity, derivedHi = -Infinity;
+      const idCursor = coll.find({ cd: null }, { projection: { _id: 1, ts: 1 } }).batchSize(10_000);
       for await (const doc of idCursor) {
         nullCdIds.push(String(doc._id));
+        const tsMs = toEpochMillis(doc.ts);
+        if (tsMs !== null && tsMs > 0) {
+          const d = clampDateTime64(tsMs); // the sweep's derived cd
+          if (d < derivedLo) derivedLo = d;
+          if (d > derivedHi) derivedHi = d;
+        }
         if (nullCdIds.length >= MAX_NULLCD_IDS) {
           throw new Error(`${collection}: more than ${MAX_NULLCD_IDS.toLocaleString('en-US')} null-cd documents — not outliers; rebuild does not support this shape`);
         }
       }
       summary.nullCdDocs = nullCdIds.length;
-      const liveNullCd = nullCdIds.length > 0 ? await staging.fetchLiveCdByIds(nullCdIds) : new Map<string, number>();
+      const liveNullCd = nullCdIds.length > 0
+        ? await staging.fetchLiveCdByIds(nullCdIds, derivedLo <= derivedHi ? { loMs: derivedLo, hiMs: derivedHi } : undefined)
+        : new Map<string, number>();
       summary.nullCdSwept = liveNullCd.size;
       const sweptCds = [...liveNullCd.values()].sort((a, b) => a - b);
 
@@ -174,7 +184,8 @@ export async function rebuildLedger(opts: {
 
         const status: ChunkDoc['status'] =
           live === mongoCount ? 'done' : live === 0 ? 'pending' : 'failed';
-        if (checkOnly && live !== mongoCount && progress.mismatchedWindows.length < 200) {
+        // pending (live=0) is 'not migrated yet', not a disagreement
+        if (checkOnly && live !== mongoCount && live !== 0 && progress.mismatchedWindows.length < 200) {
           progress.mismatchedWindows.push({
             collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
             source: mongoCount, live,

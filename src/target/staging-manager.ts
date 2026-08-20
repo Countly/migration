@@ -307,16 +307,19 @@ export class StagingManager {
    * back in the same 'YYYY-MM-DD hh:mm:ss.SSS' text form the transform
    * emits, so scalar comparison is direct string/number equality.
    */
-  async fetchRowsByIds(ids: string[]): Promise<Map<string, Record<string, unknown>>> {
+  async fetchRowsByIds(ids: string[], cdBounds?: { loMs: number; hiMs: number }): Promise<Map<string, Record<string, unknown>>> {
+    const bound = cdBounds
+      ? 'AND cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})'
+      : '';
     const out = new Map<string, Record<string, unknown>>();
     for (let i = 0; i < ids.length; i += 5_000) {
       const page = ids.slice(i, i + 5_000);
       const res = await this.ch().query({
         query: `SELECT _id, a, e, n, uid, uid_canon, did, lsid,
-                       toString(ts) AS ts, toString(cd) AS cd,
+                       toString(ts) AS ts_txt, toString(cd) AS cd_txt,
                        c, s, dur, up, sg, custom, cmp
-                FROM ${this.fq(this.config.table)} WHERE _id IN {ids:Array(String)}`,
-        query_params: { ids: page },
+                FROM ${this.fq(this.config.table)} WHERE _id IN {ids:Array(String)} ${bound}`,
+        query_params: { ids: page, ...(cdBounds ? { blo: cdBounds.loMs, bhi: cdBounds.hiMs } : {}) },
         format: 'JSONEachRow',
       });
       for (const r of await res.json<Record<string, unknown>>()) out.set(String(r._id), r);
@@ -397,13 +400,18 @@ export class StagingManager {
   async deleteLiveByPairs(pairs: Array<{ id: string; cdMs: number }>): Promise<void> {
     if (pairs.length === 0) return;
     // Two parallel arrays zipped server-side — the HTTP interface cannot
-    // parse a JS array-of-arrays as Array(Tuple(...)).
+    // parse a JS array-of-arrays as Array(Tuple(...)). The cd min/max bound
+    // lets the mutation prune to the pairs' partitions instead of scanning
+    // the whole table.
+    const lo = Math.min(...pairs.map((p) => p.cdMs));
+    const hi = Math.max(...pairs.map((p) => p.cdMs));
     await this.ch().command({
       query: `DELETE FROM ${this.fq(this.config.table)}
-              WHERE (_id, toUnixTimestamp64Milli(cd)) IN (
+              WHERE cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})
+                AND (_id, toUnixTimestamp64Milli(cd)) IN (
                 SELECT arrayJoin(arrayZip({ids:Array(String)}, {cds:Array(Int64)}))
               )`,
-      query_params: { ids: pairs.map((p) => p.id), cds: pairs.map((p) => p.cdMs) },
+      query_params: { ids: pairs.map((p) => p.id), cds: pairs.map((p) => p.cdMs), blo: lo, bhi: hi },
     });
   }
 
@@ -437,14 +445,19 @@ export class StagingManager {
    * queries; used by ledger rebuild to attribute null-cd sweep rows (their
    * cd is ts-derived and lands inside regular chunks' windows).
    */
-  async fetchLiveCdByIds(ids: string[]): Promise<Map<string, number>> {
+  async fetchLiveCdByIds(ids: string[], cdBounds?: { loMs: number; hiMs: number }): Promise<Map<string, number>> {
+    // _id is not in the ORDER BY — without cd bounds this is a full-column
+    // scan on a 10B-row table. Callers know their rows' cd values; pass them.
+    const bound = cdBounds
+      ? 'AND cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})'
+      : '';
     const out = new Map<string, number>();
     for (let i = 0; i < ids.length; i += 10_000) {
       const page = ids.slice(i, i + 10_000);
       const res = await this.ch().query({
         query: `SELECT _id, toUnixTimestamp64Milli(cd) AS cd_ms FROM ${this.fq(this.config.table)}
-                WHERE _id IN {ids:Array(String)}`,
-        query_params: { ids: page },
+                WHERE _id IN {ids:Array(String)} ${bound}`,
+        query_params: { ids: page, ...(cdBounds ? { blo: cdBounds.loMs, bhi: cdBounds.hiMs } : {}) },
         format: 'JSONEachRow',
       });
       const rows = await res.json<{ _id: string; cd_ms: string }>();

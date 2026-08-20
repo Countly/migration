@@ -281,6 +281,8 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         hint: 'Concurrent inserts per chunk. Raise for high-latency ClickHouse; set 1 for a memory-tight one.' },
       { env: 'LEDGER_LEASE_SEC', value: config.ledger.leaseSec, def: 600,
         hint: 'Chunk claim lease — how long before other pods reclaim a dead pod\u2019s chunk.' },
+      { env: 'LEDGER_SOURCE_COUNT_CHECK', value: String(config.ledger.sourceCountCheck), def: 'true',
+        hint: 'Per-commit under-read guard: after each chunk promotes, recount its window in the SOURCE (tally-independent, ~1% overhead). Disable only if the source Mongo is severely IO-bound.' },
       { env: 'LEDGER_DLQ_PAUSE_THRESHOLD', value: config.ledger.dlqPauseThreshold, def: 1_000_000,
         hint: 'Global guard the per-chunk breaker cannot provide: pause when total pending DLQ crosses this (evenly-spread failure never trips a per-chunk %). 0 disables.' },
       { env: 'LEDGER_BREAKER_PCT', value: config.ledger.breakerPct, def: 5,
