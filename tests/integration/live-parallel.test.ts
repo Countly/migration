@@ -169,12 +169,17 @@ describe('migration under concurrent live ingestion', () => {
 
     await new Promise((r) => setTimeout(r, 200)); // writer running before migration starts
     await orchestrator.run();
+    const writtenDuringRun = liveWritten;
     await new Promise((r) => setTimeout(r, 300)); // writer keeps going after completion
     stop = true;
     await writer;
 
     expect(writerError).toBeNull();
-    expect(liveWritten).toBeGreaterThan(1_000); // the writer genuinely ran throughout
+    // Structural, not wall-clock-dependent: the writer demonstrably
+    // overlapped the migration (several batches landed while it ran) and
+    // kept going after — absolute volume varies with runner speed.
+    expect(writtenDuringRun).toBeGreaterThan(100);
+    expect(liveWritten).toBeGreaterThan(writtenDuringRun);
 
     // Engine finished cleanly: monitor never tripped (a trip pauses + flags)
     const stats = orchestrator.getStats();
