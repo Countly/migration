@@ -388,6 +388,58 @@ describe('multi-collection scoping + ledger rebuild', () => {
     }
   }, 30_000);
 
+  it('audits close the count-blind spots: source recount and sampled content comparison', async () => {
+    const { rebuildLedger: rebuild, newRebuildProgress: newProgress } = await import('../../src/runtime/ledger-rebuild.ts');
+
+    // Clean state: both audits pass and the ledger is untouched by checkOnly
+    const before = await ledger.listAll(RUN);
+    let prog = newProgress();
+    await rebuild({ config, logger, ledger, hashResolver, progress: prog, checkOnly: true });
+    expect(prog.mismatchedWindows.length).toBe(0);
+    const after = await ledger.listAll(RUN);
+    expect(after.map((c) => c._id + c.status).join()).toBe(before.map((c) => c._id + c.status).join());
+
+    let audit = await orchestrator.contentAudit(100);
+    expect(audit.sampled).toBeGreaterThan(50);
+    expect(audit.missing).toBe(0);
+    expect(audit.different).toBe(0);
+
+    // Corrupt one live row the sampler deterministically hits: p_80 gets a
+    // wrong uid (same _id and cd — invisible to every count and pair check).
+    const srcDoc = await mc.db(DB).collection(COLL1).findOne({ _id: 'p_80' } as never) as Record<string, unknown>;
+    const cdMs = (srcDoc.cd as Date).getTime();
+    await staging.deleteLiveByPairs([{ id: 'p_80', cdMs }]);
+    const { transformDocument } = await import('../../src/transform/normalize.ts');
+    const defaults = hashResolver.resolveCollectionName(COLL1, config.source.collectionPrefix) ?? undefined;
+    const { row } = transformDocument(srcDoc as never, defaults);
+    await staging.insertIntoLive([{ ...row!, uid: 'EVIL' }], 'audit-corrupt');
+
+    audit = await orchestrator.contentAudit(600); // sample densely → must hit p_80
+    expect(audit.different).toBeGreaterThanOrEqual(1);
+    const hit = audit.mismatches.find((m) => m._id === 'p_80');
+    expect(hit?.fields).toContain('uid');
+    // counts still agree everywhere — this class is invisible to the source audit
+    prog = newProgress();
+    await rebuild({ config, logger, ledger, hashResolver, progress: prog, checkOnly: true });
+    expect(prog.mismatchedWindows.length).toBe(0);
+
+    // Now a LOSS: delete the row entirely — source audit flags the window
+    await staging.deleteLiveByPairs([{ id: 'p_80', cdMs }]);
+    prog = newProgress();
+    await rebuild({ config, logger, ledger, hashResolver, progress: prog, checkOnly: true });
+    expect(prog.mismatchedWindows.length).toBe(1);
+    expect(prog.mismatchedWindows[0].source - prog.mismatchedWindows[0].live).toBe(1);
+
+    // Restore the true row; both audits green again
+    await staging.insertIntoLive([row!], 'audit-restore');
+    prog = newProgress();
+    await rebuild({ config, logger, ledger, hashResolver, progress: prog, checkOnly: true });
+    expect(prog.mismatchedWindows.length).toBe(0);
+    audit = await orchestrator.contentAudit(600);
+    expect(audit.missing).toBe(0);
+    expect(audit.different).toBe(0);
+  }, 120_000);
+
   it('attach-recovery pair check ignores live copies of the same _id (cross-cutover retry)', async () => {
     // The mixing vector: a crash during attach + an SDK retry that landed the
     // same _id in live (same ts → same month partition). Matching (_id, cd)

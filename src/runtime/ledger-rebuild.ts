@@ -54,6 +54,8 @@ export interface RebuildProgress {
   collectionsDone: number;
   collectionsTotal: number;
   summary: RebuildCollectionSummary[];
+  /** checkOnly audits: windows where source count != live count */
+  mismatchedWindows: Array<{ collection: string; lowerCd: string; upperCd: string; source: number; live: number }>;
   error: string | null;
   startedAt: number | null;
   finishedAt: number | null;
@@ -62,7 +64,7 @@ export interface RebuildProgress {
 export function newRebuildProgress(): RebuildProgress {
   return {
     status: 'not_run', phase: '', collectionsDone: 0, collectionsTotal: 0,
-    summary: [], error: null, startedAt: null, finishedAt: null,
+    summary: [], mismatchedWindows: [], error: null, startedAt: null, finishedAt: null,
   };
 }
 
@@ -75,8 +77,16 @@ export async function rebuildLedger(opts: {
   ledger: LedgerStore;
   hashResolver: HashResolver;
   progress: RebuildProgress;
+  /**
+   * Audit mode: recount every window (source Mongo vs scoped live ClickHouse)
+   * and REPORT mismatches without touching the ledger. This is the defense
+   * against the one silent-loss class count-based chunk verification cannot
+   * see: a reader under-read whose tally is self-consistent — the SOURCE is
+   * the truth, not the tally.
+   */
+  checkOnly?: boolean;
 }): Promise<void> {
-  const { config, ledger, hashResolver, progress } = opts;
+  const { config, ledger, hashResolver, progress, checkOnly = false } = opts;
   const logger = opts.logger.child({ component: 'LedgerRebuild' });
   const runId = config.ledger.runId;
 
@@ -164,6 +174,12 @@ export async function rebuildLedger(opts: {
 
         const status: ChunkDoc['status'] =
           live === mongoCount ? 'done' : live === 0 ? 'pending' : 'failed';
+        if (checkOnly && live !== mongoCount && progress.mismatchedWindows.length < 200) {
+          progress.mismatchedWindows.push({
+            collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
+            source: mongoCount, live,
+          });
+        }
         summary.mongoDocs += mongoCount;
         summary.liveRows += live;
         summary[status === 'done' ? 'done' : status === 'pending' ? 'pending' : 'failed']++;
@@ -216,13 +232,21 @@ export async function rebuildLedger(opts: {
       logger.info(summary, 'Collection analyzed');
     }
 
-    progress.phase = 'writing ledger';
-    await ledger.replaceAllForRun(runId, allDocs);
-    progress.phase = 'done';
-    logger.info(
-      { chunks: allDocs.length, collections: collections.length },
-      'Ledger rebuilt from data — restart or resume the engine to continue the run',
-    );
+    if (checkOnly) {
+      progress.phase = 'done';
+      logger.info(
+        { windows: allDocs.length, mismatches: progress.mismatchedWindows.length },
+        'Source audit complete — ledger untouched',
+      );
+    } else {
+      progress.phase = 'writing ledger';
+      await ledger.replaceAllForRun(runId, allDocs);
+      progress.phase = 'done';
+      logger.info(
+        { chunks: allDocs.length, collections: collections.length },
+        'Ledger rebuilt from data — restart or resume the engine to continue the run',
+      );
+    }
   } finally {
     await mongo.close().catch(() => {});
     await staging.close().catch(() => {});

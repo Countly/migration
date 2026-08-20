@@ -302,6 +302,28 @@ export class StagingManager {
     return Number(rows[0]?.c ?? 0);
   }
 
+  /**
+   * Full rows for the sampled content audit, keyed by _id. Timestamps come
+   * back in the same 'YYYY-MM-DD hh:mm:ss.SSS' text form the transform
+   * emits, so scalar comparison is direct string/number equality.
+   */
+  async fetchRowsByIds(ids: string[]): Promise<Map<string, Record<string, unknown>>> {
+    const out = new Map<string, Record<string, unknown>>();
+    for (let i = 0; i < ids.length; i += 5_000) {
+      const page = ids.slice(i, i + 5_000);
+      const res = await this.ch().query({
+        query: `SELECT _id, a, e, n, uid, uid_canon, did, lsid,
+                       toString(ts) AS ts, toString(cd) AS cd,
+                       c, s, dur, up, sg, custom, cmp
+                FROM ${this.fq(this.config.table)} WHERE _id IN {ids:Array(String)}`,
+        query_params: { ids: page },
+        format: 'JSONEachRow',
+      });
+      for (const r of await res.json<Record<string, unknown>>()) out.set(String(r._id), r);
+    }
+    return out;
+  }
+
   /** ClickHouse server wall-clock (preflight clock-skew check). */
   async serverNowMs(): Promise<number> {
     const res = await this.ch().query({

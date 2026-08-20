@@ -20,7 +20,7 @@ import { StagingManager } from '../target/staging-manager.ts';
 import { ClickHousePressure } from '../target/clickhouse-pressure.ts';
 import { ChunkOrchestrator } from './chunk-orchestrator.ts';
 import { wireExitOnComplete } from './exit-on-complete.ts';
-import { rebuildLedger, newRebuildProgress } from './ledger-rebuild.ts';
+import { rebuildLedger, newRebuildProgress, type RebuildProgress } from './ledger-rebuild.ts';
 
 export async function runLedgerEngine(config: Config, logger: Logger): Promise<void> {
   logger.info({ engine: 'ledger', runId: config.ledger.runId }, 'Starting ledger engine (no Redis)');
@@ -237,6 +237,37 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.post('/control/dry-run', async () => startDryRun());
   app.post<{ Body: { force?: boolean } }>('/control/rebuild-ledger', async (req) => startRebuild(req.body?.force === true));
   app.get('/api/rebuild', async () => rebuildState);
+
+  // ── Post-migration audits ──────────────────────────────────────────────
+  // Count-based chunk verification is the commit gate; these two answer what
+  // it cannot: (a) source audit — recount every window against the SOURCE
+  // (catches a self-consistent under-read); (b) content audit — sampled
+  // doc-per-doc field comparison (catches right-count-wrong-content).
+  const auditSourceState: RebuildProgress & { status: string } = newRebuildProgress() as never;
+  app.post('/control/audit-source', async () => {
+    if (auditSourceState.status === 'running') return { started: false, reason: 'source audit already running' };
+    if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — audit after completion or while paused' };
+    Object.assign(auditSourceState, newRebuildProgress(), { status: 'running', startedAt: Date.now() });
+    void rebuildLedger({ config, logger, ledger, hashResolver, progress: auditSourceState, checkOnly: true })
+      .then(() => { auditSourceState.status = 'completed'; auditSourceState.finishedAt = Date.now(); })
+      .catch((e) => { auditSourceState.status = 'failed'; auditSourceState.error = (e as Error).message; });
+    return { started: true };
+  });
+  app.get('/api/audit-source', async () => auditSourceState);
+
+  const auditContentState: { status: string; result: Record<string, unknown> | null; error: string | null } =
+    { status: 'not_run', result: null, error: null };
+  app.post<{ Body: { samples?: number } }>('/control/audit-content', async (req) => {
+    if (auditContentState.status === 'running') return { started: false, reason: 'content audit already running' };
+    if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — audit after completion or while paused' };
+    const samples = Math.min(10_000, Math.max(50, req.body?.samples ?? 500));
+    auditContentState.status = 'running'; auditContentState.result = null; auditContentState.error = null;
+    void orchestrator.contentAudit(samples)
+      .then((r) => { auditContentState.result = r as unknown as Record<string, unknown>; auditContentState.status = 'completed'; })
+      .catch((e) => { auditContentState.status = 'failed'; auditContentState.error = (e as Error).message; });
+    return { started: true, samples };
+  });
+  app.get('/api/audit-content', async () => ({ ...auditContentState, progress: orchestrator.contentAuditProgress }));
   app.get('/api/dryrun', async () => dryState);
   app.get('/api/config', async () => ({
     knobs: [

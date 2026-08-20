@@ -1079,6 +1079,106 @@ export class ChunkOrchestrator {
     return false;
   }
 
+  /** Live progress of a running sampled content audit. */
+  readonly contentAuditProgress = {
+    running: false, sampled: 0, matched: 0,
+    mismatches: [] as Array<{ _id: string; collection: string; kind: string; fields?: string[] }>,
+  };
+
+  /**
+   * Sampled doc-per-doc audit — the answer to what count-based verification
+   * cannot see: the right NUMBER of wrong rows. Random source documents are
+   * re-transformed and compared field-by-field against their live rows.
+   * Scalar columns compare exactly; JSON columns (sg/up/custom/cmp) compare
+   * by top-level key set (ClickHouse's JSON type normalizes value encodings,
+   * so value-level equality there belongs to the differential harness, which
+   * pins the transform itself).
+   */
+  async contentAudit(samplesPerCollection = 500): Promise<{
+    sampled: number; matched: number; missing: number; different: number;
+    mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
+  }> {
+    const { config, staging } = this.d;
+    const p = this.contentAuditProgress;
+    p.running = true; p.sampled = 0; p.matched = 0; p.mismatches = [];
+    try {
+      const db = this.d.mongoReader.getDatabase();
+      let collections = await discoverCollections(db, config.source.collectionPrefix, this.logger);
+      const skipEventNames = new Set(['[CLY]_apm_device', '[CLY]_apm_network']);
+      collections = collections.filter((name) => {
+        const defaults = this.d.hashResolver.resolveCollectionName(name, config.source.collectionPrefix);
+        return !(defaults && skipEventNames.has(defaults.e));
+      });
+
+      let missing = 0, different = 0;
+      for (const collection of collections) {
+        const defaults = this.d.hashResolver.resolveCollectionName(collection, config.source.collectionPrefix) ?? undefined;
+        const coll = db.collection(collection);
+        const [lowDoc] = await coll.find({ cd: { $type: 'date' } }).sort({ cd: 1 }).limit(1).project({ cd: 1 }).toArray();
+        const [highDoc] = await coll.find({ cd: { $type: 'date' } }).sort({ cd: -1 }).limit(1).project({ cd: 1 }).toArray();
+        if (!lowDoc || !highDoc) continue;
+        const lo = (lowDoc.cd as Date).getTime(), hi = (highDoc.cd as Date).getTime();
+
+        // K random cd probe points, a small run of docs from each — cheap
+        // index-served sampling without $sample's whole-collection scan.
+        const RUN_LEN = 25;
+        const probes = Math.max(1, Math.ceil(samplesPerCollection / RUN_LEN));
+        const docs: Record<string, unknown>[] = [];
+        for (let k = 0; k < probes; k++) {
+          const at = new Date(lo + Math.floor(((k + 0.5) / probes) * (hi - lo)));
+          const page = await coll.find({ cd: { $gte: at } }).sort({ cd: 1, _id: 1 }).limit(RUN_LEN).toArray();
+          docs.push(...(page as Record<string, unknown>[]));
+        }
+
+        const expected = new Map<string, OutputRow>();
+        for (const doc of docs) {
+          const { row } = transformDocument(doc as SourceDocument, defaults);
+          if (row) expected.set(row._id, row);
+        }
+        if (expected.size === 0) continue;
+        const live = await staging.fetchRowsByIds([...expected.keys()]);
+
+        for (const [id, exp] of expected) {
+          p.sampled++;
+          const got = live.get(id);
+          if (!got || String(got.cd) !== exp.cd) {
+            missing++;
+            if (p.mismatches.length < 100) p.mismatches.push({ _id: id, collection, kind: 'missing (no live row with this (_id, cd))' });
+            continue;
+          }
+          const bad: string[] = [];
+          const eq = (a: unknown, b: unknown): boolean => (a ?? null) === (b ?? null);
+          if (!eq(got.a, exp.a)) bad.push('a');
+          if (!eq(got.e, exp.e)) bad.push('e');
+          if (!eq(got.n, exp.n)) bad.push('n');
+          if (!eq(got.uid, exp.uid)) bad.push('uid');
+          if (!eq(got.uid_canon, exp.uid_canon)) bad.push('uid_canon');
+          if (!eq(got.did, exp.did)) bad.push('did');
+          if (!eq(got.lsid, exp.lsid)) bad.push('lsid');
+          if (String(got.ts) !== exp.ts) bad.push('ts');
+          if (Number(got.c) !== exp.c) bad.push('c');
+          if (Number(got.s) !== exp.s) bad.push('s');
+          if (Number(got.dur) !== exp.dur) bad.push('dur');
+          for (const jf of ['sg', 'up', 'custom', 'cmp'] as const) {
+            const g = got[jf], x = exp[jf];
+            const gKeys = g && typeof g === 'object' ? Object.keys(g as object).sort().join(',') : '';
+            const xKeys = x && typeof x === 'object' ? Object.keys(x as object).sort().join(',') : '';
+            if (gKeys !== xKeys) bad.push(jf + ':keys');
+          }
+          if (bad.length > 0) {
+            different++;
+            if (p.mismatches.length < 100) p.mismatches.push({ _id: id, collection, kind: 'field mismatch', fields: bad });
+          } else {
+            p.matched++;
+          }
+        }
+      }
+      return { sampled: p.sampled, matched: p.matched, missing, different, mismatches: p.mismatches };
+    } finally {
+      p.running = false;
+    }
+  }
+
   /** Live progress of a running DLQ replay (large queues take a while). */
   readonly replayProgress = { running: false, processed: 0, replayed: 0, stillFailing: 0, alreadyLive: 0 };
 

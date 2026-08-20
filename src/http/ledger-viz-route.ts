@@ -369,9 +369,12 @@ const PAGE = `<!doctype html>
       <div class="check"><span class="ic" id="g3-ic">…</span><span class="lbl">Full verification passed</span><span class="det" id="g3-det">run it below</span></div>
       <p style="margin-top:10px">
         <button class="btn primary" id="btn-verify" onclick="runVerify(this)">Verify migration</button>
-        <span class="hint">— recounts every completed chunk against the live table + checks for duplicates. Exact.</span>
+        <button class="btn" id="btn-audit-source" onclick="runAuditSource(this)">Audit vs source</button>
+        <button class="btn" id="btn-audit-content" onclick="runAuditContent(this)">Content sample audit</button>
+        <span class="hint">— Verify recounts chunks vs their tallies (exact). Audit vs source recounts every window against MongoDB itself (catches a self-consistent under-read). Content audit re-transforms random source docs and compares them field-by-field with their live rows (catches right-count-wrong-content).</span>
       </p>
       <div id="verify-result" style="margin-top:10px"></div>
+      <div id="audit-result" style="margin-top:6px;font-size:12.5px;color:var(--ink-2)"></div>
       <p>Then: final report (<a href="/report" target="_blank">/report</a>), customer sign-off, revert Kafka retention, decommission the old cluster.</p>
     </div>
   </details>
@@ -519,6 +522,52 @@ async function pollRebuild() {
       ? '<table><thead><tr><th>collection</th><th>done</th><th>pending</th><th>failed</th><th>mongo docs</th><th>live rows</th><th>null-cd swept</th></tr></thead><tbody>' + rows + '</tbody></table>'
       : '';
   } catch (e) { /* transient poll error */ }
+}
+
+async function runAuditSource(btn) {
+  btn.disabled = true; btn.dataset.label = btn.textContent;
+  try {
+    const start = await fetch('/control/audit-source', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then(r => r.json());
+    if (!start.started) { toast('\u26a0\ufe0f ' + start.reason); btn.disabled = false; return; }
+    let st;
+    for (;;) {
+      st = await fetch('/api/audit-source').then(r => r.json());
+      if (st.status !== 'running') break;
+      btn.textContent = 'Auditing\u2026 ' + (st.phase || '');
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    const mm = st.mismatchedWindows || [];
+    document.getElementById('audit-result').innerHTML = st.status === 'failed'
+      ? '\u274c source audit failed: ' + esc(st.error)
+      : (mm.length === 0
+        ? '\u2705 <b>Source audit passed</b> \u2014 every window recounted directly against MongoDB matches the live table.'
+        : '<b style="color:#B71C1C">\u274c ' + mm.length + ' window(s) disagree with the source</b> \u2014 heal via Rebuild ledger from data (Help tab) then Retry failed chunks: ' +
+          esc(mm.slice(0, 3).map(w => w.collection.slice(0, 18) + ' [' + w.lowerCd.slice(0, 10) + '] src=' + w.source + ' live=' + w.live).join(' \u00b7 ')));
+  } catch (e) { toast('\u274c audit failed: ' + e.message); }
+  btn.disabled = false; btn.textContent = btn.dataset.label;
+}
+
+async function runAuditContent(btn) {
+  btn.disabled = true; btn.dataset.label = btn.textContent;
+  try {
+    const start = await fetch('/control/audit-content', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then(r => r.json());
+    if (!start.started) { toast('\u26a0\ufe0f ' + start.reason); btn.disabled = false; return; }
+    let st;
+    for (;;) {
+      st = await fetch('/api/audit-content').then(r => r.json());
+      if (st.status !== 'running') break;
+      btn.textContent = 'Sampling\u2026 ' + fmt((st.progress || {}).sampled || 0) + ' docs';
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    const r = st.result || {};
+    document.getElementById('audit-result').innerHTML = st.status === 'failed'
+      ? '\u274c content audit failed: ' + esc(st.error)
+      : ((r.missing === 0 && r.different === 0)
+        ? '\u2705 <b>Content audit passed</b> \u2014 ' + fmt(r.sampled) + ' random docs re-transformed and field-compared with their live rows; all match.'
+        : '<b style="color:#B71C1C">\u274c content audit: ' + r.missing + ' missing, ' + r.different + ' field mismatches of ' + fmt(r.sampled) + ' sampled</b> \u2014 ' +
+          esc((r.mismatches || []).slice(0, 3).map(m => m._id + ' (' + (m.fields ? m.fields.join(',') : m.kind) + ')').join(' \u00b7 ')));
+  } catch (e) { toast('\u274c audit failed: ' + e.message); }
+  btn.disabled = false; btn.textContent = btn.dataset.label;
 }
 
 async function runPreflight(btn) {
