@@ -49,6 +49,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
   let ledger: LedgerStore;
   let hashResolver: HashResolver;
   let staging: StagingManager;
+  let dlqStore: DlqStore;
   let config: Config;
   const closers: Array<() => Promise<void>> = [];
 
@@ -131,7 +132,8 @@ describe('multi-collection scoping + ledger rebuild', () => {
       retryReads: true, appName: 'multi-e2e', cursorBatchSize: 500, maxTimeMs: 60_000,
     }, logger);
     ledger = new LedgerStore(MONGO_URI, DB, logger);
-    const dlq = new DlqStore(MONGO_URI, DB, logger);
+    dlqStore = new DlqStore(MONGO_URI, DB, logger);
+    const dlq = dlqStore;
     staging = new StagingManager({
       url: CH_URL, database: DB, table: 'drill_events', username: 'default', password: CH_PASSWORD, queryTimeoutMs: 60_000,
     }, logger);
@@ -212,7 +214,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
 
     const progress = newRebuildProgress();
     progress.status = 'running';
-    await rebuildLedger({ config, logger, ledger, hashResolver, progress });
+    await rebuildLedger({ config, logger, ledger, dlq: dlqStore, hashResolver, progress });
 
     const all = await ledger.listAll(RUN);
     expect(all.length).toBeGreaterThan(0);
@@ -247,7 +249,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
 
     const progress = newRebuildProgress();
     progress.status = 'running';
-    await rebuildLedger({ config, logger, ledger, hashResolver, progress });
+    await rebuildLedger({ config, logger, ledger, dlq: dlqStore, hashResolver, progress });
 
     const all = await ledger.listAll(RUN);
     const failed = all.filter((c) => c.status === 'failed');
@@ -394,7 +396,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     // Clean state: both audits pass and the ledger is untouched by checkOnly
     const before = await ledger.listAll(RUN);
     let prog = newProgress();
-    await rebuild({ config, logger, ledger, hashResolver, progress: prog, checkOnly: true });
+    await rebuild({ config, logger, ledger, dlq: dlqStore, hashResolver, progress: prog, checkOnly: true });
     expect(prog.mismatchedWindows.length).toBe(0);
     const after = await ledger.listAll(RUN);
     expect(after.map((c) => c._id + c.status).join()).toBe(before.map((c) => c._id + c.status).join());
@@ -420,25 +422,55 @@ describe('multi-collection scoping + ledger rebuild', () => {
     expect(hit?.fields).toContain('uid');
     // counts still agree everywhere — this class is invisible to the source audit
     prog = newProgress();
-    await rebuild({ config, logger, ledger, hashResolver, progress: prog, checkOnly: true });
+    await rebuild({ config, logger, ledger, dlq: dlqStore, hashResolver, progress: prog, checkOnly: true });
     expect(prog.mismatchedWindows.length).toBe(0);
 
     // Now a LOSS: delete the row entirely — source audit flags the window
     await staging.deleteLiveByPairs([{ id: 'p_80', cdMs }]);
     prog = newProgress();
-    await rebuild({ config, logger, ledger, hashResolver, progress: prog, checkOnly: true });
+    await rebuild({ config, logger, ledger, dlq: dlqStore, hashResolver, progress: prog, checkOnly: true });
     expect(prog.mismatchedWindows.length).toBe(1);
     expect(prog.mismatchedWindows[0].source - prog.mismatchedWindows[0].live).toBe(1);
 
     // Restore the true row; both audits green again
     await staging.insertIntoLive([row!], 'audit-restore');
     prog = newProgress();
-    await rebuild({ config, logger, ledger, hashResolver, progress: prog, checkOnly: true });
+    await rebuild({ config, logger, ledger, dlq: dlqStore, hashResolver, progress: prog, checkOnly: true });
     expect(prog.mismatchedWindows.length).toBe(0);
     audit = await orchestrator.contentAudit(600);
     expect(audit.missing).toBe(0);
     expect(audit.different).toBe(0);
   }, 120_000);
+
+  it('a waived DLQ doc explains its window shortfall — audit does not cry wolf', async () => {
+    const { rebuildLedger: rebuild, newRebuildProgress: newProgress } = await import('../../src/runtime/ledger-rebuild.ts');
+    const { transformDocument } = await import('../../src/transform/normalize.ts');
+
+    // Simulate a doc that never migrated because it was DLQ'd and waived:
+    // remove its live row and record it as waived with its cd attributed.
+    const srcDoc = await mc.db(DB).collection(COLL1).findOne({ _id: 'p_40' } as never) as Record<string, unknown>;
+    const cdMs = (srcDoc.cd as Date).getTime();
+    await staging.deleteLiveByPairs([{ id: 'p_40', cdMs }]);
+    await dlqStore.add([{
+      run_id: RUN, source_id: 'p_40', collection: COLL1, chunk_id: 'test', reason: 'insert_rejected',
+      error: 'unfixable by decision', transform_version: 'v-test', raw_doc: srcDoc,
+    } as never]);
+    await dlqStore.waive(RUN, [`${RUN}:p_40`]);
+
+    // Source audit: source > live by exactly the waived doc → NOT a mismatch
+    const prog = newProgress();
+    await rebuild({ config, logger, ledger, dlq: dlqStore, hashResolver, progress: prog, checkOnly: true });
+    expect(prog.mismatchedWindows.length).toBe(0);
+
+    // restore: un-waive bookkeeping + reinsert the true row
+    const defaults = hashResolver.resolveCollectionName(COLL1, config.source.collectionPrefix) ?? undefined;
+    const { row } = transformDocument(srcDoc as never, defaults);
+    await staging.insertIntoLive([row!], 'audit-waive-restore');
+    await mc.db(DB).collection('mig_dlq_docs').deleteOne({ _id: `${RUN}:p_40` } as never);
+    const clean = newProgress();
+    await rebuild({ config, logger, ledger, dlq: dlqStore, hashResolver, progress: clean, checkOnly: true });
+    expect(clean.mismatchedWindows.length).toBe(0);
+  }, 60_000);
 
   it('attach-recovery pair check ignores live copies of the same _id (cross-cutover retry)', async () => {
     // The mixing vector: a crash during attach + an SDK retry that landed the

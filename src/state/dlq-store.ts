@@ -8,6 +8,7 @@
  */
 
 import { MongoClient, type Collection } from 'mongodb';
+import { toEpochMillis, clampDateTime64 } from '../transform/validators.ts';
 import type { Logger } from 'pino';
 
 export type DlqReason = 'insert_rejected' | 'transform_error' | 'skipped';
@@ -23,6 +24,14 @@ export interface DlqDoc {
   reason: DlqReason;
   error: string;
   transform_version: string;      // version that failed
+  /**
+   * The doc's cd (or ts-derived fallback) in epoch ms, when parseable —
+   * lets audits attribute unmigrated docs to their cd window, so a window
+   * whose shortfall is exactly its pending/waived DLQ docs is not flagged
+   * as a disagreement. Null when the doc has no usable cd/ts (those can't
+   * land in any window anyway).
+   */
+  cd_ms: number | null;
   status: DlqStatus;
   resolved_by_version: string | null;
   created_at: Date;
@@ -45,6 +54,7 @@ export class DlqStore {
     await this.client.connect();
     this.coll = this.client.db(this.dbName).collection<DlqDoc>('mig_dlq_docs');
     await this.coll.createIndex({ run_id: 1, status: 1 });
+    await this.coll.createIndex({ run_id: 1, collection: 1, cd_ms: 1 });
     this.logger.info({ db: this.dbName }, 'DlqStore connected');
   }
 
@@ -57,10 +67,17 @@ export class DlqStore {
     return this.coll;
   }
 
-  async add(entries: Array<Omit<DlqDoc, '_id' | 'status' | 'resolved_by_version' | 'created_at' | 'updated_at'>>): Promise<void> {
+  async add(entries: Array<Omit<DlqDoc, '_id' | 'status' | 'resolved_by_version' | 'created_at' | 'updated_at' | 'cd_ms'> & { cd_ms?: number | null }>): Promise<void> {
     if (entries.length === 0) return;
     const now = new Date();
+    const deriveCdMs = (raw: Record<string, unknown>): number | null => {
+      const cd = toEpochMillis(raw.cd);
+      if (cd !== null && cd > 0) return clampDateTime64(cd);
+      const ts = toEpochMillis(raw.ts);
+      return ts !== null && ts > 0 ? clampDateTime64(ts) : null;
+    };
     const docs: DlqDoc[] = entries.map((e) => ({
+      cd_ms: e.cd_ms !== undefined ? e.cd_ms : deriveCdMs(e.raw_doc),
       ...e,
       _id: `${e.run_id}:${e.source_id}`,
       status: 'pending',
@@ -101,6 +118,20 @@ export class DlqStore {
       if (ds.fsTotalSize) diskFreePct = Math.round(((ds.fsTotalSize - ds.fsUsedSize) / ds.fsTotalSize) * 100);
     } catch { /* no permission — omit */ }
     return { dlqBytes, dlqDocs, diskFreePct };
+  }
+
+  /**
+   * Known-unmigrated docs (pending/waived — anything not resolved) whose cd
+   * falls in a window. Audits subtract these: their absence from the live
+   * table is accounted for, not a disagreement. Entries written before the
+   * cd_ms field (or with unparseable cd/ts) can't be attributed and count 0.
+   */
+  async countUnresolvedInWindow(runId: string, collection: string, lowerCdMs: number, upperCdMs: number): Promise<number> {
+    return this.c().countDocuments({
+      run_id: runId, collection,
+      cd_ms: { $gte: lowerCdMs, $lt: upperCdMs },
+      status: { $ne: 'resolved' },
+    });
   }
 
   async countByStatus(runId: string): Promise<Record<string, number>> {

@@ -30,6 +30,7 @@ import { MongoClient } from 'mongodb';
 import type { Config } from '../config/schema.ts';
 import type { HashResolver } from '../transform/hash-resolver.ts';
 import { LedgerStore, type ChunkDoc } from '../state/ledger-store.ts';
+import type { DlqStore } from '../state/dlq-store.ts';
 import { StagingManager } from '../target/staging-manager.ts';
 import { discoverCollections } from '../source/discover-collections.ts';
 import { computeChunkBounds } from './chunk-orchestrator.ts';
@@ -76,6 +77,7 @@ export async function rebuildLedger(opts: {
   config: Config;
   logger: Logger;
   ledger: LedgerStore;
+  dlq: DlqStore;
   hashResolver: HashResolver;
   progress: RebuildProgress;
   /**
@@ -87,7 +89,7 @@ export async function rebuildLedger(opts: {
    */
   checkOnly?: boolean;
 }): Promise<void> {
-  const { config, ledger, hashResolver, progress, checkOnly = false } = opts;
+  const { config, ledger, dlq, hashResolver, progress, checkOnly = false } = opts;
   const logger = opts.logger.child({ component: 'LedgerRebuild' });
   const runId = config.ledger.runId;
 
@@ -182,10 +184,15 @@ export async function rebuildLedger(opts: {
         for (let i = lo; i < sweptCds.length && sweptCds[i] < b.upperCd; i++) sweptIn++;
         const live = liveRaw - sweptIn;
 
+        // Docs in this window that are KNOWN unmigrated (pending/waived DLQ)
+        // legitimately explain source > live — without this, a window whose
+        // only shortfall is its own DLQ'd docs gets flagged/redone forever.
+        const unresolved = await dlq.countUnresolvedInWindow(runId, collection, b.lowerCd, b.upperCd);
+
         const status: ChunkDoc['status'] =
-          live === mongoCount ? 'done' : live === 0 ? 'pending' : 'failed';
+          live + unresolved === mongoCount ? 'done' : live === 0 ? 'pending' : 'failed';
         // pending (live=0) is 'not migrated yet', not a disagreement
-        if (checkOnly && live !== mongoCount && live !== 0 && progress.mismatchedWindows.length < 200) {
+        if (checkOnly && live + unresolved !== mongoCount && live !== 0 && progress.mismatchedWindows.length < 200) {
           progress.mismatchedWindows.push({
             collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
             source: mongoCount, live,

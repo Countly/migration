@@ -189,7 +189,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       return { started: false, reason: `ledger already has ${existing} chunks for run "${config.ledger.runId}" — rebuilding replaces them; confirm with force`, existingChunks: existing };
     }
     Object.assign(rebuildState, newRebuildProgress(), { status: 'running', startedAt: Date.now() });
-    void rebuildLedger({ config, logger, ledger, hashResolver, progress: rebuildState })
+    void rebuildLedger({ config, logger, ledger, dlq, hashResolver, progress: rebuildState })
       .then(() => { rebuildState.status = 'completed'; rebuildState.finishedAt = Date.now(); })
       .catch((err) => {
         rebuildState.status = 'failed';
@@ -248,7 +248,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     if (auditSourceState.status === 'running') return { started: false, reason: 'source audit already running' };
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — audit after completion or while paused' };
     Object.assign(auditSourceState, newRebuildProgress(), { status: 'running', startedAt: Date.now() });
-    void rebuildLedger({ config, logger, ledger, hashResolver, progress: auditSourceState, checkOnly: true })
+    void rebuildLedger({ config, logger, ledger, dlq, hashResolver, progress: auditSourceState, checkOnly: true })
       .then(() => { auditSourceState.status = 'completed'; auditSourceState.finishedAt = Date.now(); })
       .catch((e) => { auditSourceState.status = 'failed'; auditSourceState.error = (e as Error).message; });
     return { started: true };
