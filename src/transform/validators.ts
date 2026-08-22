@@ -147,6 +147,23 @@ export function sanitizeJsonValue(value: unknown, onCoerce?: OnCoerce): unknown 
       onCoerce?.('stringify_nonfinite', value, '-Infinity');
       return '-Infinity';
     }
+    // Integer-valued doubles in the Int64/UInt64 overflow window serialize
+    // in FIXED notation below 1e21 (e.g. 5.26e19 → "52601586211929000000"),
+    // so ClickHouse's JSON parser infers an integer type and overflows —
+    // the row is unmigratable as a number. Beyond 1e21 JS emits exponent
+    // notation ("9.2e+25") which lands as Float64, so those stay numeric.
+    // Same philosophy as NaN/bigint/Long: values the target cannot carry
+    // numerically are stringified losslessly (as they would have
+    // serialized) and counted. Live ingestion errors on these entirely, so
+    // there is no row-identity divergence to preserve.
+    if (
+      (value >= 18446744073709551616 && value < 1e21) ||       // > UInt64 max
+      (value <= -9223372036854775809 && value > -1e21)         // < Int64 min
+    ) {
+      const str = String(value);
+      onCoerce?.('stringify_int64_overflow', value, str);
+      return str;
+    }
     return value;
   }
   if (typeof value === 'bigint') {

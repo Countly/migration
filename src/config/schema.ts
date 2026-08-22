@@ -95,7 +95,7 @@ export const configSchema = z.object({
 
     // ── Transform ────────────────────────────────────────────────────────
     transform: z.object({
-        version: z.string().default("v1"),
+        version: z.string().default("v2"),
     }),
 
     // ── ClickHouse Target ────────────────────────────────────────────────

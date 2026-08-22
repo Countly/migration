@@ -71,6 +71,21 @@ describe('coercions (shared spec: only non-JSON-carriable values change)', () =>
     expect(counter.getTotal()).toBe(1);
     expect(counter.getReport()[0].rule_key).toBe('stringify_nonfinite:sg');
   });
+  it('stringifies integer doubles in the Int64/UInt64 overflow window (the devops DLQ case)', () => {
+    const out = sanitizeJsonValue({
+      overflow_pos: 5.2601586211929e19,   // devops' UserID: fixed notation → UInt64 overflow in CH
+      overflow_neg: -9.3e18,              // below Int64 min
+      ok_uint64: 9.2e18,                  // parses as UInt64/Int64 — stays numeric
+      ok_float: 9.2e25,                   // ≥1e21 → exponent notation → Float64 — stays numeric
+      ok_edge: 1e21,
+    }) as Record<string, unknown>;
+    expect(out.overflow_pos).toBe('52601586211929000000');
+    expect(out.overflow_neg).toBe('-9300000000000000000');
+    expect(out.ok_uint64).toBe(9.2e18);
+    expect(out.ok_float).toBe(9.2e25);
+    expect(out.ok_edge).toBe(1e21);
+  });
+
   it('caps distinct coercion keys; the overflow bucket keeps totals exact', () => {
     const counter = new CoercionCounter();
     for (let i = 0; i < 10_050; i++) counter.record('stringify_nonfinite', `field_${i}`, NaN, 'NaN');
@@ -189,7 +204,7 @@ describe('ledger engine end-to-end', () => {
     }
     docs.push({
       _id: 'coerce_me', a: 'app1', e: 'big_int_event', uid: 'u9', did: 'd9',
-      ts: base + 1, cd: new Date(base + 1), sg: { order_id: 9.2e25, weird: Number.POSITIVE_INFINITY }, c: 1,
+      ts: base + 1, cd: new Date(base + 1), sg: { order_id: 9.2e25, weird: Number.POSITIVE_INFINITY, user_ref: 5.2601586211929e19 }, c: 1,
     });
     // Docs with no cd value — must be picked up by the null-cd sweep chunk
     docs.push({ _id: 'nocd_1', a: 'app1', e: 'legacy_event', uid: 'u1', did: 'd', ts: base - 86_400_000 });
@@ -275,12 +290,15 @@ describe('ledger engine end-to-end', () => {
 
     // Spec behavior: finite large double stays numeric; Infinity stringified
     const coerced = await ch.query({
-      query: `SELECT sg.order_id AS v, sg.weird AS w FROM ${DB}.drill_events WHERE _id = 'coerce_me'`,
+      query: `SELECT sg.order_id AS v, sg.weird AS w, sg.user_ref AS u FROM ${DB}.drill_events WHERE _id = 'coerce_me'`,
       format: 'JSONEachRow',
     });
-    const [c] = await coerced.json<{ v: unknown; w: unknown }>();
+    const [c] = await coerced.json<{ v: unknown; w: unknown; u: unknown }>();
     expect(Number(c.v)).toBe(9.2e25);
     expect(String(c.w)).toBe('Infinity');
+    // The overflow-window value LANDED (previously insert_rejected → DLQ),
+    // losslessly, as the string it would have serialized to
+    expect(String(c.u)).toBe('52601586211929000000');
 
     const stats = orchestrator.getStats();
     expect(stats.totalCoercions).toBeGreaterThanOrEqual(1);
