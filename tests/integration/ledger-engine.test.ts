@@ -300,6 +300,17 @@ describe('ledger engine end-to-end', () => {
     // losslessly, as the string it would have serialized to
     expect(String(c.u)).toBe('52601586211929000000');
 
+    // Platform-compat: countly-platform's WhereClauseConverter queries sg
+    // numerically as toFloat64OrNull(CAST(field,'String')) — through that
+    // pattern the stringified value behaves EXACTLY like the number would,
+    // so product queries (filters, sums) are unaffected by the coercion.
+    const viaPlatformPattern = await ch.query({
+      query: `SELECT toFloat64OrNull(CAST(sg.user_ref, 'String')) AS f
+              FROM ${DB}.drill_events WHERE _id = 'coerce_me'`,
+      format: 'JSONEachRow',
+    });
+    expect(Number((await viaPlatformPattern.json<{ f: number }>())[0].f)).toBe(5.2601586211929e19);
+
     const stats = orchestrator.getStats();
     expect(stats.totalCoercions).toBeGreaterThanOrEqual(1);
     expect(stats.chunksFailed).toBe(0);
