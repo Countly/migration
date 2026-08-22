@@ -240,10 +240,12 @@ export class ChunkOrchestrator {
 
     await mongoReader.switchCollection(collection);
 
+    // Unconditional: joins an in-progress build (crash-recovery case),
+    // no-ops when ready, builds when missing — returns only when READY.
     if (!(await mongoReader.hasRequiredIndex(collection))) {
-      log.info('Building {cd:1,_id:1} index');
-      await mongoReader.startIndexCreation(collection);
+      log.info('Building {cd:1,_id:1} index (this can take a long time on large collections — progress in the UI)');
     }
+    await mongoReader.ensureIndex(collection);
 
     const lower = await mongoReader.getLowerBound();
     const upper = await mongoReader.getUpperBound();

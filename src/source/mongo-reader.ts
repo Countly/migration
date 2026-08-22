@@ -68,7 +68,10 @@ export class MongoReader {
       readConcern: { level: readConcern as "local" | "majority" | "linearizable" | "available" | "snapshot" },
       serverSelectionTimeoutMS: 30_000,
       connectTimeoutMS: 10_000,
-      socketTimeoutMS: this.config.maxTimeMs + 30_000,
+      // NO socketTimeoutMS: every read op carries its own maxTimeMS, and a
+      // client-wide socket timeout kills legitimately long awaits — a
+      // multi-minute createIndex died at maxTimeMs+30s in the field (the
+      // dry-run crash devops hit), leaving a half-built index behind.
     });
 
     await this.client.connect();
@@ -94,17 +97,20 @@ export class MongoReader {
   }
 
   /**
-   * Start index creation for a collection. This may take a long time for
-   * large collections. The returned promise resolves when the index is built.
+   * Ensure the { cd: 1, _id: 1 } index exists AND is ready. Always calls
+   * createIndex: on a complete index it returns immediately; on an
+   * IN-PROGRESS identical build it JOINS and waits for readiness; otherwise
+   * it builds. This is the only crash-safe gate — listIndexes (and therefore
+   * hasRequiredIndex) lists in-progress builds as present, and hinting an
+   * unfinished index fails with 'hint provided does not correspond to an
+   * existing index' (the second dry-run crash devops hit).
    */
-  async startIndexCreation(collectionName: string): Promise<void> {
+  async ensureIndex(collectionName: string): Promise<void> {
     if (!this.connected || !this.db) {
       throw new Error("MongoReader is not connected. Call connect() first.");
     }
     const coll = this.db.collection(collectionName);
-    this.logger.info({ collection: collectionName }, "Starting index creation { cd: 1, _id: 1 }");
     await coll.createIndex({ cd: 1, _id: 1 });
-    this.logger.info({ collection: collectionName }, "Index creation completed");
   }
 
   /**
