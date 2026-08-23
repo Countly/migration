@@ -51,6 +51,57 @@ describe('error-classifier', () => {
   });
 });
 
+describe('schema shapes: hashed-collection (old) vs base drill_events (new format)', () => {
+  const OLD_SHAPE = { _id: 'o1', uid: 'u1', did: 'd1', ts: 1750000000000, cd: new Date(1750000000000), sg: { v: 1 }, c: 1 };
+
+  it('old shape (no a/e in doc): identity comes from the collection hash defaults', () => {
+    const { row } = transformDocument({ ...OLD_SHAPE } as never, { a: 'app1', e: 'purchase' });
+    expect(row?.a).toBe('app1');
+    expect(row?.e).toBe('[CLY]_custom');   // custom event: e is the bucket
+    expect(row?.n).toBe('purchase');       // original name in n
+  });
+
+  it('old shape with an internal event collection: e stays, n derives from sg', () => {
+    const { row } = transformDocument(
+      { ...OLD_SHAPE, sg: { name: '/cart' } } as never, { a: 'app1', e: '[CLY]_view' },
+    );
+    expect(row?.e).toBe('[CLY]_view');
+    expect(row?.n).toBe('/cart');
+  });
+
+  it('new shape (embedded a/e/n) is used as-is; embedded values win over defaults', () => {
+    const { row } = transformDocument(
+      { ...OLD_SHAPE, a: 'app_embedded', e: '[CLY]_custom', n: 'prenamed' } as never,
+      { a: 'app_from_hash', e: 'other_event' },
+    );
+    expect(row?.a).toBe('app_embedded');
+    expect(row?.n).toBe('prenamed');       // doc.n wins — dedup identity with live rows
+  });
+
+  it('old shape with seconds-unit ts converts to millis', () => {
+    const { row } = transformDocument(
+      { ...OLD_SHAPE, ts: 1750000000 } as never, { a: 'app1', e: 'purchase' },
+    );
+    expect(row?.ts).toBe('2025-06-15 15:06:40.000');
+  });
+
+  it('no identity anywhere (base-collection doc without a, no defaults) → skipped, not garbage', () => {
+    const { row, skipReason } = transformDocument({ ...OLD_SHAPE } as never, undefined);
+    expect(row).toBeNull();
+    expect(skipReason).toBe('missing_a');
+  });
+
+  it('old-only helper fields are dropped like live ingestion drops them', () => {
+    const { row } = transformDocument(
+      { ...OLD_SHAPE, d: 15, w: 24, m: '2025:6', h: 13, _uid: 'objectid' } as never,
+      { a: 'app1', e: 'purchase' },
+    );
+    expect(row && 'd' in row).toBe(false);
+    expect(row && 'm' in row).toBe(false);
+    expect(row && '_uid' in row).toBe(false);
+  });
+});
+
 describe('coercions (shared spec: only non-JSON-carriable values change)', () => {
   it('stringifies NaN/Infinity/bigint losslessly; finite large doubles STAY numbers (matches live ingestion)', () => {
     const out = sanitizeJsonValue({ ok: 42, big: 9.2e25, nan: NaN, inf: Infinity, huge: 10n ** 30n, str: 'hello' }) as Record<string, unknown>;
