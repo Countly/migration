@@ -92,6 +92,11 @@ describe('pod chaos: random SIGKILL across all stages, exact end state', () => {
     BACKPRESSURE_ENABLED: 'false',
     MULTI_POD_ENABLED: 'true',
     LOG_LEVEL: 'fatal',
+    // fast retries: local CH is healthy here; prod-like backoff would only
+    // slow the kill cycles (the outage-chaos suite tests the real backoff)
+    CLICKHOUSE_MAX_RETRIES: '2',
+    CLICKHOUSE_RETRY_BASE_DELAY_MS: '50',
+    CLICKHOUSE_RETRY_MAX_DELAY_MS: '200',
   };
 
   const stderrTail = new Map<string, string>();

@@ -759,6 +759,55 @@ describe('multi-collection scoping + ledger rebuild', () => {
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: MPR } as never);
   }, 60_000);
 
+  it('auto-resume: transient breaker pause heals when backends are healthy; data pause never does', async () => {
+    const orch = orchestrator as unknown as {
+      pause: (r?: string) => void;
+      resume: () => void;
+      getStatus: () => string;
+      autoResumeProbe: () => Promise<void>;
+    };
+    // a failed chunk that auto-resume must re-queue (empty far-future window
+    // + fake collection: purge and sentinel logic are no-ops)
+    const fakeId = `${RUN}:fake_autoresume_coll:0`;
+    await mc.db(DB).collection('mig_ranges').insertOne({
+      _id: fakeId, run_id: RUN, collection: 'fake_autoresume_coll',
+      scope_a: APP, scope_e: '[CLY]_custom', scope_n: 'zzz_none',
+      idx: 0, lower_cd: 4102444800000, upper_cd: 4102444900000,
+      status: 'failed', pod_id: null, lease_until: null, staging_table: null,
+      docs_read: 0, docs_skipped: 0, rows_expected: 0, partitions: [], attached: [],
+      attach_method: null, attempts: 3, last_error: 'ECONNRESET (injected)', transform_version: 'v2', updated_at: new Date(),
+    } as never);
+
+    // this orchestrator never ran a copy loop — its display status is
+    // 'idle'; give it the running state a real paused pod would have
+    (orchestrator as unknown as { status: string }).status = 'running';
+
+    // transient pause + two healthy probes → resumed, failed chunk re-queued
+    orch.pause('breaker-transient');
+    expect(orch.getStatus()).toBe('paused');
+    await orch.autoResumeProbe(); // probe 1: healthy, streak=1 — still paused
+    expect(orch.getStatus()).toBe('paused');
+    await orch.autoResumeProbe(); // probe 2: healthy — auto-resume fires
+    expect(orch.getStatus()).toBe('running');
+    const doc = await mc.db(DB).collection('mig_ranges').findOne({ _id: fakeId } as never);
+    expect(doc?.status).toBe('pending'); // retryFailed ran as part of auto-resume
+    expect(doc?.attempts).toBe(0);
+
+    // data pause and operator pause are never auto-resumed
+    for (const reason of ['breaker-data', undefined] as const) {
+      (orchestrator as unknown as { status: string }).status = 'running';
+      orch.pause(reason as never);
+      expect(orch.getStatus()).toBe('paused');
+      await orch.autoResumeProbe();
+      await orch.autoResumeProbe();
+      await orch.autoResumeProbe();
+      expect(orch.getStatus(), `reason=${reason ?? 'operator'}`).toBe('paused');
+      orch.resume();
+    }
+    (orchestrator as unknown as { status: string }).status = 'idle';
+    await mc.db(DB).collection('mig_ranges').deleteMany({ _id: fakeId } as never);
+  }, 30_000);
+
   it('reclaim: two recoverers race an expired chunk — exactly one wins', async () => {
     const RR = 'reclaim-race-run';
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: RR } as never);

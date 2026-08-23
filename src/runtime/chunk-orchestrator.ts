@@ -68,6 +68,7 @@ export interface LedgerEngineStats {
   totalCoercions: number;
   chunksDone: number;
   chunksFailed: number;
+  pauseReason: string | null;
   docsPerSecond: number;
   stageMs: { read: number; transform: number; insert: number; verify: number; attach: number; pressureWait: number };
   dedupWorks: boolean | null;
@@ -133,6 +134,11 @@ export class ChunkOrchestrator {
   private currentChunk: string | null = null;
   private startedAt = 0;
   private consecutiveFailed = 0;
+  private streakHadPermanent = false;
+  private pauseReason: 'operator' | 'breaker-transient' | 'breaker-data' | null = null;
+  private probeOkStreak = 0;
+  private autoResuming = false;
+  private resumeProbeTimer: NodeJS.Timeout | null = null;
   private lastReclaimAt = 0;
   private monitorTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -162,8 +168,22 @@ export class ChunkOrchestrator {
   // -------------------------------------------------------------------------
 
   stopAfterChunk(): void { this.stopping = true; }
-  pause(): void { this.paused = true; if (this.status === 'running') this.status = 'paused'; }
-  resume(): void { this.paused = false; if (this.status === 'paused') this.status = 'running'; }
+  pause(reason: 'operator' | 'breaker-transient' | 'breaker-data' = 'operator'): void {
+    this.paused = true;
+    this.pauseReason = reason;
+    if (this.status === 'running') this.status = 'paused';
+  }
+
+  resume(): void {
+    this.paused = false;
+    this.pauseReason = null;
+    // clean slate: without this, one stray failure after resume re-trips
+    // the breaker instantly (the streak counter would still be at max)
+    this.consecutiveFailed = 0;
+    this.streakHadPermanent = false;
+    this.probeOkStreak = 0;
+    if (this.status === 'paused') this.status = 'running';
+  }
   getStatus(): string { return this.status; }
 
   /** ClickHouse row-identity scope of a chunk's collection; null when unresolvable. */
@@ -188,6 +208,14 @@ export class ChunkOrchestrator {
     this.startedAt = Date.now();
     this.finishedAt = 0;
     const { config } = this.d;
+
+    // Transient-outage self-healing: only acts while paused with reason
+    // 'breaker-transient' (backend outage tripped the failure breaker) —
+    // every other pause stays owned by the operator.
+    this.resumeProbeTimer = setInterval(() => {
+      void this.autoResumeProbe();
+    }, 15_000);
+    this.resumeProbeTimer.unref?.();
 
     if (this.dryRun) {
       await this.d.staging.createDryRunTable();
@@ -307,6 +335,7 @@ export class ChunkOrchestrator {
     this.currentCollection = null;
 
     if (this.monitorTimer) clearInterval(this.monitorTimer);
+    if (this.resumeProbeTimer) clearInterval(this.resumeProbeTimer);
     this.status = this.stopping ? 'stopped' : 'completed';
     this.finishedAt = Date.now();
     this.logger.info(
@@ -680,8 +709,8 @@ export class ChunkOrchestrator {
           staging_table: null,
           last_error: `circuit breaker: ${(failRate * 100).toFixed(1)}% of docs failed`,
         }, fence);
-        this.noteChunkFailure(clog);
-        this.pause();
+        this.noteChunkFailure(clog, 'permanent');
+        this.pause('breaker-data');
         return;
       }
 
@@ -690,6 +719,7 @@ export class ChunkOrchestrator {
         await ledger.transition(chunk._id, 'written', 'done', { attach_method: null }, fence);
         this.chunksDone++;
         this.consecutiveFailed = 0;
+        this.streakHadPermanent = false;
         clog.info({ docsRead: result.docsRead, dlq: result.docsDlq }, 'Dry-run chunk done');
         return;
       }
@@ -715,6 +745,7 @@ export class ChunkOrchestrator {
         clog,
       );
       this.consecutiveFailed = 0;
+      this.streakHadPermanent = false;
 
       // Per-commit under-read guard: the tally-independent check. Everything
       // else compares against docs READ; this one asks the SOURCE how many
@@ -732,7 +763,7 @@ export class ChunkOrchestrator {
           await ledger.transition(chunk._id, 'done', 'failed', {
             last_error: `source-count mismatch: source=${srcCount} read=${result.docsRead} — under/over-read; retry redoes the window`,
           });
-          this.noteChunkFailure(clog);
+          this.noteChunkFailure(clog, 'permanent');
         }
       }
 
@@ -761,7 +792,7 @@ export class ChunkOrchestrator {
         pod_id: null,
         last_error: error.message.slice(0, 500),
       }, fence);
-      if (target === 'failed') this.noteChunkFailure(clog);
+      if (target === 'failed') this.noteChunkFailure(clog, isPermanent ? 'permanent' : 'transient');
     } finally {
       clearInterval(heartbeat);
       this.assertClaimHook = null;
@@ -1185,15 +1216,56 @@ export class ChunkOrchestrator {
   // Circuit breaker bookkeeping
   // -------------------------------------------------------------------------
 
-  private noteChunkFailure(log: Logger): void {
+  /**
+   * cls semantics: only failures KNOWN to be data-permanent pass
+   * 'permanent' (the classifier at the failure site decides). Unknown-cause
+   * failures (crash quarantine) default to 'transient': if the streak has
+   * no known-permanent failure, the pause arms the auto-resume probe — an
+   * infra outage self-heals, while genuine poison re-fails through the
+   * classified path on the next attempt and re-pauses as breaker-data.
+   */
+  private noteChunkFailure(log: Logger, cls: 'transient' | 'permanent' = 'transient'): void {
     this.chunksFailed++;
     this.consecutiveFailed++;
+    if (cls === 'permanent') this.streakHadPermanent = true;
     if (this.consecutiveFailed >= this.d.config.ledger.breakerConsecutive) {
+      const reason = this.streakHadPermanent ? 'breaker-data' : 'breaker-transient';
       log.error(
-        { consecutiveFailed: this.consecutiveFailed },
-        'Circuit breaker: consecutive chunk failures — pausing engine',
+        { consecutiveFailed: this.consecutiveFailed, reason },
+        'Circuit breaker: consecutive chunk failures — pausing engine' +
+        (reason === 'breaker-transient' ? ' (transient causes — auto-resume armed, probing backends)' : ''),
       );
-      this.pause();
+      this.pause(reason);
+    }
+  }
+
+  /**
+   * While paused by TRANSIENT failures (backend outage), probe both
+   * backends; two consecutive healthy probes re-queue the failed chunks and
+   * resume. Data pauses (breaker-data, operator, monitor, DLQ guard) never
+   * auto-resume.
+   */
+  private async autoResumeProbe(): Promise<void> {
+    if (!this.paused || this.pauseReason !== 'breaker-transient' || this.autoResuming) return;
+    try {
+      await this.d.staging.serverNowMs();
+      await this.d.ledger.countForRun(this.runId);
+      this.probeOkStreak++;
+    } catch {
+      this.probeOkStreak = 0;
+      return;
+    }
+    if (this.probeOkStreak < 2) return;
+    this.autoResuming = true;
+    try {
+      const { retried } = await this.retryFailed();
+      this.logger.warn({ retried }, 'Backends healthy after transient-failure pause — auto-resumed, failed chunks re-queued');
+      this.resume();
+    } catch (err) {
+      this.logger.warn({ err: (err as Error).message }, 'Auto-resume attempt failed — will re-probe');
+      this.probeOkStreak = 0;
+    } finally {
+      this.autoResuming = false;
     }
   }
 
@@ -1238,7 +1310,7 @@ export class ChunkOrchestrator {
         await this.d.ledger.transition(chunk._id, 'done', 'failed', {
           last_error: `invariant violation: live=${live} expected=${chunk.rows_expected}`,
         });
-        this.pause();
+        this.pause('breaker-data');
         return;
       }
     }
@@ -1343,7 +1415,7 @@ export class ChunkOrchestrator {
         '(redo re-reads the source) or Replay DLQ. Raise LEDGER_DLQ_PAUSE_THRESHOLD only ' +
         'if the disk numbers above say you can afford to keep collecting.',
       );
-      this.pause();
+      this.pause('breaker-data');
       return true;
     }
     return false;
@@ -1919,6 +1991,7 @@ export class ChunkOrchestrator {
       totalCoercions: this.coercions.getTotal(),
       chunksDone: this.chunksDone,
       chunksFailed: this.chunksFailed,
+      pauseReason: this.pauseReason,
       docsPerSecond: elapsedSec > 0 ? this.totalDocsRead / elapsedSec : 0,
       stageMs: {
         read: Math.round(this.stageMs.read),

@@ -54,7 +54,14 @@ await hashResolver.build();
 
 const orchestrator = new ChunkOrchestrator({
   config, logger, mongoReader, ledger, dlq, staging,
-  retryPolicy: new RetryPolicy({ maxRetries: 2, baseDelayMs: 50, maxDelayMs: 200 }), hashResolver,
+  // Real config-driven policy (CLICKHOUSE_MAX_RETRIES etc.) — the outage
+  // chaos test relies on prod-like backoff absorbing multi-second blips;
+  // pod-kill tests override via env for speed.
+  retryPolicy: new RetryPolicy({
+    maxRetries: config.target.maxRetries,
+    baseDelayMs: config.target.retryBaseDelayMs,
+    maxDelayMs: config.target.retryMaxDelayMs,
+  }), hashResolver,
 });
 await orchestrator.run();
 const stats = orchestrator.getStats();

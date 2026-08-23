@@ -707,7 +707,9 @@ async function tick() {
       (effRate > 0 && etaDocs > 0 ? Math.max(1, Math.round(etaDocs / effRate / 60)) + ' min' : '–');
 
     const st = document.getElementById('b-status');
-    st.textContent = stats.status;
+    st.textContent = stats.status +
+      (stats.pauseReason === 'breaker-transient' ? ' \u00b7 auto-resume armed' :
+       stats.pauseReason === 'breaker-data' ? ' \u00b7 needs operator (data)' : '');
     var fb = document.getElementById('fatal-banner');
     if (stats.fatalError) {
       fb.style.display = 'block';
