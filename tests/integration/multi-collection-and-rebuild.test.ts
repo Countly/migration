@@ -724,9 +724,40 @@ describe('multi-collection scoping + ledger rebuild', () => {
     }));
     await staging.insertBatch(st, rows as never, 'manyparts-token', 'manyparts-q1');
     expect(await staging.countRows(st)).toBe(120);
-    expect((await staging.listPartitions(st)).length).toBe(120); // one partition per ts-month
-    await staging.dropStaging(st);
-  }, 30_000);
+    const partitions = await staging.listPartitions(st);
+    expect(partitions.length).toBe(120); // one partition per ts-month
+
+    // ...and the full promote path walks all 120: per-partition pair-checked
+    // ATTACH with per-partition recordAttached bookkeeping (what a retry of
+    // field chunk #110 exercises end-to-end).
+    const MPR = 'manyparts-run';
+    await mc.db(DB).collection('mig_ranges').insertOne({
+      _id: `${MPR}:drill_events_mpcoll:0`, run_id: MPR, collection: 'drill_events_mpcoll',
+      scope_a: null, scope_e: null, scope_n: null, idx: 0,
+      lower_cd: Date.parse('2026-06-05T00:00:00Z'), upper_cd: Date.parse('2026-06-06T00:00:00Z'),
+      status: 'attaching', pod_id: 'dead-pod', lease_until: new Date(Date.now() - 60_000),
+      staging_table: st, docs_read: 120, docs_skipped: 0, rows_expected: 120,
+      partitions, attached: [], attach_method: null, attempts: 1,
+      last_error: null, transform_version: 'v2', updated_at: new Date(),
+    } as never);
+    await (orchestrator as unknown as {
+      recoverOne: (c: unknown, l: unknown) => Promise<void>;
+    }).recoverOne(await mc.db(DB).collection('mig_ranges').findOne({ _id: `${MPR}:drill_events_mpcoll:0` } as never), logger);
+
+    const doc = await mc.db(DB).collection('mig_ranges').findOne({ _id: `${MPR}:drill_events_mpcoll:0` } as never);
+    expect(doc?.status).toBe('done');
+    expect((doc?.attached as string[]).length).toBe(120); // every partition individually recorded
+    const live = await ch.query({
+      query: `SELECT count() AS c, uniqExact(_id) AS u FROM ${DB}.drill_events WHERE startsWith(_id, 'manyparts_')`,
+      format: 'JSONEachRow',
+    });
+    const [l] = await live.json<{ c: string; u: string }>();
+    expect(Number(l.c)).toBe(120);
+    expect(Number(l.u)).toBe(120);
+
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE startsWith(_id, 'manyparts_')` });
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: MPR } as never);
+  }, 60_000);
 
   it('reclaim: two recoverers race an expired chunk — exactly one wins', async () => {
     const RR = 'reclaim-race-run';
