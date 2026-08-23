@@ -47,6 +47,14 @@ export class StagingManager {
       clickhouse_settings: {
         date_time_input_format: 'best_effort',
         optimize_on_insert: 0,
+        // Chunks are cut on cd (server insert time) but tables partition by
+        // ts (device event time): historical data carries garbage device
+        // clocks (1970s epochs, far-future dates), so one cd-week of docs
+        // can span >100 ts-months and CH rejects the insert block at the
+        // default limit (field failure: "Too many partitions for single
+        // INSERT block"). Unlimited is correct for a one-off bulk load —
+        // the partitions exist in the data regardless of batch shape.
+        max_partitions_per_insert_block: 0,
       },
       request_timeout: this.config.queryTimeoutMs,
     });

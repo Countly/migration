@@ -708,6 +708,26 @@ describe('multi-collection scoping + ledger rebuild', () => {
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: ZR } as never);
   }, 30_000);
 
+  it('a cd-week of docs spanning 120 ts-months inserts fine (field: max_partitions_per_insert_block)', async () => {
+    // Chunks are cut on cd, partitions on ts: garbage device clocks put >100
+    // distinct ts-months inside one cd window, and ClickHouse rejects such
+    // an INSERT block at the default limit of 100. Field failure on chunks
+    // #110/#112 of a real migration.
+    const st = 'drill_events__stg_manyparts_0_g1';
+    await staging.createStaging(st);
+    const rows = Array.from({ length: 120 }, (_, i) => ({
+      a: APP, e: '[CLY]_custom', n: 'clockskew', uid: `mu${i}`, did: 'md',
+      _id: `manyparts_${i}`,
+      ts: `${2005 + Math.floor(i / 12)}-${String((i % 12) + 1).padStart(2, '0')}-15 12:00:00.000`,
+      cd: `2026-06-05 10:00:${String(i % 60).padStart(2, '0')}.000`, // one cd window
+      up: {}, sg: {}, c: 1, s: 0, dur: 0,
+    }));
+    await staging.insertBatch(st, rows as never, 'manyparts-token', 'manyparts-q1');
+    expect(await staging.countRows(st)).toBe(120);
+    expect((await staging.listPartitions(st)).length).toBe(120); // one partition per ts-month
+    await staging.dropStaging(st);
+  }, 30_000);
+
   it('reclaim: two recoverers race an expired chunk — exactly one wins', async () => {
     const RR = 'reclaim-race-run';
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: RR } as never);
