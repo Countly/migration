@@ -208,7 +208,13 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       ? { status: 'error', engine: 'ledger', error: stats.fatalError }
       : { status: 'ok', engine: 'ledger' };
   });
-  app.get('/stats', async () => orchestrator.getStats());
+  app.get('/stats', async () => {
+    const stats = orchestrator.getStats();
+    const cluster = await ledger
+      .clusterRate(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId, 120)
+      .catch(() => null);
+    return { ...stats, cluster };
+  });
   app.get('/report', async () => orchestrator.getReport());
   app.post('/control/pause', async () => { orchestrator.pause(); return { status: orchestrator.getStatus() }; });
   app.post('/control/resume', async () => { orchestrator.resume(); return { status: orchestrator.getStatus() }; });

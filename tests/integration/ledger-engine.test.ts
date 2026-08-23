@@ -191,6 +191,30 @@ describe('LedgerStore', () => {
     expect(second?.idx).toBe(1); // podA's claim is not re-claimable
   });
 
+  it('clusterRate sums recent done chunks across ALL pods (per-pod stats undercount N-fold)', async () => {
+    const CR = 'cluster-rate-run';
+    const now = new Date();
+    const old = new Date(Date.now() - 10 * 60_000); // outside the window
+    const mk = (idx: number, pod: string, docs: number, at: Date): Record<string, unknown> => ({
+      _id: `${CR}:collR:${idx}`, run_id: CR, collection: 'collR',
+      scope_a: null, scope_e: null, scope_n: null, idx,
+      lower_cd: idx * 1000, upper_cd: (idx + 1) * 1000,
+      status: 'done', pod_id: pod, lease_until: null, staging_table: null,
+      docs_read: docs, docs_skipped: 0, rows_expected: docs, partitions: [], attached: [],
+      attach_method: 'attach', attempts: 1, last_error: null, transform_version: 'v1', updated_at: at,
+    });
+    const mc2 = new MongoClient(MONGO_URI);
+    await mc2.connect();
+    await mc2.db(DB).collection('mig_ranges').insertMany([
+      mk(0, 'pod-a', 6000, now), mk(1, 'pod-b', 4000, now), mk(2, 'pod-c', 9999, old),
+    ] as never[]);
+    const rate = await ledger.clusterRate(CR, 120);
+    expect(rate.pods).toBe(2); // pod-c's chunk is outside the window
+    expect(rate.docsPerSecond).toBeCloseTo(10_000 / 120, 5);
+    await mc2.db(DB).collection('mig_ranges').deleteMany({ run_id: CR } as never);
+    await mc2.close();
+  });
+
   it('guarded transitions reject wrong from-state', async () => {
     const moved = await ledger.transition('r1:coll:2', 'pending', 'done');
     expect(moved).toBeNull(); // it's in_progress, not pending

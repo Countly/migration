@@ -571,6 +571,26 @@ export class LedgerStore {
     return rows.map((r) => ({ pod: r._id, done: r.done, active: r.active, lastSeen: r.lastSeen ?? null }));
   }
 
+  /**
+   * Cluster-wide throughput from the shared ledger: docs read by chunks
+   * that finished in the last windowSec, across ALL pods. The in-memory
+   * docsPerSecond each pod reports covers only itself — with N pods the
+   * dashboard undercounted by ~N× (field-reported: UI said 10k docs/s
+   * while 4 pods actually moved ~39k).
+   */
+  async clusterRate(runId: string, windowSec: number): Promise<{ docsPerSecond: number; pods: number; windowSec: number }> {
+    const since = new Date(Date.now() - windowSec * 1000);
+    const rows = await this.c()
+      .aggregate<{ docs: number; pods: string[] }>([
+        { $match: { run_id: runId, status: 'done', updated_at: { $gte: since } } },
+        { $group: { _id: null, docs: { $sum: '$docs_read' }, pods: { $addToSet: '$pod_id' } } },
+      ])
+      .toArray();
+    const docs = rows[0]?.docs ?? 0;
+    const pods = (rows[0]?.pods ?? []).filter(Boolean).length;
+    return { docsPerSecond: docs / windowSec, pods, windowSec };
+  }
+
   /** Sum of expected rows for done chunks — used by full re-verification. */
   async expectedRows(runId: string, collection: string): Promise<number> {
     const rows = await this.c()

@@ -677,10 +677,15 @@ async function tick() {
       document.getElementById('s-rows').textContent = fmt(stats.totalRowsInserted);
     }
     var dpsEl = document.getElementById('s-dps');
-    if (stats.totalRowsInserted === 0 && stats.status !== 'running') {
+    // Cluster rate comes from the shared ledger (docs finished in the last
+    // 2 min across ALL pods); the local counter only sees this pod.
+    var multiPod = stats.cluster && stats.cluster.pods > 1;
+    var effRate = multiPod && stats.status === 'running' ? stats.cluster.docsPerSecond : stats.docsPerSecond;
+    if (stats.totalRowsInserted === 0 && stats.status !== 'running' && !(stats.cluster && stats.cluster.docsPerSecond > 0)) {
       dpsEl.textContent = '\u2013';
     } else {
-      dpsEl.textContent = fmt(stats.docsPerSecond) + (stats.status === 'completed' ? ' avg' : '');
+      dpsEl.textContent = fmt(effRate) +
+        (stats.status === 'completed' ? ' avg' : (multiPod ? ' \u00b7 ' + stats.cluster.pods + ' pods' : ''));
     }
     document.getElementById('s-skipped').textContent = fmt(stats.totalDocsSkipped);
     document.getElementById('s-failed').textContent = fmt(stats.chunksFailed);
@@ -699,7 +704,7 @@ async function tick() {
     const etaDocs = remainingDocs + knownRemaining * avgDone;
     document.getElementById('s-eta').textContent =
       stats.status === 'completed' ? 'done' :
-      (stats.docsPerSecond > 0 && etaDocs > 0 ? Math.max(1, Math.round(etaDocs / stats.docsPerSecond / 60)) + ' min' : '–');
+      (effRate > 0 && etaDocs > 0 ? Math.max(1, Math.round(etaDocs / effRate / 60)) + ' min' : '–');
 
     const st = document.getElementById('b-status');
     st.textContent = stats.status;
