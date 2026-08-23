@@ -183,11 +183,29 @@ export class LedgerStore {
       updated_at: now,
     }));
 
+    // The FIRST document is the reservation, exactly as in appendChunks:
+    // pods that probed a live source at different instants compute DIFFERENT
+    // grids, and unordered insertMany with swallowed duplicate keys would
+    // interleave them into overlapping/gapping windows. insertOne on idx 0
+    // (same _id for every racer) lets exactly one grid stand; the loser
+    // returns 0 and falls into mapCollection's top-up path, which appends
+    // any genuine delta beyond the winner's upper bound.
     try {
-      await this.c().insertMany(docs, { ordered: false });
+      await this.c().insertOne(docs[0]);
     } catch (err: unknown) {
-      // Duplicate keys mean another pod initialized concurrently — fine.
-      if ((err as { code?: number }).code !== 11000) throw err;
+      if ((err as { code?: number }).code === 11000) return 0; // another pod won the map
+      throw err;
+    }
+    if (docs.length > 1) {
+      // ordered:true so a crash mid-insert leaves a contiguous PREFIX of the
+      // grid — resume then heals the remainder through the top-up path
+      // (delta from the prefix's upper bound). An unordered partial insert
+      // could leave holes no later pass would refill.
+      try {
+        await this.c().insertMany(docs.slice(1), { ordered: true });
+      } catch (err: unknown) {
+        if ((err as { code?: number }).code !== 11000) throw err;
+      }
     }
     return docs.length;
   }

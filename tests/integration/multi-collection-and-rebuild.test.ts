@@ -585,4 +585,126 @@ describe('multi-collection scoping + ledger rebuild', () => {
     }
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: AR } as never);
   }, 30_000);
+
+  it('initChunks: racing pods with DIFFERENT initial grids — exactly one coherent grid stands', async () => {
+    const IR = 'init-race-run';
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: IR } as never);
+    // Pods that probed a live source at different instants computed different
+    // maxima: different cut points, even different chunk counts. Pre-fix,
+    // both unordered insertMany calls swallowed duplicate keys and the two
+    // grids INTERLEAVED into overlapping windows.
+    const gridA = [{ lowerCd: 0, upperCd: 400 }, { lowerCd: 400, upperCd: 700 }, { lowerCd: 700, upperCd: 1000 }];
+    const gridB = [{ lowerCd: 0, upperCd: 250 }, { lowerCd: 250, upperCd: 500 }, { lowerCd: 500, upperCd: 750 }, { lowerCd: 750, upperCd: 1100 }];
+    const [a, b] = await Promise.all([
+      ledger.initChunks(IR, COLL1, gridA, 'v2', null),
+      ledger.initChunks(IR, COLL1, gridB, 'v2', null),
+    ]);
+    expect([a, b].filter((x) => x > 0).length, `a=${a} b=${b}`).toBe(1); // exactly one reservation won
+    const winner = a > 0 ? gridA : gridB;
+    const chunks = await mc.db(DB).collection('mig_ranges')
+      .find({ run_id: IR } as never).sort({ idx: 1 }).toArray();
+    expect(chunks.length).toBe(winner.length); // no chunks from the loser's grid
+    for (let i = 0; i < chunks.length; i++) {
+      expect(chunks[i].lower_cd).toBe(winner[i].lowerCd);
+      expect(chunks[i].upper_cd).toBe(winner[i].upperCd);
+    }
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: IR } as never);
+  }, 30_000);
+
+  it('initChunks: identical grids (frozen source) collapse to a single grid', async () => {
+    const IF = 'init-frozen-run';
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: IF } as never);
+    const grid = [{ lowerCd: 0, upperCd: 500 }, { lowerCd: 500, upperCd: 1000 }];
+    const results = await Promise.all([
+      ledger.initChunks(IF, COLL1, grid, 'v2', null),
+      ledger.initChunks(IF, COLL1, grid, 'v2', null),
+      ledger.initChunks(IF, COLL1, grid, 'v2', null),
+    ]);
+    expect(results.filter((x) => x > 0).length).toBe(1);
+    expect(await mc.db(DB).collection('mig_ranges').countDocuments({ run_id: IF } as never)).toBe(2);
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: IF } as never);
+  }, 30_000);
+
+  it('sweep sentinel: two pods race the claim — exactly one wins', async () => {
+    const SR = 'sentinel-race-run';
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: SR } as never);
+    await ledger.initChunks(SR, COLL1, [{ lowerCd: -1, upperCd: 0 }], 'v2', null);
+    const [p1, p2] = await Promise.all([
+      ledger.claimById(`${SR}:${COLL1}:0`, 'pod-1', 600),
+      ledger.claimById(`${SR}:${COLL1}:0`, 'pod-2', 600),
+    ]);
+    expect([p1, p2].filter(Boolean).length).toBe(1);
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: SR } as never);
+  }, 30_000);
+
+  it('retryFailed double-fire: concurrent operators retry each failed chunk exactly once', async () => {
+    // Two dashboards clicking "Retry failed chunks" at once: the from-state
+    // guard on failed->pending means exactly one transition wins; the double
+    // purge is idempotent (the injected window is empty, year 2100).
+    const counts = await ledger.statusCounts(RUN);
+    expect(counts.failed ?? 0).toBe(0); // clean baseline before injection
+    const fakeId = `${RUN}:fake_retry_coll:0`;
+    await mc.db(DB).collection('mig_ranges').insertOne({
+      _id: fakeId, run_id: RUN, collection: 'fake_retry_coll',
+      scope_a: APP, scope_e: '[CLY]_custom', scope_n: 'zzz_no_such_event',
+      idx: 0, lower_cd: 4102444800000, upper_cd: 4102444900000,
+      status: 'failed', pod_id: null, lease_until: null, staging_table: null,
+      docs_read: 0, docs_skipped: 0, rows_expected: 0, partitions: [], attached: [],
+      attach_method: null, attempts: 3, last_error: 'injected', transform_version: 'v2', updated_at: new Date(),
+    } as never);
+    const [r1, r2] = await Promise.all([orchestrator.retryFailed(), orchestrator.retryFailed()]);
+    expect(r1.retried + r2.retried, `r1=${r1.retried} r2=${r2.retried}`).toBe(1);
+    const doc = await mc.db(DB).collection('mig_ranges').findOne({ _id: fakeId } as never);
+    expect(doc?.status).toBe('pending');
+    expect(doc?.attempts).toBe(0);
+    await mc.db(DB).collection('mig_ranges').deleteOne({ _id: fakeId } as never);
+  }, 30_000);
+
+  it('zombie owner mid-chunk: abandons quietly — drops only its own staging, no transitions', async () => {
+    // The full processChunk abandon path (not just store-level fencing): a
+    // worker resumes with a STALE claim snapshot after its lease was
+    // reclaimed. Its first fenced transition must fail, it must drop only
+    // its OWN generation's staging table, and it must leave the chunk
+    // exactly as the rightful owner had it.
+    const ZR = 'zombie-run';
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: ZR } as never);
+    await ledger.initChunks(ZR, COLL1, [{ lowerCd: 0, upperCd: 1000 }], 'v2', null);
+    const chunkId = `${ZR}:${COLL1}:0`;
+
+    const orchPod = (orchestrator as unknown as { podId: string }).podId;
+    const stale = await ledger.claimById(chunkId, orchPod, 1); // generation 1, then "stalls"
+    expect(stale?.attempts).toBe(1);
+
+    // lease expires; recovery resets; another pod claims generation 2
+    await ledger.transition(chunkId, 'in_progress', 'pending', { pod_id: null, staging_table: null });
+    const fresh = await ledger.claimById(chunkId, 'rightful-pod', 600);
+    expect(fresh?.attempts).toBe(2);
+    const nameOf = (gen: number): string => (orchestrator as unknown as {
+      stagingName: (c: string, i: number, g: number) => string;
+    }).stagingName(COLL1, 0, gen);
+    await staging.createStaging(nameOf(2)); // the rightful owner's table
+
+    // the zombie wakes up and runs the chunk pipeline on its stale snapshot
+    await (orchestrator as unknown as {
+      processChunk: (c: unknown, d: unknown, l: unknown) => Promise<void>;
+    }).processChunk(stale, undefined, logger);
+
+    // chunk untouched: still owned by the rightful pod at generation 2
+    const doc = await mc.db(DB).collection('mig_ranges').findOne({ _id: chunkId } as never);
+    expect(doc?.pod_id).toBe('rightful-pod');
+    expect(doc?.attempts).toBe(2);
+    expect(doc?.status).toBe('in_progress');
+
+    // zombie's staging generation dropped; the rightful owner's intact
+    const tables = await ch.query({
+      query: `SELECT name FROM system.tables WHERE database = '${DB}' AND name LIKE '%__stg_%'`,
+      format: 'JSONEachRow',
+    });
+    const names = (await tables.json<{ name: string }>()).map((r) => r.name);
+    expect(names).not.toContain(nameOf(1));
+    expect(names).toContain(nameOf(2));
+
+    await staging.dropStaging(nameOf(2));
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: ZR } as never);
+  }, 30_000);
 });
