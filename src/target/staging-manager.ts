@@ -51,10 +51,15 @@ export class StagingManager {
         // ts (device event time): historical data carries garbage device
         // clocks (1970s epochs, far-future dates), so one cd-week of docs
         // can span >100 ts-months and CH rejects the insert block at the
-        // default limit (field failure: "Too many partitions for single
-        // INSERT block"). Unlimited is correct for a one-off bulk load —
-        // the partitions exist in the data regardless of batch shape.
-        max_partitions_per_insert_block: 0,
+        // default limit of 100 (field failure: "Too many partitions for
+        // single INSERT block"). The default is a tripwire for
+        // misconfigured partition keys, not a partition budget — the
+        // table's partitions come from the DATA (one per distinct
+        // toYYYYMM(ts)), regardless of batch shape. 4800 = every month of
+        // the DateTime64 range (1900..2299) the transform clamps ts into,
+        // i.e. the provable ceiling; a block can never legitimately exceed
+        // it, so anything above would be a real bug worth stopping on.
+        max_partitions_per_insert_block: '4800',
       },
       request_timeout: this.config.queryTimeoutMs,
     });
