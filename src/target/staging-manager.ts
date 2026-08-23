@@ -144,10 +144,19 @@ export class StagingManager {
     this.logger.info({ table: this.dryRunTable }, 'Dry-run Null-engine table created');
   }
 
-  /** Direct insert into the live table (DLQ replay path). */
-  async insertIntoLive(rows: OutputRow[], dedupToken: string): Promise<void> {
+  /** Ensure the Null-engine rehearsal table exists without dropping it
+   * (replay can run beside the main dry-run loop). */
+  async ensureDryRunTable(): Promise<void> {
+    await this.ch().command({
+      query: `CREATE TABLE IF NOT EXISTS ${this.fq(this.dryRunTable)} AS ${this.fq(this.config.table)} ENGINE = Null`,
+    });
+  }
+
+  /** Direct insert into the live table (DLQ replay path) — or, in dry-run
+   * mode, into the Null-engine rehearsal table via targetTable. */
+  async insertIntoLive(rows: OutputRow[], dedupToken: string, targetTable?: string): Promise<void> {
     await this.ch().insert({
-      table: this.config.table,
+      table: targetTable ?? this.config.table,
       values: rows,
       format: 'JSONEachRow',
       clickhouse_settings: { insert_deduplication_token: dedupToken },

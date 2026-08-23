@@ -472,6 +472,38 @@ describe('multi-collection scoping + ledger rebuild', () => {
     expect(clean.mismatchedWindows.length).toBe(0);
   }, 60_000);
 
+  it('dry-run replay writes to the Null table, never live (field bug)', async () => {
+    // A DLQ entry under the DRY run id with a perfectly good raw doc
+    const goodDoc = { _id: 'dryreplay_1', uid: 'u', did: 'd', ts: BASE + 1_000, cd: new Date(BASE + 1_000), sg: { v: 1 }, c: 1 };
+    await dlqStore.add([{
+      run_id: `${RUN}-dry`, source_id: 'dryreplay_1', collection: COLL1, chunk_id: 'test',
+      reason: 'insert_rejected', error: 'was broken under v1', transform_version: 'v1', raw_doc: goodDoc,
+    } as never]);
+
+    const dryConfig = { ...config, ledger: { ...config.ledger, dryRun: true } };
+    const dryOrch = new ChunkOrchestrator({
+      config: dryConfig as never, logger,
+      mongoReader: new MongoReader({ uri: MONGO_URI, database: DB, readPreference: 'primary', readConcern: 'local', retryReads: true, appName: 'dry-replay', cursorBatchSize: 500, maxTimeMs: 60_000 }, logger),
+      ledger, dlq: dlqStore, staging, retryPolicy: new RetryPolicy({ maxRetries: 2, baseDelayMs: 50, maxDelayMs: 200 }), hashResolver,
+    });
+    await (dryOrch as unknown as { d: { mongoReader: MongoReader } }).d.mongoReader.connect();
+
+    const res = await dryOrch.replayDlq();
+    expect(res.replayed).toBe(1); // rehearsal succeeded (Null table accepted it)
+
+    // THE assertion: nothing reached the live table
+    const live = await ch.query({
+      query: `SELECT count() AS c FROM ${DB}.drill_events WHERE _id = 'dryreplay_1'`, format: 'JSONEachRow',
+    });
+    expect(Number((await live.json<{ c: string }>())[0].c)).toBe(0);
+
+    const dryPending = await dlqStore.listPending(`${RUN}-dry`);
+    expect(dryPending.length).toBe(0); // resolved in the dry DLQ
+
+    await (dryOrch as unknown as { d: { mongoReader: MongoReader } }).d.mongoReader.close();
+    await mc.db(DB).collection('mig_dlq_docs').deleteMany({ run_id: `${RUN}-dry` } as never);
+  }, 60_000);
+
   it('attach-recovery pair check ignores live copies of the same _id (cross-cutover retry)', async () => {
     // The mixing vector: a crash during attach + an SDK retry that landed the
     // same _id in live (same ts → same month partition). Matching (_id, cd)

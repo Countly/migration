@@ -1218,6 +1218,12 @@ export class ChunkOrchestrator {
    */
   async replayDlq(): Promise<{ replayed: number; stillFailing: number; alreadyLive: number }> {
     const { dlq, staging, retryPolicy, config } = this.d;
+    // Dry run must never write the live table: replay rehearses against the
+    // Null-engine table (full parse/type validation, nothing stored) —
+    // field bug: a dry-run replay wrote real rows that the actual run would
+    // then duplicate.
+    const replayTarget = this.dryRun ? staging.dryRunTable : undefined;
+    if (this.dryRun) await staging.ensureDryRunTable();
     let replayed = 0;
     let stillFailing = 0;
     let alreadyLive = 0;
@@ -1251,7 +1257,7 @@ export class ChunkOrchestrator {
       // Skip rows already live as (_id, cd) pairs — a chunk redo with a
       // fixed transform migrates DLQ'd docs from the source; replaying them
       // on top would duplicate. Marked resolved: the doc IS migrated.
-      if (rows.length > 0) {
+      if (rows.length > 0 && !this.dryRun) {
         const cdMsOf = (r: OutputRow): number => Date.parse(r.cd.replace(' ', 'T') + 'Z');
         const cdVals = rows.map(cdMsOf);
         const liveCd = await staging.fetchLiveCdByIds(
@@ -1276,7 +1282,7 @@ export class ChunkOrchestrator {
       if (rows.length === 0) { this.syncReplayProgress(replayed, stillFailing, alreadyLive); continue; }
       try {
         await retryPolicy.execute(
-          () => staging.insertIntoLive(rows, `dlqreplay:${batchKey}`),
+          () => staging.insertIntoLive(rows, `dlqreplay:${batchKey}`, replayTarget),
           `dlq-replay-${batchKey}`,
           this.logger,
           undefined,
@@ -1288,7 +1294,7 @@ export class ChunkOrchestrator {
         // Isolate row-level failures within the replay batch too.
         for (let j = 0; j < rows.length; j++) {
           try {
-            await staging.insertIntoLive([rows[j]], `dlqreplay:${batchKey}:${j}`);
+            await staging.insertIntoLive([rows[j]], `dlqreplay:${batchKey}:${j}`, replayTarget);
             await dlq.markResolved([ids[j]], config.transform.version);
             replayed++;
           } catch (rowErr) {

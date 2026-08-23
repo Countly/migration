@@ -67,6 +67,8 @@ export class LedgerStore {
     await this.client.connect();
     this.coll = this.client.db(this.dbName).collection<ChunkDoc>(this.collectionName);
     await this.coll.createIndex({ run_id: 1, collection: 1, status: 1, idx: -1 });
+    // Global claim order: next available chunk across ALL collections
+    await this.coll.createIndex({ run_id: 1, status: 1, collection: 1, idx: -1 });
     this.logger.info({ db: this.dbName, collection: this.collectionName }, 'LedgerStore connected');
   }
 
@@ -191,6 +193,52 @@ export class LedgerStore {
   }
 
   /**
+   * Atomically claim the next pending REGULAR chunk anywhere in the run —
+   * collections in order, newest data first within each. Pods drain one
+   * collection together and spill into the next the moment nothing is
+   * claimable, so many-small-collection datasets parallelize across pods
+   * instead of convoying (sentinels are never claimed here; the sweep phase
+   * takes them per collection once its regulars are terminal).
+   */
+  async claimNextGlobal(runId: string, podId: string, leaseSec: number): Promise<ChunkDoc | null> {
+    return this.c().findOneAndUpdate(
+      { run_id: runId, status: 'pending', lower_cd: { $gte: 0 } },
+      {
+        $set: {
+          status: 'in_progress',
+          pod_id: podId,
+          lease_until: new Date(Date.now() + leaseSec * 1000),
+          updated_at: new Date(),
+        },
+        $inc: { attempts: 1 },
+      },
+      { sort: { collection: 1, idx: -1 }, returnDocument: 'after' },
+    );
+  }
+
+  /** Pending null-cd sweep chunks (sentinel bounds {-1, 0}) across the run. */
+  async listPendingSentinels(runId: string): Promise<ChunkDoc[]> {
+    return this.c().find({ run_id: runId, status: 'pending', lower_cd: -1 }).toArray();
+  }
+
+  /** Guarded claim of one specific chunk (sweep phase). */
+  async claimById(chunkId: string, podId: string, leaseSec: number): Promise<ChunkDoc | null> {
+    return this.c().findOneAndUpdate(
+      { _id: chunkId, status: 'pending' },
+      {
+        $set: {
+          status: 'in_progress',
+          pod_id: podId,
+          lease_until: new Date(Date.now() + leaseSec * 1000),
+          updated_at: new Date(),
+        },
+        $inc: { attempts: 1 },
+      },
+      { returnDocument: 'after' },
+    );
+  }
+
+  /**
    * Atomically claim the next pending chunk, newest data first (highest idx).
    */
   async claimNext(
@@ -259,11 +307,12 @@ export class LedgerStore {
    * Chunks needing recovery: leases expired mid-work, or non-terminal states
    * left behind by a crashed pod (when includeAll, e.g. single-pod startup).
    */
-  async findRecoverable(runId: string, collection: string, includeAll: boolean): Promise<ChunkDoc[]> {
+  async findRecoverable(runId: string, collection: string | null, includeAll: boolean): Promise<ChunkDoc[]> {
     const nonTerminal: ChunkStatus[] = ['in_progress', 'written', 'attaching'];
-    const filter = includeAll
-      ? { run_id: runId, collection, status: { $in: nonTerminal } }
-      : { run_id: runId, collection, status: { $in: nonTerminal }, lease_until: { $lt: new Date() } };
+    const filter: Record<string, unknown> = includeAll
+      ? { run_id: runId, status: { $in: nonTerminal } }
+      : { run_id: runId, status: { $in: nonTerminal }, lease_until: { $lt: new Date() } };
+    if (collection !== null) filter.collection = collection;
     return this.c().find(filter).toArray();
   }
 
@@ -351,13 +400,14 @@ export class LedgerStore {
   }
 
   /** Non-terminal REGULAR (non-sentinel) chunks — gates the null-cd sweep. */
-  async countRegularNonTerminal(runId: string, collection: string): Promise<number> {
-    return this.c().countDocuments({
+  async countRegularNonTerminal(runId: string, collection?: string): Promise<number> {
+    const filter: Record<string, unknown> = {
       run_id: runId,
-      collection,
       lower_cd: { $gte: 0 },
       status: { $in: ['pending', 'in_progress', 'written', 'attaching'] },
-    });
+    };
+    if (collection !== undefined) filter.collection = collection;
+    return this.c().countDocuments(filter);
   }
 
   /** The null-cd sentinel chunk of a collection, if any. */
