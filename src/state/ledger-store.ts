@@ -193,6 +193,65 @@ export class LedgerStore {
   }
 
   /**
+   * Top-up support: highest regular idx and upper_cd for a collection —
+   * the append point for delta chunks (data that arrived after mapping).
+   */
+  async regularHighWater(runId: string, collection: string): Promise<{ maxIdx: number; maxUpperCd: number } | null> {
+    const [top] = await this.c()
+      .find({ run_id: runId, collection })
+      .sort({ idx: -1 }).limit(1).project({ idx: 1 }).toArray();
+    if (!top) return null;
+    const [upper] = await this.c()
+      .find({ run_id: runId, collection, lower_cd: { $gte: 0 } })
+      .sort({ upper_cd: -1 }).limit(1).project({ upper_cd: 1 }).toArray();
+    return { maxIdx: top.idx as number, maxUpperCd: (upper?.upper_cd as number) ?? 0 };
+  }
+
+  /** Append delta chunks after the existing grid (idx continues). */
+  async appendChunks(
+    runId: string,
+    collection: string,
+    bounds: Array<{ lowerCd: number; upperCd: number }>,
+    startIdx: number,
+    transformVersion: string,
+    scope?: { a: string; e: string; n?: string } | null,
+  ): Promise<number> {
+    if (bounds.length === 0) return 0;
+    const now = new Date();
+    const docs: ChunkDoc[] = bounds.map((b, i) => ({
+      _id: `${runId}:${collection}:${startIdx + i}`,
+      run_id: runId,
+      collection,
+      scope_a: scope?.a ?? null,
+      scope_e: scope?.e ?? null,
+      scope_n: scope?.n ?? null,
+      idx: startIdx + i,
+      lower_cd: b.lowerCd,
+      upper_cd: b.upperCd,
+      status: 'pending',
+      pod_id: null,
+      lease_until: null,
+      staging_table: null,
+      docs_read: 0,
+      docs_skipped: 0,
+      rows_expected: 0,
+      partitions: [],
+      attached: [],
+      attach_method: null,
+      attempts: 0,
+      last_error: null,
+      transform_version: transformVersion,
+      updated_at: now,
+    }));
+    try {
+      await this.c().insertMany(docs, { ordered: false });
+    } catch (err: unknown) {
+      if ((err as { code?: number }).code !== 11000) throw err; // another pod appended concurrently
+    }
+    return docs.length;
+  }
+
+  /**
    * Atomically claim the next pending REGULAR chunk anywhere in the run —
    * collections in order, newest data first within each. Pods drain one
    * collection together and spill into the next the moment nothing is

@@ -206,20 +206,44 @@ export class ChunkOrchestrator {
     this.multiCollection = collections.length > 1;
     this.logger.info({ collections: collections.length, runId: this.runId, dryRun: this.dryRun }, 'Ledger engine starting');
 
-    // ── MAP PHASE ─────────────────────────────────────────────────────────
+    // ── MAP + DRAIN, with TOP-UP passes ──────────────────────────────────
     // Cut every collection's chunk grid upfront so claiming can be GLOBAL:
     // pods reserve the next available chunk anywhere, spilling into the next
     // collection the moment the current one has nothing claimable — instead
     // of convoying on one collection (the many-small-collections killer).
-    for (const collection of collections) {
+    // After draining, re-map: data that arrived in the OLD pipeline after
+    // mapping gets delta chunks appended (and newly created collections get
+    // discovered). Frozen source → one extra cheap pass; live source → the
+    // run keeps chasing the delta until the source is actually frozen,
+    // which makes bulk-before-cutover + final-drain a supported flow.
+    let mapPass = 0;
+    for (;;) {
       if (this.stopping) break;
-      await this.mapCollection(collection);
+      let newChunks = 0;
+      if (mapPass > 0) {
+        collections = await discoverCollections(db, config.source.collectionPrefix, this.logger).catch(() => collections);
+        collections = collections.filter((name) => {
+          const d2 = this.d.hashResolver.resolveCollectionName(name, config.source.collectionPrefix);
+          return !(d2 && skipEventNames.has(d2.e));
+        });
+      }
+      for (const collection of collections) {
+        if (this.stopping) break;
+        newChunks += await this.mapCollection(collection);
+      }
+      if (mapPass === 0) {
+        this.logger.info({ mapped: this.collectionDefaults.size }, 'All collections mapped — global claiming starts');
+        await this.recoverChunks(null, this.logger);
+      } else if (newChunks > 0) {
+        this.logger.info({ pass: mapPass, newChunks }, 'Top-up pass found new data — draining delta');
+      }
+      if (mapPass > 0 && newChunks === 0) break; // stable: no delta anywhere
+      await this.globalClaimLoop();
+      if (this.stopping) break;
+      mapPass++;
     }
-    this.logger.info({ mapped: this.collectionDefaults.size }, 'All collections mapped — global claiming starts');
 
-    await this.recoverChunks(null, this.logger);
-
-    // ── GLOBAL CLAIM LOOP (regular chunks across all collections) ────────
+    // ── SWEEP + FINISH ────────────────────────────────────────────────────
     let boundCollection: string | null = null;
     for (;;) {
       if (this.stopping) break;
@@ -305,7 +329,7 @@ export class ChunkOrchestrator {
    * bounds, cut the chunk grid (+ null-cd sentinel), persist it idempotently.
    * No copying happens here — claims are global afterwards.
    */
-  private async mapCollection(collection: string): Promise<void> {
+  private async mapCollection(collection: string): Promise<number> {
     const { config, mongoReader, ledger } = this.d;
     this.currentCollection = collection; // mapping progress visible in UI
     const log = this.logger.child({ collection });
@@ -324,10 +348,9 @@ export class ChunkOrchestrator {
     if (!lower || !upper) {
       log.info('Collection empty (no cd-bearing docs), skipping');
       if (!this.dryRun && (await mongoReader.hasNullCdDocuments())) {
-        await ledger.initChunks(this.runId, collection, [{ lowerCd: -1, upperCd: 0 }], config.transform.version, defaults ? chScopeOf(defaults) : null);
-        log.info('Only null-cd documents — sweep chunk added');
+        return ledger.initChunks(this.runId, collection, [{ lowerCd: -1, upperCd: 0 }], config.transform.version, defaults ? chScopeOf(defaults) : null);
       }
-      return;
+      return 0;
     }
 
     const estimated = await mongoReader.getEstimatedCount();
@@ -349,7 +372,78 @@ export class ChunkOrchestrator {
     }
 
     const created = await ledger.initChunks(this.runId, collection, bounds, config.transform.version, defaults ? chScopeOf(defaults) : null);
-    log.info({ estimated, chunks: bounds.length, created, scoped: !!defaults, dryRun: this.dryRun }, 'Chunk list ready');
+    if (created > 0) {
+      log.info({ estimated, chunks: bounds.length, created, scoped: !!defaults, dryRun: this.dryRun }, 'Chunk list ready');
+      return created;
+    }
+
+    // Collection already mapped (resume / later pass): TOP-UP. Old ingestion
+    // assigns cd at write time, so data that arrived after mapping lands
+    // strictly BEYOND the mapped upper bound — never inside existing windows.
+    // Append delta chunks for [mapped upper, current max cd]; idx continues,
+    // so the delta (newest data) is claimed first within the collection.
+    if (this.dryRun) return 0;
+    const hw = await ledger.regularHighWater(this.runId, collection);
+    if (!hw || hw.maxUpperCd <= 0) return 0;
+    if (upper.cd + 1 <= hw.maxUpperCd) return 0; // nothing new
+    const deltaCount = await mongoReader.getDatabase().collection(collection)
+      .countDocuments({ cd: { $gte: new Date(hw.maxUpperCd) } });
+    if (deltaCount === 0) return 0;
+    const deltaBounds = computeChunkBounds(hw.maxUpperCd, upper.cd, deltaCount, config.ledger.chunkDocsTarget, config.ledger.maxChunkDays);
+    const appended = await ledger.appendChunks(
+      this.runId, collection, deltaBounds, hw.maxIdx + 1, config.transform.version, defaults ? chScopeOf(defaults) : null,
+    );
+    log.info({ appended, deltaDocs: deltaCount, from: new Date(hw.maxUpperCd).toISOString(), to: new Date(upper.cd).toISOString() },
+      'Top-up: delta chunks appended for data that arrived after mapping');
+    return appended;
+  }
+
+  /** Drain every claimable regular chunk anywhere in the run. */
+  private async globalClaimLoop(): Promise<void> {
+    const { config } = this.d;
+    let boundCollection: string | null = null;
+    for (;;) {
+      if (this.stopping) return;
+      while (this.paused && !this.stopping) await sleep(1_000);
+      if (this.stopping) return;
+      await this.reclaimExpiredLeases(null, this.logger);
+
+      const chunk = await this.d.ledger.claimNextGlobal(this.runId, this.podId, config.ledger.leaseSec);
+      if (!chunk) {
+        const remaining = await this.d.ledger.countRegularNonTerminal(this.runId);
+        if (remaining === 0) return;
+        if (!config.worker.enabled) {
+          const orphans = await this.d.ledger.findRecoverable(this.runId, null, true);
+          for (const orphan of orphans) await this.recoverOne(orphan, this.logger);
+          continue;
+        }
+        this.logger.info({ waitingOn: remaining }, 'No claimable chunks; waiting on other pods (reclaim on lease expiry)');
+        await sleep(Math.min((config.ledger.leaseSec * 1000) / 2, 15_000));
+        continue;
+      }
+
+      const log = this.logger.child({ collection: chunk.collection });
+      if (chunk.attempts > MAX_CHUNK_ATTEMPTS && this.isSplittable(chunk)) {
+        const parts = await this.d.ledger.splitChunk(chunk, 4);
+        log.warn({ chunk: chunk._id, attempts: chunk.attempts, parts }, 'Chunk exhausted crash-retries — split into sub-chunks (poison-pill hunt)');
+        continue;
+      }
+      if (chunk.attempts > MAX_CHUNK_ATTEMPTS) {
+        await this.d.ledger.transition(chunk._id, 'in_progress', 'failed', {
+          last_error: `exceeded ${MAX_CHUNK_ATTEMPTS} attempts (crash quarantine — inspect source docs in this cd window)`,
+        });
+        this.noteChunkFailure(log);
+        continue;
+      }
+
+      if (chunk.collection !== boundCollection) {
+        await this.d.mongoReader.switchCollection(chunk.collection);
+        boundCollection = chunk.collection;
+        this.currentCollection = chunk.collection;
+      }
+      await this.processChunk(chunk, this.collectionDefaults.get(chunk.collection), log);
+      this.lastStatusCounts = await this.d.ledger.statusCounts(this.runId);
+    }
   }
 
   /**

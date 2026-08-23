@@ -147,4 +147,36 @@ describe('cross-collection scheduling with two pods', () => {
     expect(byPod.size).toBe(2);
     for (const [, n] of byPod) expect(n).toBeGreaterThanOrEqual(2);
   }, 180_000);
+
+  it('top-up: data that arrived after mapping gets delta chunks and drains on the next run', async () => {
+    // Old ingestion kept writing after the run: cd strictly beyond the
+    // mapped upper bound (cd is assigned at write time).
+    const DELTA = 150;
+    const late = Date.UTC(2026, 1, 1); // beyond every mapped window
+    for (const ev of [events[0], events[3]]) {
+      const coll = mc.db(DB).collection(collOf(ev));
+      const docs = Array.from({ length: DELTA }, (_, j) => ({
+        _id: `${ev}_late_${j}`, uid: 'lu', did: 'ld',
+        ts: late + j * 60_000, cd: new Date(late + j * 60_000), sg: { late: true }, c: 1,
+      }));
+      await coll.insertMany(docs as never[]);
+    }
+
+    // Resume: mapping detects the delta, appends chunks, drains them.
+    await pods[0].run();
+
+    const res = await ch.query({
+      query: `SELECT count() AS t, uniqExact(_id) AS u FROM ${DB}.drill_events`,
+      format: 'JSONEachRow',
+    });
+    const [row] = await res.json<{ t: string; u: string }>();
+    expect(Number(row.t)).toBe(COLLS * DOCS_EACH + 2 * DELTA);
+    expect(Number(row.u)).toBe(COLLS * DOCS_EACH + 2 * DELTA); // no dups: old windows untouched
+
+    // Appended chunks continue the idx sequence and are done
+    const appended = await mc.db(DB).collection('mig_ranges')
+      .find({ run_id: RUN, collection: collOf(events[0]), idx: { $gte: 1 } }).toArray();
+    expect(appended.length).toBeGreaterThanOrEqual(1);
+    expect(appended.every((c) => c.status === 'done')).toBe(true);
+  }, 180_000);
 });
