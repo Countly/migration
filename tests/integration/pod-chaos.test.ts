@@ -14,6 +14,14 @@
  * design: the invariants must hold under EVERY interleaving. Crash
  * quarantine (a chunk SIGKILLed > MAX_CHUNK_ATTEMPTS times) is legal and
  * healed through the documented operator flow (retryFailed), bounded here.
+ *
+ * On top of the kills, the full cutover-first field situation runs
+ * concurrently: a MONGO writer keeps appending to the old source during the
+ * kill phases (top-up mapping under chaos), and a CLICKHOUSE writer pours
+ * live rows into the target the whole time — including into the same
+ * (a, e, n) scope the migrator is copying.
+ *
+ * Knobs: CHAOS_PODS (default 2) pods per kill cycle, CHAOS_CYCLES (8).
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -47,6 +55,8 @@ const collOf = (ev: string): string => `drill_events${createHash('sha1').update(
 const DOCS_EACH = 12_000;
 const NULL_CD_DOCS = 40; // in collection 0 only — exercises the sweep under chaos
 const BASE = Date.UTC(2026, 2, 1);
+const PODS = Number(process.env.CHAOS_PODS ?? 2);
+const CYCLES = Number(process.env.CHAOS_CYCLES ?? 8);
 
 /** Deterministic RNG so a failing seed can be replayed. */
 function mulberry32(seed: number): () => number {
@@ -192,6 +202,51 @@ describe('pod chaos: random SIGKILL across all stages, exact end state', () => {
   });
 
   it('random pod kills at every stage still end in an exact, fully audited state', async () => {
+    // ── Live load, both sides ─────────────────────────────────────────────
+    // Old ingestion is still writing to the SOURCE (cd continues the seeded
+    // minute grid, exactly how the old pipeline stamps trailing data): the
+    // map/top-up passes must chase it under kills. New ingestion writes to
+    // the TARGET with wall-clock cd, half into the same scope being
+    // migrated: no purge/attach/heal may ever touch those rows.
+    let sourceAppended = 0;
+    let liveWritten = 0;
+    let writersStopSource = false;
+    let writersStopLive = false;
+    let writerError: Error | null = null;
+    const sourceWriter = (async () => {
+      const coll = mc.db(DB).collection(collOf(EVENTS[0]));
+      while (!writersStopSource) {
+        const docs = Array.from({ length: 20 }, (_, k) => {
+          const j = DOCS_EACH + sourceAppended + k;
+          const t = BASE + j * 60_000;
+          return { _id: `${EVENTS[0]}_${j}`, uid: String(j % 100), did: `d${j}`, ts: t, cd: new Date(t), sg: { v: j }, c: 1 };
+        });
+        try {
+          await coll.insertMany(docs as never[]);
+          sourceAppended += docs.length;
+        } catch (e) { writerError = e as Error; writersStopSource = true; }
+        await sleep(60);
+      }
+    })();
+    const liveWriter = (async () => {
+      while (!writersStopLive) {
+        const now = Date.now();
+        const rows = Array.from({ length: 20 }, (_, k) => ({
+          a: k % 2 === 0 ? APP : 'other_chaos_app',
+          e: '[CLY]_custom',
+          n: k % 2 === 0 ? EVENTS[0] : 'unrelated',
+          uid: `lu${k}`, did: 'ld', _id: `live_${now}_${liveWritten + k}`,
+          ts: new Date(now).toISOString().replace('T', ' ').replace('Z', ''),
+          up: {}, sg: {}, c: 1, s: 0, dur: 0,
+        }));
+        try {
+          await ch.insert({ table: `${DB}.drill_events`, values: rows, format: 'JSONEachRow' });
+          liveWritten += rows.length;
+        } catch (e) { writerError = e as Error; writersStopLive = true; }
+        await sleep(60);
+      }
+    })();
+
     // ── Phase A: forced torn commit — SIGKILL between ATTACH and record ──
     console.log('[chaos] phase A: spawning torn worker');
     const torn = spawnWorker('pod-torn', { CHAOS_CRASH_AFTER_ATTACH: '1' });
@@ -205,12 +260,12 @@ describe('pod chaos: random SIGKILL across all stages, exact end state', () => {
 
     // ── Phase B: random kill/respawn cycles, 2 pods each ─────────────────
     let cycles = 0;
-    for (; cycles < 8; cycles++) {
+    for (; cycles < CYCLES; cycles++) {
       const nt = await nonTerminal();
-      console.log(`[chaos] phase B cycle ${cycles}: nonTerminal=${nt}`);
-      if (nt === 0) break;
+      console.log(`[chaos] phase B cycle ${cycles}: nonTerminal=${nt} sourceAppended=${sourceAppended} liveWritten=${liveWritten}`);
+      if (nt === 0 && cycles > 1) break; // source may still be growing — give top-up at least 2 cycles
       const workers: Array<{ child: ChildProcess; timer: NodeJS.Timeout }> = [];
-      for (let w = 0; w < 2; w++) {
+      for (let w = 0; w < PODS; w++) {
         const child = spawnWorker(`pod-c${cycles}-${w}`);
         const delay = 700 + Math.floor(rng() * 2200);
         const timer = setTimeout(() => child.kill('SIGKILL'), delay);
@@ -221,6 +276,14 @@ describe('pod chaos: random SIGKILL across all stages, exact end state', () => {
         clearTimeout(timer);
       }
     }
+
+    // Old ingestion stops (the real cutover step); phase C's map passes
+    // drain whatever it appended. The live writer keeps hammering the
+    // target THROUGH phase C and verification.
+    writersStopSource = true;
+    await sourceWriter;
+    expect(writerError).toBeNull();
+    console.log(`[chaos] source writer stopped after appending ${sourceAppended} docs`);
 
     // ── Phase C: undisturbed drain + quarantine healing ──────────────────
     let healed = 0;
@@ -246,9 +309,17 @@ describe('pod chaos: random SIGKILL across all stages, exact end state', () => {
     expect(await nonTerminal()).toBe(0);
     expect(counts.done ?? 0).toBeGreaterThan(0);
 
-    const sourceTotal = EVENTS.length * DOCS_EACH + NULL_CD_DOCS;
+    // live writer ran through everything — stop it only now
+    writersStopLive = true;
+    await liveWriter;
+    expect(writerError).toBeNull();
+    expect(liveWritten).toBeGreaterThan(0);
+
+    let sourceTotal = 0;
+    for (const ev of EVENTS) sourceTotal += await mc.db(DB).collection(collOf(ev)).countDocuments();
+    expect(sourceTotal).toBe(EVENTS.length * DOCS_EACH + NULL_CD_DOCS + sourceAppended);
     const totals = await ch.query({
-      query: `SELECT count() AS t, uniqExact(_id) AS u FROM ${DB}.drill_events`,
+      query: `SELECT count() AS t, uniqExact(_id) AS u FROM ${DB}.drill_events WHERE NOT startsWith(_id, 'live_')`,
       format: 'JSONEachRow',
     });
     const [tot] = await totals.json<{ t: string; u: string }>();
@@ -257,12 +328,12 @@ describe('pod chaos: random SIGKILL across all stages, exact end state', () => {
       // Diagnose before failing: which rows duplicated, and which chunk owns them
       const dupq = await ch.query({
         query: `SELECT _id, count() AS c, min(toUnixTimestamp64Milli(cd)) AS cdlo, max(toUnixTimestamp64Milli(cd)) AS cdhi
-                FROM ${DB}.drill_events GROUP BY _id HAVING c > 1 ORDER BY _id LIMIT 6`,
+                FROM ${DB}.drill_events WHERE NOT startsWith(_id, 'live_') GROUP BY _id HAVING c > 1 ORDER BY _id LIMIT 6`,
         format: 'JSONEachRow',
       });
       const dups = await dupq.json<{ _id: string; c: string; cdlo: string; cdhi: string }>();
       const dtot = await ch.query({
-        query: `SELECT count() AS n FROM (SELECT _id FROM ${DB}.drill_events GROUP BY _id HAVING count() > 1)`,
+        query: `SELECT count() AS n FROM (SELECT _id FROM ${DB}.drill_events WHERE NOT startsWith(_id, 'live_') GROUP BY _id HAVING count() > 1)`,
         format: 'JSONEachRow',
       });
       console.log('[chaos] DUP total ids:', (await dtot.json<{ n: string }>())[0].n, 'sample:', JSON.stringify(dups));
@@ -281,9 +352,16 @@ describe('pod chaos: random SIGKILL across all stages, exact end state', () => {
         query: `SELECT count() AS c FROM ${DB}.drill_events WHERE startsWith(_id, '${ev}_')`,
         format: 'JSONEachRow',
       });
-      const expected = DOCS_EACH + (ev === EVENTS[0] ? NULL_CD_DOCS : 0);
+      const expected = DOCS_EACH + (ev === EVENTS[0] ? NULL_CD_DOCS + sourceAppended : 0);
       expect(Number((await per.json<{ c: string }>())[0].c), `collection ${ev}`).toBe(expected);
     }
+
+    // every live-ingested row survived the entire chaos untouched
+    const liveCount = await ch.query({
+      query: `SELECT count() AS c FROM ${DB}.drill_events WHERE startsWith(_id, 'live_')`,
+      format: 'JSONEachRow',
+    });
+    expect(Number((await liveCount.json<{ c: string }>())[0].c)).toBe(liveWritten);
 
     // full verification + both audits pass on the chaos-built table
     const verify = await orchestrator.verifyMigration();
