@@ -605,7 +605,12 @@ export class ChunkOrchestrator {
       }
     } catch (err) {
       if (err instanceof ClaimLostError) return; // lost the chunk mid-recovery — not ours anymore
-      throw err;
+      // A failed recovery attempt must never kill the pod (field crash:
+      // ECONNREFUSED from a recovery-path ClickHouse call during an outage
+      // propagated up through the claim loop). The chunk stays claimed by
+      // us; when our lease expires it becomes recoverable again — retried
+      // on a later tick, healed by the usual machinery.
+      log.warn({ chunk: mine._id, err: (err as Error).message }, 'Recovery attempt failed — will retry after lease expiry');
     }
   }
 

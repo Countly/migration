@@ -42,7 +42,7 @@ const ledger = new LedgerStore(uri, process.env.MANIFEST_DB!, logger);
 const dlq = new DlqStore(uri, process.env.MANIFEST_DB!, logger);
 const staging = new StagingManager({
   url: process.env.CLICKHOUSE_URL!, database: process.env.CLICKHOUSE_DB!, table: 'drill_events',
-  username: 'default', password: process.env.CLICKHOUSE_PASSWORD ?? '', queryTimeoutMs: 60_000,
+  username: 'default', password: process.env.CLICKHOUSE_PASSWORD ?? '', queryTimeoutMs: config.target.queryTimeoutMs,
 }, logger);
 const hashResolver = new HashResolver({ uri, countlyDb: process.env.MONGO_COUNTLY_DB! }, logger);
 

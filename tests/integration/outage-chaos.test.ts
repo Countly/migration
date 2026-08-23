@@ -82,21 +82,31 @@ describe.skipIf(!ENABLED)('backing-service outage chaos (CHAOS_OUTAGE=1, dedicat
     MULTI_POD_ENABLED: 'true',
     LOG_LEVEL: 'fatal',
     CHAOS_LOG_LEVEL: 'warn', // worker pino level — stderrTail captures it
-    // prod-like backoff — the point of this suite: multi-second blips must
-    // be absorbed by retries, not instantly park chunks
-    CLICKHOUSE_MAX_RETRIES: '8',
-    CLICKHOUSE_RETRY_BASE_DELAY_MS: '500',
-    CLICKHOUSE_RETRY_MAX_DELAY_MS: '5000',
+    // TIGHT retry budget, deliberately: prod-like backoff was measured to
+    // absorb even a 150s hard stop without a single failed chunk (Docker's
+    // port proxy black-holes connections, so each attempt burns the full
+    // request timeout — great for production patience, useless for testing
+    // the breaker). These knobs make chunks park within ~40s of outage so
+    // the breaker->auto-resume loop is exercised LIVE.
+    CLICKHOUSE_QUERY_TIMEOUT_MS: '4000',
+    CLICKHOUSE_MAX_RETRIES: '2',
+    CLICKHOUSE_RETRY_BASE_DELAY_MS: '300',
+    CLICKHOUSE_RETRY_MAX_DELAY_MS: '1000',
   };
 
   const stderrTail = new Map<string, string>();
   const spawnWorker = (podId: string): ChildProcess => {
     const child = spawn(process.execPath, ['--experimental-strip-types', WORKER], {
       env: { ...process.env, ...baseEnv, POD_ID: podId },
-      stdio: ['ignore', 'ignore', 'pipe'],
+      // capture BOTH streams: pino logs to stdout, the CH client's error
+      // dumps go to stderr — the breaker/auto-resume evidence lives in
+      // stdout (a whole debugging round was lost to grepping stderr only)
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     let tail = '';
-    child.stderr!.on('data', (d: Buffer) => { tail = (tail + d.toString()).slice(-4000); });
+    const grab = (d: Buffer): void => { tail = (tail + d.toString()).slice(-8000); };
+    child.stdout!.on('data', grab);
+    child.stderr!.on('data', grab);
     child.on('exit', () => stderrTail.set(podId, tail));
     return child;
   };
@@ -211,10 +221,31 @@ describe.skipIf(!ENABLED)('backing-service outage chaos (CHAOS_OUTAGE=1, dedicat
     // let both pods get into the copy phase
     await sleep(4_000);
 
-    console.log('[outage] restarting ClickHouse (hard crash: connections reset)');
-    sh(`docker restart ${CH_CTR}`);
+    // STOP (not restart): 45s exceeds the whole retry budget (8 tries,
+    // 0.5-5s backoff), so chunks WILL fail and the consecutive-failure
+    // breaker WILL pause the pods — the auto-resume loop must then carry
+    // the run end-to-end. A quick restart only proves retries absorb blips;
+    // this proves the pause path heals.
+    // 150s: one transient failure cycle costs ~27s of prod backoff and a
+    // chunk only parks as failed at attempts>=3, so forcing the breaker
+    // (3 consecutive failed chunks per pod) needs a sustained ~2min outage.
+    // (A 45s stop was measured fully absorbed: zero failed chunks.)
+    console.log('[outage] stopping ClickHouse for 90s (forces the failure breaker under the tight retry budget)');
+    sh(`docker stop ${CH_CTR}`);
+    for (let t = 0; t < 9; t++) {
+      await sleep(10_000);
+      // Mongo is up during the CH outage — watch what the pods actually do
+      const counts = await ledger.statusCounts(RUN).catch(() => ({}));
+      const hot = await mc.db(DB).collection('mig_ranges')
+        .find({ run_id: RUN } as never).sort({ attempts: -1 }).limit(2)
+        .project({ idx: 1, status: 1, attempts: 1, pod_id: 1, last_error: 1 }).toArray()
+        .catch(() => []);
+      console.log(`[outage] t+${(t + 1) * 10}s counts=${JSON.stringify(counts)} hot=${JSON.stringify(hot.map((c) => ({ i: c.idx, s: c.status, a: c.attempts, p: c.pod_id, e: (c.last_error ?? '').slice(0, 60) })))}`);
+    }
+    sh(`docker start ${CH_CTR}`);
+    console.log('[outage] ClickHouse back up');
 
-    await sleep(8_000); // CH back up; workers retrying/recovering
+    await sleep(8_000); // workers probing/recovering
 
     console.log('[outage] pausing MongoDB for 6s (hang: connections freeze)');
     sh(`docker pause ${MONGO_CTR}`);
@@ -237,9 +268,9 @@ describe.skipIf(!ENABLED)('backing-service outage chaos (CHAOS_OUTAGE=1, dedicat
       const done = counts.done ?? 0;
       console.log('[outage] watch: counts', JSON.stringify(counts));
       if (done !== lastDone) { lastDone = done; stalledSince = Date.now(); }
-      else if (Date.now() - stalledSince > 90_000) {
+      else if (Date.now() - stalledSince > 160_000) { // paused-under-breaker stalls legitimately for outage tail + probes
         wedged = true;
-        console.log('[outage] WEDGED: no chunk completed in 90s — killing workers');
+        console.log('[outage] WEDGED: no chunk completed in 160s — killing workers');
         console.log('[outage] pod-1 stderr tail:', stderrTail.get('outage-pod-1')?.slice(-1500) ?? '(live)');
         console.log('[outage] pod-2 stderr tail:', stderrTail.get('outage-pod-2')?.slice(-1500) ?? '(live)');
         w1.kill('SIGKILL'); w2.kill('SIGKILL');
@@ -257,6 +288,15 @@ describe.skipIf(!ENABLED)('backing-service outage chaos (CHAOS_OUTAGE=1, dedicat
     expect(wedged, 'workers wedged: breaker paused without auto-resume').toBe(false);
     expect(e1.code, `pod-1 stderr: ${(stderrTail.get('outage-pod-1') ?? '').slice(-800)}`).toBe(0);
     expect(e2.code, `pod-2 stderr: ${(stderrTail.get('outage-pod-2') ?? '').slice(-800)}`).toBe(0);
+
+    // The 90s stop under the tight retry budget fires the breaker
+    // deterministically (ledger telemetry: ~6 failed chunks within 10s,
+    // pods frozen until CH returns). The run can only have finished
+    // because auto-resume carried it — demand both halves of the proof.
+    const logs = (stderrTail.get('outage-pod-1') ?? '') + (stderrTail.get('outage-pod-2') ?? '');
+    expect(logs, 'breaker never fired — outage config no longer forces it').toContain('Circuit breaker');
+    expect(logs, 'breaker fired but no auto-resume logged').toContain('auto-resumed');
+    console.log('[outage] breaker fired and auto-resume carried the run — full loop observed live');
 
     // Drain + heal: the documented operator flow. Workers hit by the outage
     // may have exited nonzero or parked chunks as failed — respawn and
