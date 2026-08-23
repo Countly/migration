@@ -215,6 +215,34 @@ describe('LedgerStore', () => {
     await mc2.close();
   });
 
+  it('activeClaims is lease-aware: dead pods\' stale claims do not count, live ones do', async () => {
+    const AC = 'active-claims-run';
+    const mk = (idx: number, pod: string, status: string, leaseMs: number): Record<string, unknown> => ({
+      _id: `${AC}:collA:${idx}`, run_id: AC, collection: 'collA',
+      scope_a: null, scope_e: null, scope_n: null, idx,
+      lower_cd: idx * 1000, upper_cd: (idx + 1) * 1000,
+      status, pod_id: pod, lease_until: new Date(Date.now() + leaseMs), staging_table: null,
+      docs_read: 0, docs_skipped: 0, rows_expected: 0, partitions: [], attached: [],
+      attach_method: null, attempts: 1, last_error: null, transform_version: 'v1', updated_at: new Date(),
+    });
+    const mc3 = new MongoClient(MONGO_URI);
+    await mc3.connect();
+    await mc3.db(DB).collection('mig_ranges').insertMany([
+      mk(0, 'pod-live', 'in_progress', 60_000),    // live lease → counts
+      mk(1, 'pod-live', 'attaching', 60_000),      // live lease → counts
+      mk(2, 'pod-dead', 'in_progress', -60_000),   // expired → crashed pod, ignored
+      mk(3, 'pod-me', 'written', 60_000),          // the asking pod itself, excluded
+      { ...mk(4, 'pod-done', 'done', 60_000) },    // terminal, ignored
+    ] as never[]);
+    const active = await ledger.activeClaims(AC, 'pod-me');
+    expect(active).toEqual([{ pod: 'pod-live', count: 2 }]);
+    // without exclusion the asking pod shows up too
+    const all = await ledger.activeClaims(AC);
+    expect(all.map((r) => r.pod).sort()).toEqual(['pod-live', 'pod-me']);
+    await mc3.db(DB).collection('mig_ranges').deleteMany({ run_id: AC } as never);
+    await mc3.close();
+  });
+
   it('guarded transitions reject wrong from-state', async () => {
     const moved = await ledger.transition('r1:coll:2', 'pending', 'done');
     expect(moved).toBeNull(); // it's in_progress, not pending

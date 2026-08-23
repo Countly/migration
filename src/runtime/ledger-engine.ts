@@ -181,9 +181,11 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     if (rebuildState.status === 'running') return { started: false, reason: 'rebuild already running' };
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — a rebuild only makes sense when progress state is lost; stop/pause first' };
     if (dryState.status === 'running') return { started: false, reason: 'dry run in progress — wait for it to finish' };
-    const pods = await ledger.podActivity(config.ledger.runId);
-    const others = pods.filter((row) => row.pod !== config.worker.podId && row.active > 0);
-    if (others.length > 0) return { started: false, reason: `other pods hold active chunks (${others.map((row) => row.pod).join(', ')}) — stop them first` };
+    // Lease-aware: a crashed pod's stale claims expire and must not block a
+    // rebuild (post-crash is exactly when rebuild is needed); a pod that is
+    // actually working keeps its leases renewed and must block it.
+    const others = await ledger.activeClaims(config.ledger.runId, config.worker.podId);
+    if (others.length > 0) return { started: false, reason: `other pods hold live leases (${others.map((row) => `${row.pod}: ${row.count}`).join(', ')}) — stop them first` };
     const existing = await ledger.countForRun(config.ledger.runId);
     if (existing > 0 && !force) {
       return { started: false, reason: `ledger already has ${existing} chunks for run "${config.ledger.runId}" — rebuilding replaces them; confirm with force`, existingChunks: existing };
@@ -253,6 +255,8 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.post('/control/audit-source', async () => {
     if (auditSourceState.status === 'running') return { started: false, reason: 'source audit already running' };
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — audit after completion or while paused' };
+    const busySrc = await ledger.activeClaims(config.ledger.runId, config.worker.podId);
+    if (busySrc.length > 0) return { started: false, reason: `other pods are actively migrating (${busySrc.map((row) => row.pod).join(', ')}) — a mid-run audit reports false mismatches; audit after completion` };
     Object.assign(auditSourceState, newRebuildProgress(), { status: 'running', startedAt: Date.now() });
     void rebuildLedger({ config, logger, ledger, dlq, hashResolver, progress: auditSourceState, checkOnly: true })
       .then(() => { auditSourceState.status = 'completed'; auditSourceState.finishedAt = Date.now(); })
@@ -266,6 +270,8 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.post<{ Body: { samples?: number } }>('/control/audit-content', async (req) => {
     if (auditContentState.status === 'running') return { started: false, reason: 'content audit already running' };
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — audit after completion or while paused' };
+    const busyCnt = await ledger.activeClaims(config.ledger.runId, config.worker.podId);
+    if (busyCnt.length > 0) return { started: false, reason: `other pods are actively migrating (${busyCnt.map((row) => row.pod).join(', ')}) — a mid-run audit reports false mismatches; audit after completion` };
     const samples = Math.min(10_000, Math.max(50, req.body?.samples ?? 500));
     auditContentState.status = 'running'; auditContentState.result = null; auditContentState.error = null;
     void orchestrator.contentAudit(samples)

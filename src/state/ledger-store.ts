@@ -572,6 +572,30 @@ export class LedgerStore {
   }
 
   /**
+   * Pods holding LIVE claims: non-terminal chunks whose lease has not
+   * expired. This is the guard for destructive/ambiguous operator actions
+   * (rebuild, audits): a crashed pod's stale claims must NOT block them —
+   * its leases expire — while a genuinely working pod must.
+   */
+  async activeClaims(runId: string, excludePod?: string): Promise<Array<{ pod: string; count: number }>> {
+    const match: Record<string, unknown> = {
+      run_id: runId,
+      status: { $in: ['in_progress', 'written', 'attaching'] },
+      lease_until: { $gt: new Date() },
+      pod_id: { $ne: null },
+    };
+    const rows = await this.c()
+      .aggregate<{ _id: string; count: number }>([
+        { $match: match },
+        { $group: { _id: '$pod_id', count: { $sum: 1 } } },
+      ])
+      .toArray();
+    return rows
+      .filter((r) => r._id !== excludePod)
+      .map((r) => ({ pod: r._id, count: r.count }));
+  }
+
+  /**
    * Cluster-wide throughput from the shared ledger: docs read by chunks
    * that finished in the last windowSec, across ALL pods. The in-memory
    * docsPerSecond each pod reports covers only itself — with N pods the
