@@ -22,6 +22,12 @@ the fix one click away.
 To scale: start more instances with the same `.env` and a unique `POD_ID`
 each, on separate machines (see Scaling with pods below).
 
+Chunks for ALL collections are mapped upfront and claimed globally
+(collections in order, newest data first within each), so pods spill into
+the next collection the moment the current one has nothing claimable —
+many-small-collection datasets parallelize across pods just like one big
+collection does.
+
 **Docker (no Kubernetes)**: scaling works the same way — pods are just
 processes coordinating through chunk leases in MongoDB, and `POD_ID`
 defaults to the container hostname (unique automatically). Run one

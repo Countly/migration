@@ -206,10 +206,74 @@ export class ChunkOrchestrator {
     this.multiCollection = collections.length > 1;
     this.logger.info({ collections: collections.length, runId: this.runId, dryRun: this.dryRun }, 'Ledger engine starting');
 
+    // ── MAP PHASE ─────────────────────────────────────────────────────────
+    // Cut every collection's chunk grid upfront so claiming can be GLOBAL:
+    // pods reserve the next available chunk anywhere, spilling into the next
+    // collection the moment the current one has nothing claimable — instead
+    // of convoying on one collection (the many-small-collections killer).
     for (const collection of collections) {
       if (this.stopping) break;
-      await this.processCollection(collection);
+      await this.mapCollection(collection);
     }
+    this.logger.info({ mapped: this.collectionDefaults.size }, 'All collections mapped — global claiming starts');
+
+    await this.recoverChunks(null, this.logger);
+
+    // ── GLOBAL CLAIM LOOP (regular chunks across all collections) ────────
+    let boundCollection: string | null = null;
+    for (;;) {
+      if (this.stopping) break;
+      while (this.paused && !this.stopping) await sleep(1_000);
+      if (this.stopping) break;
+      await this.reclaimExpiredLeases(null, this.logger);
+
+      const chunk = await this.d.ledger.claimNextGlobal(this.runId, this.podId, config.ledger.leaseSec);
+      if (!chunk) {
+        const remaining = await this.d.ledger.countRegularNonTerminal(this.runId);
+        if (remaining === 0) break;
+        if (!config.worker.enabled) {
+          const orphans = await this.d.ledger.findRecoverable(this.runId, null, true);
+          for (const orphan of orphans) await this.recoverOne(orphan, this.logger);
+          continue;
+        }
+        this.logger.info({ waitingOn: remaining }, 'No claimable chunks; waiting on other pods (reclaim on lease expiry)');
+        await sleep(Math.min((config.ledger.leaseSec * 1000) / 2, 15_000));
+        continue;
+      }
+
+      const log = this.logger.child({ collection: chunk.collection });
+      if (chunk.attempts > MAX_CHUNK_ATTEMPTS && this.isSplittable(chunk)) {
+        const parts = await this.d.ledger.splitChunk(chunk, 4);
+        log.warn({ chunk: chunk._id, attempts: chunk.attempts, parts }, 'Chunk exhausted crash-retries — split into sub-chunks (poison-pill hunt)');
+        continue;
+      }
+      if (chunk.attempts > MAX_CHUNK_ATTEMPTS) {
+        await this.d.ledger.transition(chunk._id, 'in_progress', 'failed', {
+          last_error: `exceeded ${MAX_CHUNK_ATTEMPTS} attempts (crash quarantine — inspect source docs in this cd window)`,
+        });
+        this.noteChunkFailure(log);
+        continue;
+      }
+
+      if (chunk.collection !== boundCollection) {
+        await this.d.mongoReader.switchCollection(chunk.collection);
+        boundCollection = chunk.collection;
+        this.currentCollection = chunk.collection;
+      }
+      await this.processChunk(chunk, this.collectionDefaults.get(chunk.collection), log);
+      this.lastStatusCounts = await this.d.ledger.statusCounts(this.runId);
+    }
+
+    // ── SWEEP PHASE (null-cd sentinels, per collection, after its regulars) ─
+    if (!this.stopping) await this.runSweepPhase();
+
+    if (!this.stopping) {
+      for (const collection of this.collectionDefaults.keys()) {
+        await this.sweepOrphanStaging(collection);
+      }
+      this.lastStatusCounts = await this.d.ledger.statusCounts(this.runId);
+    }
+    this.currentCollection = null;
 
     if (this.monitorTimer) clearInterval(this.monitorTimer);
     this.status = this.stopping ? 'stopped' : 'completed';
@@ -233,24 +297,36 @@ export class ChunkOrchestrator {
   // Per-collection flow
   // -------------------------------------------------------------------------
 
-  private async processCollection(collection: string): Promise<void> {
+  /** Collection identity cache (transform defaults) built during mapping. */
+  private readonly collectionDefaults = new Map<string, CollectionDefaults | undefined>();
+
+  /**
+   * Map one collection: ensure the read index (join semantics), probe cd
+   * bounds, cut the chunk grid (+ null-cd sentinel), persist it idempotently.
+   * No copying happens here — claims are global afterwards.
+   */
+  private async mapCollection(collection: string): Promise<void> {
     const { config, mongoReader, ledger } = this.d;
-    this.currentCollection = collection;
+    this.currentCollection = collection; // mapping progress visible in UI
     const log = this.logger.child({ collection });
 
     await mongoReader.switchCollection(collection);
-
-    // Unconditional: joins an in-progress build (crash-recovery case),
-    // no-ops when ready, builds when missing — returns only when READY.
     if (!(await mongoReader.hasRequiredIndex(collection))) {
       log.info('Building {cd:1,_id:1} index (this can take a long time on large collections — progress in the UI)');
     }
     await mongoReader.ensureIndex(collection);
 
+    const defaults = this.d.hashResolver.resolveCollectionName(collection, config.source.collectionPrefix) ?? undefined;
+    this.collectionDefaults.set(collection, defaults);
+
     const lower = await mongoReader.getLowerBound();
     const upper = await mongoReader.getUpperBound();
     if (!lower || !upper) {
       log.info('Collection empty (no cd-bearing docs), skipping');
+      if (!this.dryRun && (await mongoReader.hasNullCdDocuments())) {
+        await ledger.initChunks(this.runId, collection, [{ lowerCd: -1, upperCd: 0 }], config.transform.version, defaults ? chScopeOf(defaults) : null);
+        log.info('Only null-cd documents — sweep chunk added');
+      }
       return;
     }
 
@@ -265,84 +341,72 @@ export class ChunkOrchestrator {
 
     // Null-cd sweep chunk: documents with no `cd` value are invisible to the
     // cd-bounded chunks — they get one dedicated chunk, paged by `_id`.
-    // Sentinel bounds {-1, 0} mark it.
+    // Sentinel bounds {-1, 0} mark it; the sweep phase runs it only after
+    // this collection's regulars are terminal.
     if (!this.dryRun && (await mongoReader.hasNullCdDocuments())) {
       bounds.push({ lowerCd: -1, upperCd: 0 });
       log.info('Collection has null-cd documents — added null-cd sweep chunk');
     }
 
-    const defaults = this.d.hashResolver.resolveCollectionName(collection, config.source.collectionPrefix) ?? undefined;
     const created = await ledger.initChunks(this.runId, collection, bounds, config.transform.version, defaults ? chScopeOf(defaults) : null);
     log.info({ estimated, chunks: bounds.length, created, scoped: !!defaults, dryRun: this.dryRun }, 'Chunk list ready');
+  }
 
-    await this.recoverChunks(collection, log);
-
+  /**
+   * Null-cd sweeps: each collection's sentinel runs strictly after that
+   * collection's regular chunks are terminal (its rows carry ts-derived cd
+   * inside regular windows and would poison verify-then-attach). By the time
+   * this phase starts, this pod saw zero claimable regulars globally; other
+   * pods may still hold leases, so each sentinel re-checks its own gate.
+   */
+  private async runSweepPhase(): Promise<void> {
+    const { config, ledger } = this.d;
     for (;;) {
       if (this.stopping) return;
       while (this.paused && !this.stopping) await sleep(1_000);
-      await this.reclaimExpiredLeases(collection, log);
 
-      // The null-cd sweep must run strictly after every regular chunk is
-      // terminal — its rows land inside regular chunks' cd windows and would
-      // poison their verify-then-attach checks.
-      const regularsRemaining = await ledger.countRegularNonTerminal(this.runId, collection);
-      const chunk = await ledger.claimNext(this.runId, collection, this.podId, config.ledger.leaseSec, regularsRemaining > 0);
-      if (chunk && chunk.attempts > MAX_CHUNK_ATTEMPTS && this.isSplittable(chunk)) {
-        // Poison-pill quarantine: this chunk keeps killing the process (a
-        // clean data error would have failed it long before exhausting
-        // crash-retries). Don't retry the same span again — bisect it, so
-        // repeated splitting converges on a tiny window around the poison
-        // document instead of quarantining millions of docs.
-        const parts = await ledger.splitChunk(chunk, 4);
-        log.warn(
-          { chunk: chunk._id, attempts: chunk.attempts, parts },
-          'Chunk exhausted crash-retries — split into sub-chunks (poison-pill hunt)',
-        );
-        continue;
-      }
-      if (!chunk) {
-        // Nothing pending — but "complete" means NO non-terminal chunks.
-        // Chunks may still be leased by another pod (or orphaned by a dead
-        // one); wait for their leases instead of declaring a hole "done".
-        const nonTerminal = await ledger.findRecoverable(this.runId, collection, true);
-        if (nonTerminal.length === 0) break;
-        if (!config.worker.enabled) {
-          // Single-pod: no other pod can own these — recover immediately.
-          for (const orphan of nonTerminal) await this.recoverOne(orphan, log);
+      const sentinels = await ledger.listPendingSentinels(this.runId);
+      let claimedAny = false;
+      for (const sentinel of sentinels) {
+        if (this.stopping) return;
+        if ((await ledger.countRegularNonTerminal(this.runId, sentinel.collection)) > 0) continue;
+        const chunk = await ledger.claimById(sentinel._id, this.podId, config.ledger.leaseSec);
+        if (!chunk) continue;
+        claimedAny = true;
+        const log = this.logger.child({ collection: chunk.collection });
+        if (chunk.attempts > MAX_CHUNK_ATTEMPTS) {
+          await ledger.transition(chunk._id, 'in_progress', 'failed', {
+            last_error: `exceeded ${MAX_CHUNK_ATTEMPTS} attempts (crash quarantine — inspect source docs in this cd window)`,
+          });
+          this.noteChunkFailure(log);
           continue;
         }
-        log.info(
-          { waitingOn: nonTerminal.length },
-          'No pending chunks; waiting on leased in-flight chunks (reclaim on lease expiry)',
-        );
-        await sleep(Math.min((config.ledger.leaseSec * 1000) / 2, 15_000));
-        continue;
+        await this.d.mongoReader.switchCollection(chunk.collection);
+        this.currentCollection = chunk.collection;
+        await this.processChunk(chunk, this.collectionDefaults.get(chunk.collection), log);
+        this.lastStatusCounts = await ledger.statusCounts(this.runId);
       }
-      if (chunk.attempts > MAX_CHUNK_ATTEMPTS) {
-        // Too small to split further (or the null-cd sentinel): quarantine.
-        // The window is now tiny — the offending doc(s) are inspectable
-        // directly in the source between lower_cd and upper_cd.
-        await ledger.transition(chunk._id, 'in_progress', 'failed', {
-          last_error: `exceeded ${MAX_CHUNK_ATTEMPTS} attempts (crash quarantine — inspect source docs in this cd window)`,
-        });
-        this.noteChunkFailure(log);
-        continue;
-      }
-      await this.processChunk(chunk, defaults, log);
-      this.lastStatusCounts = await ledger.statusCounts(this.runId, collection);
-    }
+      if (claimedAny) continue;
 
-    await this.sweepOrphanStaging(collection);
-    this.lastStatusCounts = await ledger.statusCounts(this.runId, collection);
-    log.info({ statusCounts: this.lastStatusCounts }, 'Collection complete');
-    this.currentCollection = null;
+      // Nothing claimable: complete when NOTHING is non-terminal anywhere.
+      const counts = await ledger.statusCounts(this.runId);
+      const nonTerminal = (counts.pending ?? 0) + (counts.in_progress ?? 0) + (counts.written ?? 0) + (counts.attaching ?? 0);
+      if (nonTerminal === 0) return;
+      if (!config.worker.enabled) {
+        const orphans = await ledger.findRecoverable(this.runId, null, true);
+        for (const orphan of orphans) await this.recoverOne(orphan, this.logger);
+        continue;
+      }
+      await this.reclaimExpiredLeases(null, this.logger);
+      await sleep(Math.min((config.ledger.leaseSec * 1000) / 2, 15_000));
+    }
   }
 
   // -------------------------------------------------------------------------
   // Recovery & multi-pod lease reclaim
   // -------------------------------------------------------------------------
 
-  private async recoverChunks(collection: string, log: Logger): Promise<void> {
+  private async recoverChunks(collection: string | null, log: Logger): Promise<void> {
     const includeAll = !this.d.config.worker.enabled;
     const recoverable = await this.d.ledger.findRecoverable(this.runId, collection, includeAll);
     for (const chunk of recoverable) {
@@ -351,7 +415,7 @@ export class ChunkOrchestrator {
   }
 
   /** Periodic tick (multi-pod): reclaim chunks whose owner's lease expired. */
-  private async reclaimExpiredLeases(collection: string, log: Logger): Promise<void> {
+  private async reclaimExpiredLeases(collection: string | null, log: Logger): Promise<void> {
     if (!this.d.config.worker.enabled) return;
     const intervalMs = Math.min((this.d.config.ledger.leaseSec * 1000) / 2, 30_000);
     if (Date.now() - this.lastReclaimAt < intervalMs) return;
