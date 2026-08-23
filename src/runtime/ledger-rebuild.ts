@@ -189,10 +189,17 @@ export async function rebuildLedger(opts: {
         // only shortfall is its own DLQ'd docs gets flagged/redone forever.
         const unresolved = await dlq.countUnresolvedInWindow(runId, collection, b.lowerCd, b.upperCd);
 
-        const status: ChunkDoc['status'] =
-          live + unresolved === mongoCount ? 'done' : live === 0 ? 'pending' : 'failed';
+        // Unscopable collection (base drill_events with embedded a/e) among
+        // OTHERS: an unscoped window count includes sibling rows, so no
+        // classification is possible — mark pending. Redo is idempotent:
+        // promotion pair-checks staged rows before every attach, so already
+        // -migrated partitions are skipped, never duplicated.
+        const unscopableInMulti = !scope && collections.length > 1;
+        const status: ChunkDoc['status'] = unscopableInMulti
+          ? 'pending'
+          : live + unresolved === mongoCount ? 'done' : live === 0 ? 'pending' : 'failed';
         // pending (live=0) is 'not migrated yet', not a disagreement
-        if (checkOnly && live + unresolved !== mongoCount && live !== 0 && progress.mismatchedWindows.length < 200) {
+        if (checkOnly && !unscopableInMulti && live + unresolved !== mongoCount && live !== 0 && progress.mismatchedWindows.length < 200) {
           progress.mismatchedWindows.push({
             collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
             source: mongoCount, live,
