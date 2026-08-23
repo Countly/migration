@@ -100,6 +100,11 @@ export function computeChunkBounds(
   return bounds;
 }
 
+/** Thrown when a stalled worker discovers its lease was reclaimed. */
+class ClaimLostError extends Error {
+  constructor(chunkId: string) { super(`claim lost: ${chunkId}`); this.name = 'ClaimLostError'; }
+}
+
 const MAX_CHUNK_ATTEMPTS = 3;
 const BISECT_LOG_THRESHOLD = 1;
 
@@ -118,6 +123,8 @@ export class ChunkOrchestrator {
   private fatalError: string | null = null;
   private multiCollection = false;
   private finishedAt = 0;
+  /** Set while a chunk is processing; page loop calls it to abort fast on claim loss. */
+  private assertClaimHook: (() => void) | null = null;
   /** Live progress of a running verify (billion-scale runs take minutes). */
   readonly verifyProgress = { running: false, checked: 0, total: 0, phase: '' };
   private stopping = false;
@@ -274,7 +281,7 @@ export class ChunkOrchestrator {
       if (chunk.attempts > MAX_CHUNK_ATTEMPTS) {
         await this.d.ledger.transition(chunk._id, 'in_progress', 'failed', {
           last_error: `exceeded ${MAX_CHUNK_ATTEMPTS} attempts (crash quarantine — inspect source docs in this cd window)`,
-        });
+        }, { podId: this.podId, attempts: chunk.attempts });
         this.noteChunkFailure(log);
         continue;
       }
@@ -431,7 +438,7 @@ export class ChunkOrchestrator {
       if (chunk.attempts > MAX_CHUNK_ATTEMPTS) {
         await this.d.ledger.transition(chunk._id, 'in_progress', 'failed', {
           last_error: `exceeded ${MAX_CHUNK_ATTEMPTS} attempts (crash quarantine — inspect source docs in this cd window)`,
-        });
+        }, { podId: this.podId, attempts: chunk.attempts });
         this.noteChunkFailure(log);
         continue;
       }
@@ -463,6 +470,14 @@ export class ChunkOrchestrator {
       let claimedAny = false;
       for (const sentinel of sentinels) {
         if (this.stopping) return;
+        // Barrier-lite against a mapper racing us: re-probe THIS collection
+        // for delta right before its sweep. If new data appended (or another
+        // pod's fresh append is visible), regulars go first — skip the
+        // sentinel this round. (Since promotion pair-checks staged rows,
+        // even a lost race here degrades to harmless idempotent redo, not
+        // data loss — this probe is defense-in-depth for ordering.)
+        const appended = await this.mapCollection(sentinel.collection).catch(() => 0);
+        if (appended > 0) { await this.globalClaimLoop(); continue; }
         if ((await ledger.countRegularNonTerminal(this.runId, sentinel.collection)) > 0) continue;
         const chunk = await ledger.claimById(sentinel._id, this.podId, config.ledger.leaseSec);
         if (!chunk) continue;
@@ -582,8 +597,12 @@ export class ChunkOrchestrator {
   // Chunk processing
   // -------------------------------------------------------------------------
 
-  private stagingName(collection: string, idx: number): string {
-    return `${this.d.config.target.table}__stg_${shortHash(`${this.runId}:${collection}`)}_${idx}`;
+  private stagingName(collection: string, idx: number, gen?: number): string {
+    // gen = claim generation (attempts): a stalled worker resumed after
+    // reclamation writes to ITS OWN table, never the new owner's. Orphaned
+    // generations are swept by the prefix-based orphan sweep.
+    const base = `${this.d.config.target.table}__stg_${shortHash(`${this.runId}:${collection}`)}_${idx}`;
+    return gen !== undefined ? `${base}_g${gen}` : base;
   }
 
   private async processChunk(
@@ -593,18 +612,27 @@ export class ChunkOrchestrator {
   ): Promise<void> {
     const { config, mongoReader, ledger, staging } = this.d;
     this.currentChunk = chunk._id;
-    const stagingTable = this.dryRun ? staging.dryRunTable : this.stagingName(chunk.collection, chunk.idx);
+    const fence = { podId: this.podId, attempts: chunk.attempts };
+    const stagingTable = this.dryRun ? staging.dryRunTable : this.stagingName(chunk.collection, chunk.idx, chunk.attempts);
     const clog = log.child({ chunk: chunk.idx, staging: stagingTable });
 
+    let claimLost = false;
     const heartbeat = setInterval(() => {
-      ledger.heartbeat(chunk._id, this.podId, config.ledger.leaseSec).catch(() => {});
+      ledger.heartbeat(chunk._id, this.podId, config.ledger.leaseSec, chunk.attempts)
+        .then((owned) => { if (!owned) claimLost = true; })
+        .catch(() => {});
     }, Math.max(10_000, (config.ledger.leaseSec * 1000) / 3));
+    const assertClaim = (): void => {
+      if (claimLost) throw new ClaimLostError(chunk._id);
+    };
+    this.assertClaimHook = assertClaim;
 
     try {
       if (!this.dryRun) {
         await staging.createStaging(stagingTable);
       }
-      await ledger.transition(chunk._id, 'in_progress', 'in_progress', { staging_table: stagingTable });
+      const owned = await ledger.transition(chunk._id, 'in_progress', 'in_progress', { staging_table: stagingTable }, fence);
+      if (!owned) throw new ClaimLostError(chunk._id);
 
       const result = await this.copyChunk(chunk, stagingTable, defaults, clog);
 
@@ -612,12 +640,14 @@ export class ChunkOrchestrator {
       this.totalDocsSkipped += result.docsSkipped;
       this.totalDocsDlq += result.docsDlq;
 
+      assertClaim();
       const rowsExpected = result.docsRead - result.docsSkipped - result.docsDlq;
-      await ledger.transition(chunk._id, 'in_progress', 'written', {
+      const toWritten = await ledger.transition(chunk._id, 'in_progress', 'written', {
         docs_read: result.docsRead,
         docs_skipped: result.docsSkipped,
         rows_expected: rowsExpected,
-      });
+      }, fence);
+      if (!toWritten) throw new ClaimLostError(chunk._id);
 
       // Circuit breaker: a high in-chunk failure rate is a systematic bug,
       // not dirty data — halt before the DLQ balloons into a dataset copy.
@@ -632,7 +662,7 @@ export class ChunkOrchestrator {
         await ledger.transition(chunk._id, 'written', 'failed', {
           staging_table: null,
           last_error: `circuit breaker: ${(failRate * 100).toFixed(1)}% of docs failed`,
-        });
+        }, fence);
         this.noteChunkFailure(clog);
         this.pause();
         return;
@@ -640,7 +670,7 @@ export class ChunkOrchestrator {
 
       if (this.dryRun) {
         // Null-engine target: nothing stored, nothing to verify or promote.
-        await ledger.transition(chunk._id, 'written', 'done', { attach_method: null });
+        await ledger.transition(chunk._id, 'written', 'done', { attach_method: null }, fence);
         this.chunksDone++;
         this.consecutiveFailed = 0;
         clog.info({ docsRead: result.docsRead, dlq: result.docsDlq }, 'Dry-run chunk done');
@@ -659,7 +689,7 @@ export class ChunkOrchestrator {
           staging_table: null,
           pod_id: null,
           last_error: `verify mismatch: expected ${rowsExpected}, landed ${landed}`,
-        });
+        }, fence);
         return;
       }
 
@@ -696,6 +726,14 @@ export class ChunkOrchestrator {
 
       await this.checkDlqPressure(clog);
     } catch (err) {
+      if (err instanceof ClaimLostError) {
+        // Our lease was reclaimed while we were stalled — the chunk belongs
+        // to someone else now. Abandon quietly: no transitions, and drop
+        // only OUR generation's staging table.
+        clog.warn({ chunk: chunk._id }, 'Claim lost (lease reclaimed while stalled) — abandoning chunk');
+        if (!this.dryRun) await staging.dropStaging(stagingTable).catch(() => {});
+        return;
+      }
       const error = err as Error;
       const isPermanent = classifyError(err) === 'permanent';
       clog.error({ error: error.message, isPermanent }, 'Chunk failed');
@@ -705,10 +743,11 @@ export class ChunkOrchestrator {
         staging_table: null,
         pod_id: null,
         last_error: error.message.slice(0, 500),
-      });
+      }, fence);
       if (target === 'failed') this.noteChunkFailure(clog);
     } finally {
       clearInterval(heartbeat);
+      this.assertClaimHook = null;
       this.currentChunk = null;
     }
   }
@@ -826,6 +865,7 @@ export class ChunkOrchestrator {
     inflight: Promise<void>[],
     clog: Logger,
   ): Promise<void> {
+    this.assertClaimHook?.();
     const { config } = this.d;
 
     // Chaos hook for poison-pill drills (bench/poison-drill.ts): hard-kills
@@ -957,7 +997,9 @@ export class ChunkOrchestrator {
 
     const aStart = performance.now();
     const partitions = await staging.listPartitions(stagingTable);
-    await ledger.transition(chunk._id, ['written', 'attaching'], 'attaching', { partitions, staging_table: stagingTable });
+    const fence = chunk.pod_id ? { podId: chunk.pod_id, attempts: chunk.attempts } : undefined;
+    const moved = await ledger.transition(chunk._id, ['written', 'attaching'], 'attaching', { partitions, staging_table: stagingTable }, fence);
+    if (!moved) throw new ClaimLostError(chunk._id);
 
     await this.finishAttaching({ ...chunk, partitions, attached: chunk.attached ?? [] }, log);
     this.stageMs.attach += performance.now() - aStart;
@@ -965,6 +1007,7 @@ export class ChunkOrchestrator {
 
   private async finishAttaching(chunk: ChunkDoc, log: Logger): Promise<void> {
     const { ledger, staging } = this.d;
+    const fence = chunk.pod_id ? { podId: chunk.pod_id, attempts: chunk.attempts } : undefined;
     const stagingTable = chunk.staging_table!;
     const attachedSet = new Set(chunk.attached);
     let method: 'attach' | 'insert_select' = chunk.attach_method ?? 'attach';
@@ -977,7 +1020,7 @@ export class ChunkOrchestrator {
       // window-count here once skipped attaches on multi-collection runs).
       const already = await staging.countLiveByStagedIds(stagingTable, partitionId);
       if (already > 0) {
-        await ledger.recordAttached(chunk._id, partitionId);
+        await ledger.recordAttached(chunk._id, partitionId, fence);
         continue;
       }
       try {
@@ -987,15 +1030,15 @@ export class ChunkOrchestrator {
           log.warn({ err: (err as Error).message }, 'ATTACH unavailable — falling back to INSERT SELECT');
           await staging.insertSelect(stagingTable);
           method = 'insert_select';
-          for (const p of chunk.partitions) await ledger.recordAttached(chunk._id, p);
+          for (const p of chunk.partitions) await ledger.recordAttached(chunk._id, p, fence);
           break;
         }
         throw err; // partial attach + failure → stays 'attaching', recovery resumes
       }
-      await ledger.recordAttached(chunk._id, partitionId);
+      await ledger.recordAttached(chunk._id, partitionId, fence);
     }
 
-    await ledger.transition(chunk._id, 'attaching', 'done', { attach_method: method });
+    await ledger.transition(chunk._id, 'attaching', 'done', { attach_method: method }, fence);
     await staging.dropStaging(stagingTable);
     this.chunksDone++;
   }

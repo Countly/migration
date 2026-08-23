@@ -207,7 +207,15 @@ export class LedgerStore {
     return { maxIdx: top.idx as number, maxUpperCd: (upper?.upper_cd as number) ?? 0 };
   }
 
-  /** Append delta chunks after the existing grid (idx continues). */
+  /**
+   * Append delta chunks after the existing grid (idx continues). The FIRST
+   * document is the reservation: it is inserted alone, and a duplicate key
+   * there means another pod won the append for this startIdx — we return 0
+   * and the caller re-probes on its next pass. This serializes concurrent
+   * appends without a lock: racing pods that observed different source
+   * maxima can no longer interleave two different grids into overlapping
+   * windows.
+   */
   async appendChunks(
     runId: string,
     collection: string,
@@ -243,10 +251,24 @@ export class LedgerStore {
       transform_version: transformVersion,
       updated_at: now,
     }));
+    // The FIRST document is the reservation: racing pods that observed
+    // different source maxima compute the same startIdx, so exactly one
+    // insertOne wins — the loser aborts with 0 and re-probes next pass.
+    // Without this, unordered insertMany with swallowed duplicate keys let
+    // two different grids interleave into OVERLAPPING windows (= docs
+    // migrated twice).
     try {
-      await this.c().insertMany(docs, { ordered: false });
+      await this.c().insertOne(docs[0]);
     } catch (err: unknown) {
-      if ((err as { code?: number }).code !== 11000) throw err; // another pod appended concurrently
+      if ((err as { code?: number }).code === 11000) return 0; // lost the race
+      throw err;
+    }
+    if (docs.length > 1) {
+      try {
+        await this.c().insertMany(docs.slice(1), { ordered: false });
+      } catch (err: unknown) {
+        if ((err as { code?: number }).code !== 11000) throw err;
+      }
     }
     return docs.length;
   }
@@ -328,12 +350,19 @@ export class LedgerStore {
     );
   }
 
-  /** Extend the lease of a chunk this pod is working on. */
-  async heartbeat(chunkId: string, podId: string, leaseSec: number): Promise<void> {
-    await this.c().updateOne(
-      { _id: chunkId, pod_id: podId, status: { $in: ['in_progress', 'written', 'attaching'] } },
+  /**
+   * Extend the lease of a chunk this pod is working on. Returns false when
+   * the claim no longer belongs to this pod+generation — the worker was
+   * stalled past its lease and someone reclaimed; it must abandon the chunk.
+   */
+  async heartbeat(chunkId: string, podId: string, leaseSec: number, attempts?: number): Promise<boolean> {
+    const filter: Record<string, unknown> = { _id: chunkId, pod_id: podId, status: { $in: ['in_progress', 'written', 'attaching'] } };
+    if (attempts !== undefined) filter.attempts = attempts;
+    const res = await this.c().updateOne(
+      filter,
       { $set: { lease_until: new Date(Date.now() + leaseSec * 1000), updated_at: new Date() } },
     );
+    return res.matchedCount > 0;
   }
 
   /**
@@ -345,19 +374,28 @@ export class LedgerStore {
     from: ChunkStatus | ChunkStatus[],
     to: ChunkStatus,
     patch: Partial<ChunkDoc> = {},
+    fence?: { podId: string; attempts: number },
   ): Promise<ChunkDoc | null> {
     const fromArr = Array.isArray(from) ? from : [from];
+    const filter: Record<string, unknown> = { _id: chunkId, status: { $in: fromArr } };
+    // Claim fencing: a stalled worker that resumes after its lease was
+    // reclaimed must not be able to move the NEW owner's claim. attempts
+    // increments atomically on every claim, so (pod_id, attempts) uniquely
+    // identifies one claim generation.
+    if (fence) { filter.pod_id = fence.podId; filter.attempts = fence.attempts; }
     return this.c().findOneAndUpdate(
-      { _id: chunkId, status: { $in: fromArr } },
+      filter,
       { $set: { ...patch, status: to, updated_at: new Date() } },
       { returnDocument: 'after' },
     );
   }
 
   /** Append one attached partition id (crash-safe attach progress). */
-  async recordAttached(chunkId: string, partitionId: string): Promise<void> {
+  async recordAttached(chunkId: string, partitionId: string, fence?: { podId: string; attempts: number }): Promise<void> {
+    const filter: Record<string, unknown> = { _id: chunkId };
+    if (fence) { filter.pod_id = fence.podId; filter.attempts = fence.attempts; }
     await this.c().updateOne(
-      { _id: chunkId },
+      filter,
       { $addToSet: { attached: partitionId }, $set: { updated_at: new Date() } },
     );
   }

@@ -538,4 +538,51 @@ describe('multi-collection scoping + ledger rebuild', () => {
     await staging.dropStaging(stagingTable);
     await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'retry_victim'` });
   }, 60_000);
+
+  it('fencing: a stalled ex-owner cannot move or heartbeat a reclaimed chunk', async () => {
+    const FR = 'fence-run';
+    await ledger.initChunks(FR, COLL1, [{ lowerCd: 0, upperCd: 1000 }], 'v2', null);
+
+    // stale pod claims (generation 1) and stalls
+    const stale = await ledger.claimById(`${FR}:${COLL1}:0`, 'stale-pod', 1);
+    expect(stale?.attempts).toBe(1);
+    const staleFence = { podId: 'stale-pod', attempts: stale!.attempts };
+
+    // lease expires; recovery resets; a new pod claims (generation 2)
+    await ledger.transition(`${FR}:${COLL1}:0`, 'in_progress', 'pending', { pod_id: null, staging_table: null });
+    const fresh = await ledger.claimById(`${FR}:${COLL1}:0`, 'new-pod', 600);
+    expect(fresh?.attempts).toBe(2);
+
+    // the stalled worker wakes up: every fenced mutation is rejected
+    expect(await ledger.heartbeat(`${FR}:${COLL1}:0`, 'stale-pod', 600, staleFence.attempts)).toBe(false);
+    expect(await ledger.transition(`${FR}:${COLL1}:0`, 'in_progress', 'written', {}, staleFence)).toBeNull();
+
+    // the rightful owner's fence works
+    const ok = await ledger.transition(`${FR}:${COLL1}:0`, 'in_progress', 'written', {}, { podId: 'new-pod', attempts: 2 });
+    expect(ok?.status).toBe('written');
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: FR } as never);
+  }, 30_000);
+
+  it('appendChunks: racing pods with different grids — exactly one wins, windows never overlap', async () => {
+    const AR = 'append-race-run';
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: AR } as never); // idempotent re-runs
+    await ledger.initChunks(AR, COLL1, [{ lowerCd: 0, upperCd: 1000 }], 'v2', null);
+
+    // Pods observed different source maxima and race their appends
+    const gridA = [{ lowerCd: 1000, upperCd: 2000 }, { lowerCd: 2000, upperCd: 3000 }];
+    const gridB = [{ lowerCd: 1000, upperCd: 1500 }, { lowerCd: 1500, upperCd: 2500 }, { lowerCd: 2500, upperCd: 3500 }];
+    const [a, b] = await Promise.all([
+      ledger.appendChunks(AR, COLL1, gridA, 1, 'v2', null),
+      ledger.appendChunks(AR, COLL1, gridB, 1, 'v2', null),
+    ]);
+    expect([a, b].filter((x) => x > 0).length, `a=${a} b=${b}`).toBe(1); // exactly one reservation won
+
+    const chunks = await mc.db(DB).collection('mig_ranges')
+      .find({ run_id: AR } as never).sort({ idx: 1 }).toArray();
+    // one coherent grid: contiguous, non-overlapping
+    for (let i = 1; i < chunks.length; i++) {
+      expect(chunks[i].lower_cd).toBe(chunks[i - 1].upper_cd);
+    }
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: AR } as never);
+  }, 30_000);
 });
