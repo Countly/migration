@@ -524,7 +524,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
       query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
               VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u', 'd', 'retry_victim', ${tsMs}, fromUnixTimestamp64Milli(${Date.now()}))`,
     });
-    expect(await staging.countLiveByStagedIds(stagingTable, partitionId)).toBe(0); // id-only matching: 1 → skipped attach → data loss
+    expect(await staging.countLiveMatchingStaged(stagingTable, partitionId)).toBe(0); // id-only matching: 1 → skipped attach → data loss
 
     // once the migrated copy IS live, recovery correctly reports it
     await staging.insertIntoLive([{
@@ -533,7 +533,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
       c: 1, s: 0, dur: 0,
       cd: new Date(tsMs).toISOString().replace('T', ' ').replace('Z', ''),
     } as never], 'precision-test-live');
-    expect(await staging.countLiveByStagedIds(stagingTable, partitionId)).toBe(1);
+    expect(await staging.countLiveMatchingStaged(stagingTable, partitionId)).toBe(1);
 
     await staging.dropStaging(stagingTable);
     await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'retry_victim'` });
@@ -706,5 +706,76 @@ describe('multi-collection scoping + ledger rebuild', () => {
 
     await staging.dropStaging(nameOf(2));
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: ZR } as never);
+  }, 30_000);
+
+  it('reclaim: two recoverers race an expired chunk — exactly one wins', async () => {
+    const RR = 'reclaim-race-run';
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: RR } as never);
+    await ledger.initChunks(RR, COLL1, [{ lowerCd: 0, upperCd: 1000 }], 'v2', null);
+    const id = `${RR}:${COLL1}:0`;
+    await mc.db(DB).collection('mig_ranges').updateOne({ _id: id } as never, {
+      $set: { status: 'attaching', pod_id: 'dead-pod', lease_until: new Date(Date.now() - 60_000), attempts: 1 },
+    } as never);
+    const [r1, r2] = await Promise.all([
+      ledger.reclaim(id, 'attaching', 'recoverer-1', 600),
+      ledger.reclaim(id, 'attaching', 'recoverer-2', 600),
+    ]);
+    expect([r1, r2].filter(Boolean).length).toBe(1); // single winner
+    const winner = (r1 ?? r2)!;
+    expect(winner.attempts).toBe(2); // new claim generation
+    // a still-live lease is never reclaimed
+    expect(await ledger.reclaim(id, 'attaching', 'recoverer-3', 600)).toBeNull();
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: RR } as never);
+  }, 30_000);
+
+  it('double-attached partition heals to exactly one copy during recovery', async () => {
+    // The chaos-harness catch, pinned deterministically: a partition that
+    // ended up attached TWICE (two recoverers raced before reclaim existed)
+    // must converge to exactly one live copy when recovery runs again.
+    const HR = 'heal-run';
+    const HCOLL = 'drill_events_healcoll';
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: HR } as never);
+    const st = 'drill_events__stg_healtest_0_g1';
+    await staging.createStaging(st);
+    const rows = Array.from({ length: 5 }, (_, i) => ({
+      a: APP, e: '[CLY]_custom', n: 'heal_ev', uid: `hu${i}`, did: 'hd',
+      _id: `healrow_${i}`, ts: `2031-01-01 00:00:0${i}.000`, cd: `2031-01-01 00:00:0${i}.000`,
+      up: {}, sg: {}, c: 1, s: 0, dur: 0,
+    }));
+    await ch.insert({ table: `${DB}.${st}`, values: rows, format: 'JSONEachRow' });
+    const [pid] = await staging.listPartitions(st);
+    expect(pid).toBe('203101');
+
+    // the historical bug: the same partition attached twice
+    await staging.attachPartition(st, pid);
+    await staging.attachPartition(st, pid);
+    expect(await staging.countLiveMatchingStaged(st, pid)).toBe(10);
+
+    await mc.db(DB).collection('mig_ranges').insertOne({
+      _id: `${HR}:${HCOLL}:0`, run_id: HR, collection: HCOLL,
+      scope_a: null, scope_e: null, scope_n: null, idx: 0,
+      lower_cd: Date.UTC(2031, 0, 1), upper_cd: Date.UTC(2031, 0, 2),
+      status: 'attaching', pod_id: 'dead-pod', lease_until: new Date(Date.now() - 60_000),
+      staging_table: st, docs_read: 5, docs_skipped: 0, rows_expected: 5,
+      partitions: [pid], attached: [], attach_method: null, attempts: 1,
+      last_error: null, transform_version: 'v2', updated_at: new Date(),
+    } as never);
+
+    await (orchestrator as unknown as {
+      recoverOne: (c: unknown, l: unknown) => Promise<void>;
+    }).recoverOne(await mc.db(DB).collection('mig_ranges').findOne({ _id: `${HR}:${HCOLL}:0` } as never), logger);
+
+    const doc = await mc.db(DB).collection('mig_ranges').findOne({ _id: `${HR}:${HCOLL}:0` } as never);
+    expect(doc?.status).toBe('done');
+    const liveNow = await ch.query({
+      query: `SELECT count() AS c, uniqExact(_id) AS u FROM ${DB}.drill_events WHERE startsWith(_id, 'healrow_')`,
+      format: 'JSONEachRow',
+    });
+    const [l] = await liveNow.json<{ c: string; u: string }>();
+    expect(Number(l.c)).toBe(5); // healed: exactly one copy of each
+    expect(Number(l.u)).toBe(5);
+
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE startsWith(_id, 'healrow_')` });
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: HR } as never);
   }, 30_000);
 });

@@ -229,16 +229,47 @@ export class StagingManager {
    * post-cutover insert time and can never equal the staged row's historical
    * cd. Also precise across sibling collections sharing the partition.
    */
-  async countLiveByStagedIds(stagingTable: string, partitionId: string): Promise<number> {
+  async countPartitionRows(table: string, partitionId: string): Promise<number> {
     const res = await this.ch().query({
-      query: `SELECT count() AS c FROM ${this.fq(this.config.table)}
-              WHERE _partition_id = {pid:String}
-                AND (_id, cd) IN (SELECT _id, cd FROM ${this.fq(stagingTable)} WHERE _partition_id = {pid:String} LIMIT 100)`,
+      query: `SELECT count() AS c FROM ${this.fq(table)} WHERE _partition_id = {pid:String}`,
       query_params: { pid: partitionId },
       format: 'JSONEachRow',
     });
     const rows = await res.json<{ c: string }>();
     return Number(rows[0]?.c ?? 0);
+  }
+
+  /**
+   * EXACT count of live rows matching one staging partition's (_id, cd)
+   * pairs. The attach path compares this against the partition's staged row
+   * count: equal = already attached, zero = safe to attach, anything else =
+   * double-attach or partial promotion that needs healing.
+   */
+  async countLiveMatchingStaged(stagingTable: string, partitionId: string): Promise<number> {
+    const res = await this.ch().query({
+      query: `SELECT count() AS c FROM ${this.fq(this.config.table)}
+              WHERE _partition_id = {pid:String}
+                AND (_id, cd) IN (SELECT _id, cd FROM ${this.fq(stagingTable)} WHERE _partition_id = {pid:String})`,
+      query_params: { pid: partitionId },
+      format: 'JSONEachRow',
+    });
+    const rows = await res.json<{ c: string }>();
+    return Number(rows[0]?.c ?? 0);
+  }
+
+  /**
+   * Heal a double-attach: remove ALL live copies matching this staging
+   * partition's (_id, cd) pairs — the caller re-attaches afterwards so
+   * exactly one copy remains. Provenance-exact: rows sharing an _id but a
+   * different cd (live traffic, cross-cutover retries) are never touched.
+   */
+  async deleteLiveMatchingStaged(stagingTable: string, partitionId: string): Promise<void> {
+    await this.ch().command({
+      query: `DELETE FROM ${this.fq(this.config.table)}
+              WHERE _partition_id = {pid:String}
+                AND (_id, cd) IN (SELECT _id, cd FROM ${this.fq(stagingTable)} WHERE _partition_id = {pid:String})`,
+      query_params: { pid: partitionId },
+    });
   }
 
   /**

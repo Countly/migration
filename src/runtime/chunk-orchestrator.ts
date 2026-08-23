@@ -264,7 +264,7 @@ export class ChunkOrchestrator {
         if (remaining === 0) break;
         if (!config.worker.enabled) {
           const orphans = await this.d.ledger.findRecoverable(this.runId, null, true);
-          for (const orphan of orphans) await this.recoverOne(orphan, this.logger);
+          for (const orphan of orphans) await this.recoverOne(orphan, this.logger, true);
           continue;
         }
         this.logger.info({ waitingOn: remaining }, 'No claimable chunks; waiting on other pods (reclaim on lease expiry)');
@@ -421,7 +421,7 @@ export class ChunkOrchestrator {
         if (remaining === 0) return;
         if (!config.worker.enabled) {
           const orphans = await this.d.ledger.findRecoverable(this.runId, null, true);
-          for (const orphan of orphans) await this.recoverOne(orphan, this.logger);
+          for (const orphan of orphans) await this.recoverOne(orphan, this.logger, true);
           continue;
         }
         this.logger.info({ waitingOn: remaining }, 'No claimable chunks; waiting on other pods (reclaim on lease expiry)');
@@ -503,7 +503,7 @@ export class ChunkOrchestrator {
       if (nonTerminal === 0) return;
       if (!config.worker.enabled) {
         const orphans = await ledger.findRecoverable(this.runId, null, true);
-        for (const orphan of orphans) await this.recoverOne(orphan, this.logger);
+        for (const orphan of orphans) await this.recoverOne(orphan, this.logger, true);
         continue;
       }
       await this.reclaimExpiredLeases(null, this.logger);
@@ -519,7 +519,7 @@ export class ChunkOrchestrator {
     const includeAll = !this.d.config.worker.enabled;
     const recoverable = await this.d.ledger.findRecoverable(this.runId, collection, includeAll);
     for (const chunk of recoverable) {
-      await this.recoverOne(chunk, log);
+      await this.recoverOne(chunk, log, includeAll);
     }
   }
 
@@ -536,30 +536,47 @@ export class ChunkOrchestrator {
     }
   }
 
-  private async recoverOne(chunk: ChunkDoc, log: Logger): Promise<void> {
+  private async recoverOne(chunk: ChunkDoc, log: Logger, ignoreLease = false): Promise<void> {
     const { ledger, staging } = this.d;
-    const stagingTable = chunk.staging_table ?? this.stagingName(chunk.collection, chunk.idx);
-    log.info({ chunk: chunk._id, status: chunk.status }, 'Recovering chunk');
+    // Single-winner recovery: reclaim atomically starts a new claim
+    // generation. Concurrent recoverers race here and exactly one proceeds;
+    // a zombie ex-owner is fenced out of every subsequent ledger mutation
+    // (and of the mutating side of attach healing) by the attempts bump.
+    const mine = await ledger.reclaim(chunk._id, chunk.status, this.podId, this.d.config.ledger.leaseSec, ignoreLease);
+    if (!mine) return; // another pod reclaimed it (or the state moved on)
+    const fence = { podId: this.podId, attempts: mine.attempts };
+    const stagingTable = mine.staging_table;
+    log.info({ chunk: mine._id, status: chunk.status, gen: mine.attempts }, 'Recovering chunk');
 
-    if (chunk.status === 'in_progress') {
-      // Mid-copy crash: never reconstruct — drop and redo.
-      await staging.dropStaging(stagingTable);
-      await ledger.transition(chunk._id, 'in_progress', 'pending', { staging_table: null, pod_id: null });
-      return;
-    }
-    if (chunk.status === 'written') {
-      const count = await staging.countRows(stagingTable).catch(() => -1);
-      if (count === chunk.rows_expected && count >= 0) {
-        await this.promoteChunk({ ...chunk, staging_table: stagingTable }, log);
-      } else {
-        await staging.dropStaging(stagingTable);
-        await ledger.transition(chunk._id, 'written', 'pending', { staging_table: null, pod_id: null });
+    try {
+      if (chunk.status === 'in_progress') {
+        // Mid-copy crash: never reconstruct — drop and redo.
+        if (stagingTable) await staging.dropStaging(stagingTable);
+        await ledger.transition(mine._id, 'in_progress', 'pending', { staging_table: null, pod_id: null }, fence);
+        return;
       }
-      return;
-    }
-    if (chunk.status === 'attaching') {
-      // The one state where blind retry is unsafe (double-attach duplicates).
-      await this.finishAttaching({ ...chunk, staging_table: stagingTable }, log);
+      if (chunk.status === 'written') {
+        const count = stagingTable ? await staging.countRows(stagingTable).catch(() => -1) : -1;
+        if (count === mine.rows_expected && count >= 0) {
+          await this.promoteChunk(mine, log);
+        } else {
+          if (stagingTable) await staging.dropStaging(stagingTable);
+          await ledger.transition(mine._id, 'written', 'pending', { staging_table: null, pod_id: null }, fence);
+        }
+        return;
+      }
+      if (chunk.status === 'attaching') {
+        // The one state where blind retry is unsafe (double-attach
+        // duplicates) — finishAttaching pair-accounts every partition.
+        if (!stagingTable) {
+          await ledger.transition(mine._id, 'attaching', 'pending', { staging_table: null, pod_id: null }, fence);
+          return;
+        }
+        await this.finishAttaching(mine, log);
+      }
+    } catch (err) {
+      if (err instanceof ClaimLostError) return; // lost the chunk mid-recovery — not ours anymore
+      throw err;
     }
   }
 
@@ -621,7 +638,7 @@ export class ChunkOrchestrator {
       ledger.heartbeat(chunk._id, this.podId, config.ledger.leaseSec, chunk.attempts)
         .then((owned) => { if (!owned) claimLost = true; })
         .catch(() => {});
-    }, Math.max(10_000, (config.ledger.leaseSec * 1000) / 3));
+    }, Math.min(Math.max(10_000, (config.ledger.leaseSec * 1000) / 3), Math.max(500, (config.ledger.leaseSec * 1000) / 2)));
     const assertClaim = (): void => {
       if (claimLost) throw new ClaimLostError(chunk._id);
     };
@@ -1014,14 +1031,34 @@ export class ChunkOrchestrator {
 
     const remaining = chunk.partitions.filter((p) => !attachedSet.has(p));
     for (const partitionId of remaining) {
-      // Verify-then-attach: never attach a partition whose rows are already
-      // live. Checked by staged row ids — precise for THIS chunk even when
-      // sibling collections share the month partition and cd window (a
-      // window-count here once skipped attaches on multi-collection runs).
-      const already = await staging.countLiveByStagedIds(stagingTable, partitionId);
-      if (already > 0) {
+      // Verify-then-attach with EXACT pair accounting. `live` counts rows of
+      // the live table matching this partition's staged (_id, cd) pairs —
+      // precise for THIS chunk even when sibling collections share the month
+      // partition and cd window:
+      //   live === staged → already fully attached (crash landed between
+      //                     ATTACH and recordAttached) — record, move on
+      //   live === 0      → normal path — attach
+      //   anything else   → double-attach (two recoverers raced pre-reclaim,
+      //                     or a zombie attached concurrently) or a partial
+      //                     promotion — heal: delete the matched pairs, then
+      //                     attach fresh. Every mutating heal re-asserts
+      //                     ownership first, so a fenced-out actor can never
+      //                     issue the DELETE.
+      const staged = await staging.countPartitionRows(stagingTable, partitionId);
+      if (staged === 0) {
         await ledger.recordAttached(chunk._id, partitionId, fence);
         continue;
+      }
+      const live = await staging.countLiveMatchingStaged(stagingTable, partitionId);
+      if (live === staged) {
+        await ledger.recordAttached(chunk._id, partitionId, fence);
+        continue;
+      }
+      if (live !== 0) {
+        const owned = await ledger.transition(chunk._id, 'attaching', 'attaching', {}, fence);
+        if (!owned) throw new ClaimLostError(chunk._id);
+        log.error({ partition: partitionId, staged, live }, 'Pair-count anomaly (double-attach or partial promotion) — healing: delete matched pairs, attach fresh');
+        await staging.deleteLiveMatchingStaged(stagingTable, partitionId);
       }
       try {
         await staging.attachPartition(stagingTable, partitionId);
@@ -1034,6 +1071,16 @@ export class ChunkOrchestrator {
           break;
         }
         throw err; // partial attach + failure → stays 'attaching', recovery resumes
+      }
+      // Post-attach re-count: a concurrent actor attaching between our count
+      // and our ATTACH shows up as live > staged — heal once more.
+      const after = await staging.countLiveMatchingStaged(stagingTable, partitionId);
+      if (after > staged) {
+        const owned = await ledger.transition(chunk._id, 'attaching', 'attaching', {}, fence);
+        if (!owned) throw new ClaimLostError(chunk._id);
+        log.error({ partition: partitionId, staged, after }, 'Concurrent double-attach detected post-attach — healing');
+        await staging.deleteLiveMatchingStaged(stagingTable, partitionId);
+        await staging.attachPartition(stagingTable, partitionId);
       }
       await ledger.recordAttached(chunk._id, partitionId, fence);
     }

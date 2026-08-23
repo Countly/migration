@@ -419,6 +419,30 @@ export class LedgerStore {
   }
 
   /**
+   * Atomically take over a recoverable chunk. Single-winner: the status and
+   * expired-lease filter mean that when several pods spot the same chunk,
+   * exactly one reclaim succeeds — the losers get null and walk away
+   * (without this, two recoverers could both run the attaching path and
+   * double-attach the same staging partition). $inc attempts starts a NEW
+   * claim generation, so every fenced mutation still held by the previous
+   * owner (a zombie that resumes later) is rejected from here on.
+   * ignoreLease is for single-pod mode only, where a fresh process recovers
+   * its own predecessor's chunks without waiting out their leases.
+   */
+  async reclaim(chunkId: string, fromStatus: ChunkStatus, podId: string, leaseSec: number, ignoreLease = false): Promise<ChunkDoc | null> {
+    const filter: Record<string, unknown> = { _id: chunkId, status: fromStatus };
+    if (!ignoreLease) filter.lease_until = { $lt: new Date() };
+    return this.c().findOneAndUpdate(
+      filter as never,
+      {
+        $set: { pod_id: podId, lease_until: new Date(Date.now() + leaseSec * 1000), updated_at: new Date() },
+        $inc: { attempts: 1 },
+      },
+      { returnDocument: 'after' },
+    );
+  }
+
+  /**
    * Chunks needing recovery: leases expired mid-work, or non-terminal states
    * left behind by a crashed pod (when includeAll, e.g. single-pod startup).
    */
