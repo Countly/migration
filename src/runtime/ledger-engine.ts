@@ -308,6 +308,35 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       note: 'Progress state is ~50-100 tiny documents with your MongoDB\u2019s durability. Recovery never trusts it blindly \u2014 chunks are count-verified. Changing a knob requires an engine restart (env vars).',
     },
   }));
+  // One-click adoption of the detected boundary. Env stays king: when the
+  // bound came from LEDGER_CD_UPPER_BOUND, this route refuses and points at
+  // the ConfigMap — two sources of truth with duplication at stake is how
+  // operators get hurt.
+  const envBoundAtBoot = config.ledger.cdUpperBoundMs;
+  app.post<{ Body: { boundMs?: number } }>('/control/apply-bound', async (req, reply) => {
+    const boundMs = Number(req.body?.boundMs);
+    if (!Number.isFinite(boundMs) || boundMs <= 0) {
+      reply.code(400);
+      return { applied: false, reason: 'boundMs (epoch ms) required' };
+    }
+    if (config.ledger.dryRun) return { applied: false, reason: 'dry run — apply on the real run' };
+    if (envBoundAtBoot !== null) {
+      return { applied: false, reason: `bound already pinned via LEDGER_CD_UPPER_BOUND=${envBoundAtBoot} — change it in the deployment config, not here` };
+    }
+    if (boundMs >= Date.now() - 60_000) {
+      return { applied: false, reason: 'bound must be safely in the past (>60s ago)' };
+    }
+    try {
+      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
+      await ledger.setStoredBound(config.ledger.runId, boundMs, 'dashboard');
+      logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), ...pruned }, 'Run bound applied from dashboard — pods adopt it on their next map pass');
+      return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...pruned };
+    } catch (err) {
+      reply.code(409);
+      return { applied: false, reason: (err as Error).message };
+    }
+  });
+
   // Tee-boundary detection + sync parity (background task — the Mongo
   // scan across thousands of collections is minutes of work).
   const { detectBoundary, newBoundaryProgress } = await import('./boundary-detector.ts');

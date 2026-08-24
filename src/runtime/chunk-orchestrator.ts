@@ -254,9 +254,40 @@ export class ChunkOrchestrator {
     // discovered). Frozen source → one extra cheap pass; live source → the
     // run keeps chasing the delta until the source is actually frozen,
     // which makes bulk-before-cutover + final-drain a supported flow.
+    // Bound resolution: env wins when present; otherwise the run-config
+    // stored bound (the dashboard "apply detected boundary" path) is
+    // adopted — re-read at EVERY pass so running pods pick it up live.
+    const envBound = config.ledger.cdUpperBoundMs;
+
     let mapPass = 0;
     for (;;) {
       if (this.stopping) break;
+      const storedBound = await this.d.ledger.getStoredBound(this.runId).catch(() => null);
+      if (storedBound !== null) {
+        if (envBound !== null && envBound !== storedBound) {
+          const msg = `bound conflict: LEDGER_CD_UPPER_BOUND=${envBound} but the run stores ${storedBound} — refusing to guess with duplication at stake`;
+          this.logger.error(msg);
+          this.status = 'failed';
+          this.fatalError = msg;
+          return;
+        }
+        if (config.ledger.cdUpperBoundMs === null) {
+          this.logger.warn({ bound: new Date(storedBound).toISOString() }, 'Adopted stored run bound (applied via dashboard)');
+        }
+        config.ledger.cdUpperBoundMs = storedBound;
+        // Self-healing prune: a pod whose UNBOUNDED map pass raced the
+        // apply click may have appended chunks past the bound after the
+        // apply-time prune ran. Every adopting pod re-prunes, so stragglers
+        // die within one pass cycle. A non-pending chunk past the bound at
+        // this point is a real incident — logged loudly, never swallowed.
+        await this.d.ledger.pruneBeyondBound(this.runId, storedBound).then((r) => {
+          if (r.deleted > 0 || r.clamped > 0) {
+            this.logger.warn({ ...r }, 'Pruned chunks beyond the adopted bound (raced an unbounded map pass)');
+          }
+        }).catch((err) => {
+          this.logger.error({ err: (err as Error).message }, 'Chunks BEYOND the bound have already executed — post-bound data may be duplicated; purge/retry those chunks');
+        });
+      }
       let newChunks = 0;
       if (mapPass > 0) {
         collections = await discoverCollections(db, config.source.collectionPrefix, this.logger).catch(() => collections);

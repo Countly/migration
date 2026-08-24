@@ -805,6 +805,26 @@ async function tick() {
 let dlqOffset = 0;
 function dlqPage(delta) { dlqOffset = Math.max(0, dlqOffset + delta); slowTick(); }
 
+async function applyBound(btn, ms) {
+  if (!armed.get(btn)) {
+    armed.set(btn, true);
+    btn.dataset.label = btn.textContent;
+    btn.textContent = 'Click again to confirm';
+    btn.classList.add('armed');
+    setTimeout(function() { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 4000);
+    return;
+  }
+  armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); btn.disabled = true;
+  try {
+    const res = await fetch('/control/apply-bound', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ boundMs: ms }) });
+    const body = await res.json().catch(function() { return {}; });
+    if (body.applied) toast('\u2705 bound applied: cd < ' + body.iso + ' \u00b7 pruned ' + body.deleted + ' pending chunk(s), clamped ' + body.clamped + ' \u2014 pods adopt on their next map pass');
+    else toast('\u274c not applied: ' + (body.reason || res.status));
+  } catch (e) { toast('\u274c apply failed: ' + e.message); }
+  btn.disabled = false;
+  tick();
+}
+
 async function detectBoundary(btn) {
   btn.disabled = true;
   try { await fetch('/control/detect-boundary', { method: 'POST', headers: {'content-type': 'application/json'}, body: '{}' }); } catch (e) {}
@@ -829,7 +849,8 @@ async function pollBoundary(btn) {
         (d.method === 'gap'
           ? '<span style="color:var(--green);font-weight:600">clean ingestion-pause gap found (' + new Date(d.gap.fromMs).toISOString().slice(11,16) + '\u2013' + new Date(d.gap.toMs).toISOString().slice(11,16) + ' UTC): the seam is exact \u2014 zero duplicates, zero loss</span>'
           : '<span style="color:#A05A16;font-weight:600">no pause gap \u2014 anchored at the first ClickHouse row; ' + fmt(d.ambiguousMongoDocs) + ' old-side docs sit within \u00b12 min of it (potential dup/loss stake; prefer re-flipping inside a pause)</span>') +
-        '<br><code>LEDGER_CD_UPPER_BOUND=' + d.suggestedBoundMs + '</code></p>';
+        '<br><code>LEDGER_CD_UPPER_BOUND=' + d.suggestedBoundMs + '</code> ' +
+        '<button class="btn" onclick="applyBound(this,' + d.suggestedBoundMs + ')">Apply this bound to the run</button></p>';
       const around = d.minutes.filter(function(m) { return Math.abs(m.minuteMs - d.suggestedBoundMs) <= 6 * 60000; });
       html += '<table><tr><th>Minute (UTC)</th><th>MongoDB docs</th><th>ClickHouse rows</th></tr>' +
         around.map(function(m) {

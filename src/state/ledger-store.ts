@@ -419,6 +419,55 @@ export class LedgerStore {
   }
 
   /**
+   * Run-level stored bound (mig_run_config): the "apply the detected
+   * boundary from the dashboard" path. Env (LEDGER_CD_UPPER_BOUND) always
+   * wins as the source of truth when present; this store only fills in
+   * when env is unset, and pods re-read it at every map pass.
+   */
+  private rc(): Collection<{ _id: string; cd_upper_bound_ms: number; set_at: Date; set_by: string }> {
+    if (!this.coll) throw new Error('LedgerStore not connected');
+    return this.client.db(this.dbName).collection('mig_run_config');
+  }
+
+  async getStoredBound(runId: string): Promise<number | null> {
+    const doc = await this.rc().findOne({ _id: runId });
+    return doc?.cd_upper_bound_ms ?? null;
+  }
+
+  async setStoredBound(runId: string, boundMs: number, setBy: string): Promise<void> {
+    await this.rc().updateOne(
+      { _id: runId },
+      { $set: { cd_upper_bound_ms: boundMs, set_at: new Date(), set_by: setBy } },
+      { upsert: true },
+    );
+  }
+
+  /**
+   * Applying a bound to an ALREADY-MAPPED run: the grid was cut without it,
+   * so pending chunks past the bound must go. Regular pending chunks fully
+   * beyond are deleted; a pending straddler is clamped to end AT the bound.
+   * Refuses when any non-pending chunk reaches past the bound — that data
+   * (possibly) already moved and needs purge tooling, not a config flip.
+   */
+  async pruneBeyondBound(runId: string, boundMs: number): Promise<{ deleted: number; clamped: number }> {
+    const busy = await this.c().countDocuments({
+      run_id: runId, lower_cd: { $gte: 0 }, upper_cd: { $gt: boundMs },
+      status: { $nin: ['pending'] },
+    });
+    if (busy > 0) {
+      throw new Error(`${busy} non-pending chunk(s) already reach past the bound — their windows may hold migrated post-bound data; purge/retry them first`);
+    }
+    const del = await this.c().deleteMany({
+      run_id: runId, lower_cd: { $gte: boundMs }, status: 'pending',
+    });
+    const clamp = await this.c().updateMany(
+      { run_id: runId, lower_cd: { $gte: 0, $lt: boundMs }, upper_cd: { $gt: boundMs }, status: 'pending' },
+      { $set: { upper_cd: boundMs, updated_at: new Date() } },
+    );
+    return { deleted: del.deletedCount ?? 0, clamped: clamp.modifiedCount ?? 0 };
+  }
+
+  /**
    * Atomically take over a recoverable chunk. Single-winner: the status and
    * expired-lease filter mean that when several pods spot the same chunk,
    * exactly one reclaim succeeds — the losers get null and walk away

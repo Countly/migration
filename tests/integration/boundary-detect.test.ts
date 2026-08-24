@@ -192,6 +192,86 @@ describe('tee-boundary detection + sync parity', () => {
     await mc.db(DB).collection(COLL).deleteMany({ _id: { $regex: '^fill_' } } as never);
   }, 60_000);
 
+  it('apply-bound: prunes pending chunks past the bound, refuses when executed chunks are there', async () => {
+    const AR = 'apply-run';
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: AR } as never);
+    // grid mapped WITHOUT a bound: 4 windows; the bound lands inside #2
+    await ledger.initChunks(AR, COLL, [
+      { lowerCd: 0, upperCd: 100 }, { lowerCd: 100, upperCd: 200 },
+      { lowerCd: 200, upperCd: 300 }, { lowerCd: 300, upperCd: 400 },
+    ], 'v2', null);
+    const B = 150;
+    const pruned = await ledger.pruneBeyondBound(AR, B);
+    expect(pruned).toEqual({ deleted: 2, clamped: 1 }); // #2,#3 gone; #1 clamped
+    const left = await mc.db(DB).collection('mig_ranges')
+      .find({ run_id: AR } as never).sort({ idx: 1 }).toArray();
+    expect(left.map((c) => [c.lower_cd, c.upper_cd])).toEqual([[0, 100], [100, 150]]);
+
+    // an EXECUTED chunk past the bound → hard refusal (data may have moved)
+    await mc.db(DB).collection('mig_ranges').updateOne(
+      { _id: `${AR}:${COLL}:1` } as never, { $set: { status: 'done', upper_cd: 200 } } as never);
+    await expect(ledger.pruneBeyondBound(AR, B)).rejects.toThrow(/non-pending/);
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: AR } as never);
+  }, 30_000);
+
+  it('stored bound: a fresh pod adopts it and migrates only below; env conflict is fatal', async () => {
+    const SR = 'stored-run';
+    const B = FLIP - MIN; // inside the pause gap
+    await ledger.setStoredBound(SR, B, 'test');
+
+    // pod with NO env bound: adopts the stored one
+    Object.assign(process.env, {
+      LEDGER_RUN_ID: SR, LEDGER_CHUNK_DOCS_TARGET: '200', MONGO_PAGE_SIZE: '200',
+      MULTI_POD_ENABLED: 'false', POD_ID: 'stored-pod',
+    });
+    delete process.env.LEDGER_CD_UPPER_BOUND;
+    const config2 = loadConfig();
+    const { MongoReader } = await import('../../src/source/mongo-reader.ts');
+    const { DlqStore } = await import('../../src/state/dlq-store.ts');
+    const { RetryPolicy } = await import('../../src/runtime/retry-policy.ts');
+    const { HashResolver } = await import('../../src/transform/hash-resolver.ts');
+    const { ChunkOrchestrator } = await import('../../src/runtime/chunk-orchestrator.ts');
+    const mongoReader = new MongoReader({
+      uri: MONGO_URI, database: DB, readPreference: 'primary', readConcern: 'local',
+      retryReads: true, appName: 'stored-pod', cursorBatchSize: 500, maxTimeMs: 60_000,
+    }, logger);
+    const dlq2 = new DlqStore(MONGO_URI, DB, logger);
+    const resolver2 = new HashResolver({ uri: MONGO_URI, countlyDb: `${DB}_countly` }, logger);
+    await mongoReader.connect(); await dlq2.connect(); await resolver2.build();
+    closers.push(() => mongoReader.close(), () => dlq2.close(), () => resolver2.close());
+    const orch = new ChunkOrchestrator({
+      config: config2, logger, mongoReader, ledger, dlq: dlq2, staging,
+      retryPolicy: new RetryPolicy({ maxRetries: 2, baseDelayMs: 50, maxDelayMs: 200 }), hashResolver: resolver2,
+    });
+    await orch.run();
+    expect(orch.getStats().status).toBe('completed');
+    expect((orch.getStats() as { cdUpperBoundMs: number | null }).cdUpperBoundMs).toBe(B); // adopted
+
+    // only pre-gap docs migrated; teed-era old-side docs untouched
+    const res = await ch.query({
+      query: `SELECT countIf(_id LIKE 'pre\_%') AS pre, countIf(_id LIKE 'old\_%') AS old FROM ${DB}.drill_events`,
+      format: 'JSONEachRow',
+    });
+    const [r] = await res.json<{ pre: string; old: string }>();
+    expect(Number(r.pre)).toBe(90); // 18 pre-tee minutes x 5 docs
+    expect(Number(r.old)).toBe(0);  // nothing at/after the bound
+    const chunks = await mc.db(DB).collection('mig_ranges').find({ run_id: SR, lower_cd: { $gte: 0 } } as never).toArray();
+    for (const c of chunks) expect(c.upper_cd).toBeLessThanOrEqual(B);
+
+    // a pod started with a CONFLICTING env bound must fail loudly, not guess
+    process.env.LEDGER_CD_UPPER_BOUND = String(B + 60_000);
+    const config3 = loadConfig();
+    const orch2 = new ChunkOrchestrator({
+      config: config3, logger, mongoReader, ledger, dlq: dlq2, staging,
+      retryPolicy: new RetryPolicy({ maxRetries: 2, baseDelayMs: 50, maxDelayMs: 200 }), hashResolver: resolver2,
+    });
+    await orch2.run();
+    const st = orch2.getStats();
+    expect(st.status).toBe('failed');
+    expect(String(st.fatalError)).toContain('bound conflict');
+    delete process.env.LEDGER_CD_UPPER_BOUND;
+  }, 120_000);
+
   it('refuses detection once the run has mapped chunks — sync parity still reports', async () => {
     await ledger.initChunks(RUN, COLL, [{ lowerCd: 0, upperCd: 1000 }], 'v2', null);
     const report = (await run())!;
