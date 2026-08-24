@@ -344,6 +344,30 @@ export class StagingManager {
 
 
   /** Rows live ingestion wrote recently (preflight: is new ingestion flowing?). */
+  /** Earliest live cd — the tee-boundary anchor (null when the table is empty). */
+  async minLiveCd(): Promise<number | null> {
+    const res = await this.ch().query({
+      query: `SELECT toUnixTimestamp64Milli(min(cd)) AS m, count() AS c FROM ${this.fq(this.config.table)}`,
+      format: 'JSONEachRow',
+    });
+    const [row] = await res.json<{ m: string; c: string }>();
+    return Number(row?.c ?? 0) > 0 ? Number(row.m) : null;
+  }
+
+  /** Live-row counts bucketed by cd — the boundary/sync rate curves. */
+  async liveCountsPerBucket(fromMs: number, toMs: number, bucketSec: number): Promise<Map<number, number>> {
+    const res = await this.ch().query({
+      query: `SELECT intDiv(toUnixTimestamp64Milli(cd), {b:UInt32} * 1000) * {b:UInt32} * 1000 AS bucket, count() AS c
+              FROM ${this.fq(this.config.table)}
+              WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
+              GROUP BY bucket ORDER BY bucket`,
+      query_params: { b: bucketSec, lo: fromMs, hi: toMs },
+      format: 'JSONEachRow',
+    });
+    const rows = await res.json<{ bucket: string; c: string }>();
+    return new Map(rows.map((r) => [Number(r.bucket), Number(r.c)]));
+  }
+
   async countRecentLive(minutes: number): Promise<number> {
     const res = await this.ch().query({
       query: `SELECT count() AS c FROM ${this.fq(this.config.table)}

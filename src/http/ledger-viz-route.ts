@@ -290,6 +290,12 @@ const PAGE = `<!doctype html>
     <div id="failed"><div class="empty">None 🎉</div></div>
   </div>
 
+  <div class="card">
+    <h2>Tee boundary &amp; sync <span class="hint">(mirror-by-nginx cutovers: detect the cut-off from data, watch both stacks stay in step)</span></h2>
+    <div style="margin-bottom:8px"><button class="btn" id="btn-boundary" onclick="detectBoundary(this)">Detect boundary + check sync</button></div>
+    <div id="boundary-out"><div class="empty">Not run. Requires the tee to be active; boundary suggestion only valid before migration starts (sync parity works any time).</div></div>
+  </div>
+
     <div id="mirror-detail" style="font-size:12.5px;color:var(--ink-2)"></div>
   </div>
 
@@ -797,6 +803,55 @@ async function tick() {
 
 let dlqOffset = 0;
 function dlqPage(delta) { dlqOffset = Math.max(0, dlqOffset + delta); slowTick(); }
+
+async function detectBoundary(btn) {
+  btn.disabled = true;
+  try { await fetch('/control/detect-boundary', { method: 'POST', headers: {'content-type': 'application/json'}, body: '{}' }); } catch (e) {}
+  pollBoundary(btn);
+}
+async function pollBoundary(btn) {
+  try {
+    const st = await fetch('/api/boundary').then(r => r.json());
+    const out = document.getElementById('boundary-out');
+    if (st.status === 'running') {
+      out.innerHTML = '<div class="empty">\u23f3 ' + esc(st.phase || 'starting') + ' \u2014 ' + st.collectionsScanned + '/' + st.totalCollections + ' collections</div>';
+      setTimeout(function() { pollBoundary(btn); }, 1500);
+      return;
+    }
+    btn.disabled = false;
+    if (st.status === 'failed') { out.innerHTML = '<div class="empty">failed: ' + esc(st.error || '') + '</div>'; return; }
+    if (!st.report) { out.innerHTML = '<div class="empty">Not run.</div>'; return; }
+    const d = st.report.detection, sy = st.report.sync;
+    let html = '';
+    if (d.status === 'ok') {
+      html += '<p><b>Suggested bound: ' + new Date(d.suggestedBoundMs).toISOString() + '</b> \u2014 ' +
+        (d.method === 'gap'
+          ? '<span style="color:var(--green);font-weight:600">clean ingestion-pause gap found (' + new Date(d.gap.fromMs).toISOString().slice(11,16) + '\u2013' + new Date(d.gap.toMs).toISOString().slice(11,16) + ' UTC): the seam is exact \u2014 zero duplicates, zero loss</span>'
+          : '<span style="color:#A05A16;font-weight:600">no pause gap \u2014 anchored at the first ClickHouse row; ' + fmt(d.ambiguousMongoDocs) + ' old-side docs sit within \u00b12 min of it (potential dup/loss stake; prefer re-flipping inside a pause)</span>') +
+        '<br><code>LEDGER_CD_UPPER_BOUND=' + d.suggestedBoundMs + '</code></p>';
+      const around = d.minutes.filter(function(m) { return Math.abs(m.minuteMs - d.suggestedBoundMs) <= 6 * 60000; });
+      html += '<table><tr><th>Minute (UTC)</th><th>MongoDB docs</th><th>ClickHouse rows</th></tr>' +
+        around.map(function(m) {
+          const mark = d.gap && m.minuteMs >= d.gap.fromMs && m.minuteMs < d.gap.toMs;
+          return '<tr' + (mark ? ' style="background:var(--green-soft)"' : '') + '><td>' + new Date(m.minuteMs).toISOString().slice(11, 16) + '</td><td>' + fmt(m.mongo) + '</td><td>' + fmt(m.ch) + '</td></tr>';
+        }).join('') + '</table>';
+    } else {
+      html += '<p style="color:#A05A16">' + esc(d.reason || 'no data') + '</p>';
+    }
+    if (sy.status === 'ok') {
+      html += '<p style="margin-top:10px"><b>Tee sync parity</b> since ' + new Date(sy.fromMs).toISOString().slice(0, 16).replace('T', ' ') + ' UTC: ' +
+        (sy.flaggedHours === 0
+          ? '<span style="color:var(--green);font-weight:600">all ' + sy.hours.length + ' hour(s) in step \u2713</span>'
+          : '<span style="color:#A05A16;font-weight:600">' + sy.flaggedHours + ' hour(s) diverge \u2014 nginx mirror drops silently when the secondary is down; each flagged hour is a bounded backfill window</span>') + '</p>';
+      const bad = sy.hours.filter(function(h) { return h.flagged; }).slice(0, 12);
+      if (bad.length) {
+        html += '<table><tr><th>Hour (UTC)</th><th>MongoDB</th><th>ClickHouse</th><th>drift</th></tr>' +
+          bad.map(function(h) { return '<tr><td>' + new Date(h.hourMs).toISOString().slice(0, 13) + ':00</td><td>' + fmt(h.mongo) + '</td><td>' + fmt(h.ch) + '</td><td>' + h.driftPct + '%</td></tr>'; }).join('') + '</table>';
+      }
+    }
+    out.innerHTML = html;
+  } catch (e) { btn.disabled = false; }
+}
 // strings render QUOTED: stringify-coercions turn a number into the same
 // digits as a string, and unquoted they looked like a no-op in the UI
 function fmtVal(v) { return typeof v === 'string' ? '"' + esc(v) + '"' : esc(String(v)); }

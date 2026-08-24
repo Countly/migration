@@ -308,6 +308,23 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       note: 'Progress state is ~50-100 tiny documents with your MongoDB\u2019s durability. Recovery never trusts it blindly \u2014 chunks are count-verified. Changing a knob requires an engine restart (env vars).',
     },
   }));
+  // Tee-boundary detection + sync parity (background task — the Mongo
+  // scan across thousands of collections is minutes of work).
+  const { detectBoundary, newBoundaryProgress } = await import('./boundary-detector.ts');
+  const boundaryState = newBoundaryProgress();
+  app.post<{ Body: { bandMinutes?: number } }>('/control/detect-boundary', async (req) => {
+    if (boundaryState.status === 'running') return { started: false, reason: 'detection already running' };
+    Object.assign(boundaryState, newBoundaryProgress(), { status: 'running', startedAt: Date.now() });
+    void detectBoundary({
+      config, logger, db: mongoReader.getDatabase(), staging, ledger,
+      progress: boundaryState, bandMinutes: req.body?.bandMinutes,
+    })
+      .then((report) => { boundaryState.report = report; boundaryState.status = 'completed'; boundaryState.finishedAt = Date.now(); })
+      .catch((e) => { boundaryState.status = 'failed'; boundaryState.error = (e as Error).message; boundaryState.finishedAt = Date.now(); });
+    return { started: true };
+  });
+  app.get('/api/boundary', async () => boundaryState);
+
   app.get('/api/pods', async () => ({
     pods: await ledger.podActivity(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId),
     leaseSec: config.ledger.leaseSec,
