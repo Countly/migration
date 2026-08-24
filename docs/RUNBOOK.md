@@ -83,3 +83,40 @@ incident.
 `bench/README.md`: seed → straight run (counts must be exact) → SIGKILL crash
 drill → optionally `bench/seed-failures.ts` for a full failure-scenario drill
 (breaker, DLQ, monitor, retry-failed).
+
+## Mirror-first playbook (customer keeps the old architecture until sign-off)
+
+For customers who require approval before switching: the old arch stays
+authoritative, the new arch receives a LIVE copy, and history is backfilled
+up to the moment mirroring began.
+
+1. Deploy the new arch cluster. Point NO traffic at it.
+2. Start one mirror pod: same image, `MIRROR_MODE=true`, same MONGO/CLICKHOUSE
+   env as a migration pod. It tails the old cluster's change stream
+   (read-only), replicates every new drill_events insert with the same
+   transform as the bulk migration (cd preserved), and records its
+   **checkpoint** — shown on the dashboard's Mirror card.
+3. Run the bulk migration pods with `LEDGER_CD_UPPER_BOUND=<checkpoint>`
+   (the Mirror card prints the exact value and warns if a pod's bound does
+   not match). The mapper never crosses the bound; top-up is disabled; the
+   boundary overlap converges through pair-checked attach — same (_id, cd)
+   never lands twice.
+4. Verify + audits as usual: because the mirror preserves cd, they cover the
+   WHOLE timeline (migrated + mirrored) as one consistent set.
+5. Customer validates side-by-side for as long as needed; the mirror keeps
+   ClickHouse current ("caught up" on the card).
+6. On approval: switch SDK/API traffic to the new arch, let the mirror drain
+   to caught-up + idle, stop the mirror pod.
+
+Caveats the runbook owner must carry:
+- The mirror replicates INSERTS. In-place mutations on old-arch drill data
+  during the mirror window (app-user merges rewriting uid, GDPR erasures,
+  TTL deletions) are NOT propagated — the card counts them as
+  "non-insert ops". Before sign-off, run the reconciliation pass: re-apply
+  pending GDPR erasures through the new arch's compliance flow and re-run
+  the source audit (retention deletions show as drift, not defects).
+- If the mirror ever reports a resume-token loss (oplog rolled while the
+  mirror was down too long), there is a GAP: restart the mirror fresh, then
+  run an additional bounded migration for the gap window before trusting
+  the timeline again. Size the oplog for the longest tolerated mirror
+  downtime.

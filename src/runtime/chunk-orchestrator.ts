@@ -70,6 +70,7 @@ export interface LedgerEngineStats {
   chunksFailed: number;
   pauseReason: string | null;
   sourceShrankChunks: number;
+  cdUpperBoundMs: number | null;
   docsPerSecond: number;
   stageMs: { read: number; transform: number; insert: number; verify: number; attach: number; pressureWait: number };
   dedupWorks: boolean | null;
@@ -381,8 +382,18 @@ export class ChunkOrchestrator {
     const defaults = this.d.hashResolver.resolveCollectionName(collection, config.source.collectionPrefix) ?? undefined;
     this.collectionDefaults.set(collection, defaults);
 
+    const bound = config.ledger.cdUpperBoundMs;
     const lower = await mongoReader.getLowerBound();
-    const upper = await mongoReader.getUpperBound();
+    let upper = await mongoReader.getUpperBound();
+    if (bound !== null && lower && lower.cd >= bound) {
+      // Collection born after the mirror checkpoint: every doc is the
+      // mirror's responsibility. Nothing to map here.
+      log.info({ bound: new Date(bound).toISOString() }, 'Collection entirely beyond the cd bound — mirror territory, skipping');
+      return 0;
+    }
+    if (bound !== null && upper && upper.cd >= bound) {
+      upper = { ...upper, cd: bound - 1 };
+    }
     if (!lower || !upper) {
       log.info('Collection empty (no cd-bearing docs), skipping');
       if (!this.dryRun && (await mongoReader.hasNullCdDocuments())) {
@@ -391,7 +402,12 @@ export class ChunkOrchestrator {
       return 0;
     }
 
-    const estimated = await mongoReader.getEstimatedCount();
+    // A clamped span makes the whole-collection estimate wrong for chunk
+    // sizing — one indexed count below the bound is cheap and exact.
+    const estimated = bound !== null && upper.cd === bound - 1
+      ? await this.d.mongoReader.getDatabase().collection(collection)
+          .countDocuments({ cd: { $lt: new Date(bound) } })
+      : await mongoReader.getEstimatedCount();
     let bounds = computeChunkBounds(lower.cd, upper.cd, estimated, config.ledger.chunkDocsTarget, config.ledger.maxChunkDays);
 
     // Dry run: keep every k-th chunk so old and new data shapes are both covered.
@@ -421,6 +437,11 @@ export class ChunkOrchestrator {
     // Append delta chunks for [mapped upper, current max cd]; idx continues,
     // so the delta (newest data) is claimed first within the collection.
     if (this.dryRun) return 0;
+    if (bound !== null) {
+      // Mirror-first: data past the checkpoint belongs to the mirror —
+      // top-up must never chase it (that is the whole point of the bound).
+      return 0;
+    }
     const hw = await ledger.regularHighWater(this.runId, collection);
     if (!hw || hw.maxUpperCd <= 0) return 0;
     if (upper.cd + 1 <= hw.maxUpperCd) return 0; // nothing new
@@ -1783,27 +1804,51 @@ export class ChunkOrchestrator {
         if (top?.cd instanceof Date) maxSourceCd = Math.max(maxSourceCd, top.cd.getTime());
       }
       const chNow = await this.d.staging.serverNowMs().catch(() => 0);
-      const skewOk = maxSourceCd === 0 || chNow === 0 || maxSourceCd < chNow - 60_000;
-      checks.push({
-        id: 'clock',
-        label: 'Source frozen & clocks sane (cd boundary)',
-        status: skewOk ? 'pass' : 'fail',
-        detail: skewOk
-          ? `newest source cd ${maxSourceCd ? new Date(maxSourceCd).toISOString() : 'n/a'} is safely behind ClickHouse server time`
-          : `newest source cd ${new Date(maxSourceCd).toISOString()} is within 60s of ClickHouse server time (${new Date(chNow).toISOString()}) — source still ingesting or clocks skewed; the migrated/live cd boundary is NOT trustworthy yet`,
-      });
+      const boundMs = config.ledger.cdUpperBoundMs;
+      if (boundMs !== null) {
+        // Mirror-first: the source is EXPECTED to keep growing — the trust
+        // boundary is the checkpoint bound, which must be safely in the past.
+        const boundOk = chNow === 0 || boundMs < chNow - 60_000;
+        checks.push({
+          id: 'clock',
+          label: 'Mirror checkpoint bound sane',
+          status: boundOk ? 'pass' : 'fail',
+          detail: boundOk
+            ? `migrating cd < ${new Date(boundMs).toISOString()} only — everything at/after is the mirror's (source keeps growing, as expected in mirror-first mode)`
+            : `LEDGER_CD_UPPER_BOUND ${new Date(boundMs).toISOString()} is not safely in the past vs ClickHouse time ${new Date(chNow).toISOString()} — set it to the mirror's recorded checkpoint`,
+        });
+      } else {
+        const skewOk = maxSourceCd === 0 || chNow === 0 || maxSourceCd < chNow - 60_000;
+        checks.push({
+          id: 'clock',
+          label: 'Source frozen & clocks sane (cd boundary)',
+          status: skewOk ? 'pass' : 'fail',
+          detail: skewOk
+            ? `newest source cd ${maxSourceCd ? new Date(maxSourceCd).toISOString() : 'n/a'} is safely behind ClickHouse server time`
+            : `newest source cd ${new Date(maxSourceCd).toISOString()} is within 60s of ClickHouse server time (${new Date(chNow).toISOString()}) — source still ingesting or clocks skewed; the migrated/live cd boundary is NOT trustworthy yet`,
+        });
+      }
       // Old ingestion stopped? Probe twice: if any collection's newest cd or
       // estimated count advances between probes, the source is still being
       // written — cutover step 'stop old ingestion' has not happened.
-      const frozen = await this.probeSourceFrozen(db, collections, 4_000);
-      checks.push({
-        id: 'frozen',
-        label: 'Old ingestion stopped (source frozen)',
-        status: frozen.frozen ? 'pass' : 'fail',
-        detail: frozen.frozen
-          ? `no writes observed during a ${Math.round(frozen.probeMs / 1000)}s probe`
-          : `STILL RECEIVING WRITES: ${frozen.grew.join(', ')} — stop old ingestion before migrating (works the same for new-cluster and same-cluster setups)`,
-      });
+      if (config.ledger.cdUpperBoundMs !== null) {
+        checks.push({
+          id: 'frozen',
+          label: 'Old ingestion running (mirror-first mode)',
+          status: 'pass',
+          detail: 'source keeps receiving writes by design — the mirror carries everything at/after the checkpoint; this migration only touches cd below it',
+        });
+      } else {
+        const frozen = await this.probeSourceFrozen(db, collections, 4_000);
+        checks.push({
+          id: 'frozen',
+          label: 'Old ingestion stopped (source frozen)',
+          status: frozen.frozen ? 'pass' : 'fail',
+          detail: frozen.frozen
+            ? `no writes observed during a ${Math.round(frozen.probeMs / 1000)}s probe`
+            : `STILL RECEIVING WRITES: ${frozen.grew.join(', ')} — stop old ingestion before migrating (works the same for new-cluster and same-cluster setups)`,
+        });
+      }
 
       // New ingestion flowing? Post-cutover rows carry recent cd. Zero recent
       // rows is a warning, not a failure — traffic may legitimately be zero,
@@ -2024,6 +2069,7 @@ export class ChunkOrchestrator {
       chunksFailed: this.chunksFailed,
       pauseReason: this.pauseReason,
       sourceShrankChunks: this.sourceShrankChunks,
+      cdUpperBoundMs: this.d.config.ledger.cdUpperBoundMs,
       docsPerSecond: elapsedSec > 0 ? this.totalDocsRead / elapsedSec : 0,
       stageMs: {
         read: Math.round(this.stageMs.read),

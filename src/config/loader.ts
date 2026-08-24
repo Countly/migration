@@ -23,6 +23,7 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             breakerConsecutive: env.LEDGER_BREAKER_CONSECUTIVE,
             monitorIntervalMs: env.LEDGER_MONITOR_INTERVAL_MS,
             maxChunkDays: env.LEDGER_MAX_CHUNK_DAYS,
+            cdUpperBoundMs: env.LEDGER_CD_UPPER_BOUND,
             captureTransformErrors: env.LEDGER_CAPTURE_TRANSFORM_ERRORS,
             dryRun: env.DRY_RUN,
             dryRunSamplePct: env.DRY_RUN_SAMPLE_PCT,
@@ -80,6 +81,12 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
 
         state: {
             manifestDb: env.MANIFEST_DB,
+        },
+
+        mirror: {
+            enabled: env.MIRROR_MODE,
+            batchDocs: env.MIRROR_BATCH_DOCS,
+            batchMs: env.MIRROR_BATCH_MS,
         },
 
         worker: {

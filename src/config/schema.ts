@@ -62,6 +62,20 @@ export const configSchema = z.object({
             // an unclean mongod shutdown) — a wrong estimate can never produce
             // a whole-collection mega-chunk.
             maxChunkDays: numberFromEnv.default(7).pipe(z.number().positive()),
+            // Mirror-first mode: migrate ONLY cd < this bound (the mirror's
+            // checkpoint T0); the mapper clamps to it and top-up never
+            // crosses it — everything at/after belongs to the live mirror.
+            cdUpperBoundMs: z
+                .union([z.string(), z.number(), z.null(), z.undefined()])
+                .transform((v, ctx) => {
+                    if (v === null || v === undefined || v === "") return null;
+                    const ms = typeof v === "number" ? v : /^\d+$/.test(v) ? Number(v) : Date.parse(v);
+                    if (!Number.isFinite(ms) || ms <= 0) {
+                        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `LEDGER_CD_UPPER_BOUND must be ISO date or epoch ms, got: ${String(v)}` });
+                        return z.NEVER;
+                    }
+                    return ms;
+                }),
             // Dry run: sampled rehearsal against a Null-engine clone.
             dryRun: booleanFromEnv.default(false),
             dryRunSamplePct: numberFromEnv.default(2).pipe(z.number().min(0.1).max(5)),
@@ -127,6 +141,13 @@ export const configSchema = z.object({
     // ── State (chunk ledger + DLQ live here) ─────────────────────────────
     state: z.object({
         manifestDb: z.string().default("countly_drill"),
+    }),
+
+    // ── Mirror mode (mirror-first playbook) ─────────────────────────────
+    mirror: z.object({
+        enabled: booleanFromEnv.default(false),
+        batchDocs: positiveIntFromEnv.default(500),
+        batchMs: positiveIntFromEnv.default(1_000),
     }),
 
     // ── Worker / Multi-Pod ──────────────────────────────────────────────

@@ -232,6 +232,7 @@ const PAGE = `<!doctype html>
   <div class="badges">
     <span class="badge grey" id="b-engine">ledger engine · no redis</span>
     <span class="badge" id="b-dedup" style="display:none">dedup verified</span>
+    <span class="badge grey" id="b-bound" style="display:none"></span>
     <span class="badge grey" id="b-status">starting…</span>
   </div>
   <div id="fatal-banner" style="display:none;margin:10px 0 0;padding:12px 16px;border:1px solid #E57373;border-radius:8px;background:#FDECEA;color:#B71C1C;font-size:13px;line-height:1.5">
@@ -287,6 +288,12 @@ const PAGE = `<!doctype html>
   <div class="card">
     <h2>Failed chunks</h2>
     <div id="failed"><div class="empty">None 🎉</div></div>
+  </div>
+
+  <div class="card" id="mirror-card" style="display:none">
+    <h2>Mirror <span class="hint">(mirror-first mode — live writes tailed from the old cluster's change stream)</span></h2>
+    <div id="mirror-status" style="margin-bottom:6px"></div>
+    <div id="mirror-detail" style="font-size:12.5px;color:var(--ink-2)"></div>
   </div>
 
   <div class="card">
@@ -729,6 +736,13 @@ async function tick() {
     } else { fb.style.display = 'none'; }
     st.className = 'badge ' + (stats.status === 'completed' ? '' : stats.status === 'running' ? 'grey' : 'warn');
 
+    var bb = document.getElementById('b-bound');
+    if (stats.cdUpperBoundMs) {
+      bb.style.display = '';
+      bb.textContent = 'bounded \u00b7 cd < ' + new Date(stats.cdUpperBoundMs).toISOString().slice(0, 16).replace('T', ' ');
+      bb.className = 'badge grey';
+    } else { bb.style.display = 'none'; }
+
     if (stats.dedupWorks !== null) {
       const b = document.getElementById('b-dedup');
       b.style.display = '';
@@ -854,6 +868,32 @@ async function slowTick() {
           (c.sample ? fmtVal(c.sample.original) + ' \\u2192 ' + fmtVal(c.sample.coerced) : '') + '</td></tr>').join('') + '</table>';
 
     document.getElementById('ph3-s').textContent = report.dryRun ? 'this is a dry run' : 'run with DRY_RUN=1';
+
+    const mir = await fetch('/api/mirror').then(r => r.json()).catch(() => null);
+    const mcard = document.getElementById('mirror-card');
+    if (mir && mir.present) {
+      mcard.style.display = '';
+      const fresh = mir.staleMs !== null && mir.staleMs < 90000;
+      const atHead = (mir.live && mir.live.atHead) || mir.atHead;
+      const lag = atHead ? 0
+                : mir.live && mir.live.lagMs !== null ? mir.live.lagMs
+                : mir.lastEventMs ? Date.now() - mir.lastEventMs : null;
+      const boundMatch = !mir.cdUpperBoundMs || Math.abs(mir.cdUpperBoundMs - mir.checkpointMs) < 1000;
+      document.getElementById('mirror-status').innerHTML =
+        '<span class="pill ' + (fresh ? 'resolved' : 'pending') + '">' + (fresh ? 'live' : 'stale \u2014 mirror pod not reporting') + '</span> ' +
+        '<span class="pill" style="background:var(--bg)">mirrored: ' + fmt(mir.docsMirrored) + '</span> ' +
+        (atHead ? '<span class="pill resolved">caught up</span> '
+                : lag !== null ? '<span class="pill" style="background:var(--bg)">lag: ' + (lag < 2000 ? '<2s' : Math.round(lag / 1000) + 's') + '</span> ' : '') +
+        (mir.docsDlq ? '<span class="pill pending">dlq: ' + fmt(mir.docsDlq) + '</span> ' : '') +
+        (mir.nonInsertOps ? '<span class="pill pending">non-insert ops: ' + fmt(mir.nonInsertOps) + ' (not mirrored \u2014 see runbook reconciliation)</span>' : '');
+      document.getElementById('mirror-detail').innerHTML =
+        'checkpoint: <b>' + new Date(mir.checkpointMs).toISOString() + '</b> \u2014 the bulk migration must run with ' +
+        '<code>LEDGER_CD_UPPER_BOUND=' + mir.checkpointMs + '</code>' +
+        (mir.cdUpperBoundMs
+          ? (boundMatch ? ' <span style="color:var(--green);font-weight:600">\u2713 this pod\\'s bound matches</span>'
+                        : ' <span style="color:#A05A16;font-weight:600">\u26a0 this pod\\'s bound (' + new Date(mir.cdUpperBoundMs).toISOString() + ') does NOT match the checkpoint</span>')
+          : ' <span style="color:#A05A16">\u26a0 this pod has no LEDGER_CD_UPPER_BOUND set</span>');
+    } else { mcard.style.display = 'none'; }
 
     const [pods, dry] = await Promise.all([
       fetch('/api/pods').then(r => r.json()).catch(() => null),
