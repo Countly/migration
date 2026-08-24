@@ -155,6 +155,7 @@ export class ChunkOrchestrator {
   private chunksFailed = 0;
   private stageMs = { read: 0, transform: 0, insert: 0, verify: 0, attach: 0, pressureWait: 0 };
   private lastStatusCounts: Record<string, number> = {};
+  private lastStatusRefreshMs = 0;
 
   private lastPressure: { state: PressureState; at: number } | null = null;
 
@@ -532,7 +533,13 @@ export class ChunkOrchestrator {
         this.currentCollection = chunk.collection;
       }
       await this.processChunk(chunk, this.collectionDefaults.get(chunk.collection), log);
-      this.lastStatusCounts = await this.d.ledger.statusCounts(this.runId);
+      // the status aggregation costs O(total chunks) — refreshing it after
+      // EVERY chunk turned the 73k-chunk tail quadratic; 2s staleness in
+      // the UI is free
+      if (Date.now() - this.lastStatusRefreshMs > 2_000) {
+        this.lastStatusRefreshMs = Date.now();
+        this.lastStatusCounts = await this.d.ledger.statusCounts(this.runId);
+      }
     }
   }
 
@@ -1108,6 +1115,7 @@ export class ChunkOrchestrator {
     const attachedSet = new Set(chunk.attached);
     let method: 'attach' | 'insert_select' = chunk.attach_method ?? 'attach';
 
+    const chScope = this.scopeOf(chunk); // prunes pair checks to the (a,e,n,ts) key
     const remaining = chunk.partitions.filter((p) => !attachedSet.has(p));
     for (const partitionId of remaining) {
       // Verify-then-attach with EXACT pair accounting. `live` counts rows of
@@ -1128,7 +1136,7 @@ export class ChunkOrchestrator {
         await ledger.recordAttached(chunk._id, partitionId, fence);
         continue;
       }
-      const live = await staging.countLiveMatchingStaged(stagingTable, partitionId);
+      const live = await staging.countLiveMatchingStaged(stagingTable, partitionId, chScope);
       if (live === staged) {
         await ledger.recordAttached(chunk._id, partitionId, fence);
         continue;
@@ -1137,7 +1145,7 @@ export class ChunkOrchestrator {
         const owned = await ledger.transition(chunk._id, 'attaching', 'attaching', {}, fence);
         if (!owned) throw new ClaimLostError(chunk._id);
         log.error({ partition: partitionId, staged, live }, 'Pair-count anomaly (double-attach or partial promotion) — healing: delete matched pairs, attach fresh');
-        await staging.deleteLiveMatchingStaged(stagingTable, partitionId);
+        await staging.deleteLiveMatchingStaged(stagingTable, partitionId, chScope);
       }
       try {
         await staging.attachPartition(stagingTable, partitionId);
@@ -1153,12 +1161,12 @@ export class ChunkOrchestrator {
       }
       // Post-attach re-count: a concurrent actor attaching between our count
       // and our ATTACH shows up as live > staged — heal once more.
-      const after = await staging.countLiveMatchingStaged(stagingTable, partitionId);
+      const after = await staging.countLiveMatchingStaged(stagingTable, partitionId, chScope);
       if (after > staged) {
         const owned = await ledger.transition(chunk._id, 'attaching', 'attaching', {}, fence);
         if (!owned) throw new ClaimLostError(chunk._id);
         log.error({ partition: partitionId, staged, after }, 'Concurrent double-attach detected post-attach — healing');
-        await staging.deleteLiveMatchingStaged(stagingTable, partitionId);
+        await staging.deleteLiveMatchingStaged(stagingTable, partitionId, chScope);
         await staging.attachPartition(stagingTable, partitionId);
       }
       await ledger.recordAttached(chunk._id, partitionId, fence);

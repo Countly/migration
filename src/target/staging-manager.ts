@@ -258,12 +258,28 @@ export class StagingManager {
    * count: equal = already attached, zero = safe to attach, anything else =
    * double-attach or partial promotion that needs healing.
    */
-  async countLiveMatchingStaged(stagingTable: string, partitionId: string): Promise<number> {
+  /**
+   * Pruning matters at scale: without it this is a column scan of the LIVE
+   * partition (billions of rows), paid PER CHUNK — which flattened the
+   * many-tiny-collections tail to ~20 docs/s in the field. The chunk's
+   * (a, e, n) scope plus the staged rows' ts range are exactly the live
+   * table's primary key (a, e, n, ts), so the scan becomes a keyed range
+   * read. Scopeless chunks (unresolvable collections) fall back to the
+   * partition scan — correct, just slower.
+   */
+  private pairPruneSql(stagingTable: string, scope?: { a: string; e: string; n?: string } | null): string {
+    return `${this.scopeSql(scope)}
+                AND ts >= (SELECT min(ts) FROM ${this.fq(stagingTable)} WHERE _partition_id = {pid:String})
+                AND ts <= (SELECT max(ts) FROM ${this.fq(stagingTable)} WHERE _partition_id = {pid:String})`;
+  }
+
+  async countLiveMatchingStaged(stagingTable: string, partitionId: string, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
     const res = await this.ch().query({
       query: `SELECT count() AS c FROM ${this.fq(this.config.table)}
               WHERE _partition_id = {pid:String}
+                ${this.pairPruneSql(stagingTable, scope)}
                 AND (_id, cd) IN (SELECT _id, cd FROM ${this.fq(stagingTable)} WHERE _partition_id = {pid:String})`,
-      query_params: { pid: partitionId },
+      query_params: { pid: partitionId, ...this.scopeParams(scope) },
       format: 'JSONEachRow',
     });
     const rows = await res.json<{ c: string }>();
@@ -276,12 +292,13 @@ export class StagingManager {
    * exactly one copy remains. Provenance-exact: rows sharing an _id but a
    * different cd (live traffic, cross-cutover retries) are never touched.
    */
-  async deleteLiveMatchingStaged(stagingTable: string, partitionId: string): Promise<void> {
+  async deleteLiveMatchingStaged(stagingTable: string, partitionId: string, scope?: { a: string; e: string; n?: string } | null): Promise<void> {
     await this.ch().command({
       query: `DELETE FROM ${this.fq(this.config.table)}
               WHERE _partition_id = {pid:String}
+                ${this.pairPruneSql(stagingTable, scope)}
                 AND (_id, cd) IN (SELECT _id, cd FROM ${this.fq(stagingTable)} WHERE _partition_id = {pid:String})`,
-      query_params: { pid: partitionId },
+      query_params: { pid: partitionId, ...this.scopeParams(scope) },
     });
   }
 
