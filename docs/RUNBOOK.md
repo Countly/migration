@@ -128,3 +128,13 @@ Caveats:
   before sign-off.
 - Retention TTL keeps deleting on the old side throughout — the source
   audit reports that as deletion drift, not as a defect.
+
+### Bound is opt-in — pick the mode deliberately
+
+| Situation | LEDGER_CD_UPPER_BOUND | Behavior |
+|---|---|---|
+| No tee (classic cutover / bulk-before-cutover) | UNSET | Migrate EVERYTHING, including data that keeps arriving in the old cluster — top-up passes chase it until the final drain. ClickHouse's existing rows play no role in mapping. |
+| Tee active (same requests re-ingested on both sides) | SET to the flip boundary | Post-flip old-cluster data is the tee's copy — migrating it would duplicate undetectably. Mapper clamps, top-up disabled. |
+
+The boundary detector only SUGGESTS a value; it is never applied
+automatically — in the no-tee mode applying it would orphan new arrivals.

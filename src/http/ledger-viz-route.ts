@@ -294,6 +294,7 @@ const PAGE = `<!doctype html>
     <h2>Tee boundary &amp; sync <span class="hint">(mirror-by-nginx cutovers: detect the cut-off from data, watch both stacks stay in step)</span></h2>
     <div style="margin-bottom:8px"><button class="btn" id="btn-boundary" onclick="detectBoundary(this)">Detect boundary + check sync</button></div>
     <div id="boundary-out"><div class="empty">Not run. Requires the tee to be active; boundary suggestion only valid before migration starts (sync parity works any time).</div></div>
+    <p class="hint" style="margin-top:8px">The bound is OPT-IN and only for tee/mirror setups. Without <code>LEDGER_CD_UPPER_BOUND</code> the migration deliberately keeps chasing new old-cluster data (top-up passes) — that is correct when nothing mirrors traffic to ClickHouse. Set the bound ONLY when the same requests are re-ingested on both sides; the detector never applies it automatically.</p>
   </div>
 
     <div id="mirror-detail" style="font-size:12.5px;color:var(--ink-2)"></div>
