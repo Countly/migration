@@ -69,6 +69,7 @@ export interface LedgerEngineStats {
   chunksDone: number;
   chunksFailed: number;
   pauseReason: string | null;
+  sourceShrankChunks: number;
   docsPerSecond: number;
   stageMs: { read: number; transform: number; insert: number; verify: number; attach: number; pressureWait: number };
   dedupWorks: boolean | null;
@@ -134,6 +135,7 @@ export class ChunkOrchestrator {
   private currentChunk: string | null = null;
   private startedAt = 0;
   private consecutiveFailed = 0;
+  private sourceShrankChunks = 0;
   private streakHadPermanent = false;
   private pauseReason: 'operator' | 'breaker-transient' | 'breaker-data' | null = null;
   private probeOkStreak = 0;
@@ -758,18 +760,7 @@ export class ChunkOrchestrator {
       // == live, all short) is caught here, at commit time, for the price of
       // one indexed count (~1% of chunk duration).
       if (config.ledger.sourceCountCheck && !this.isNullCdChunk(chunk)) {
-        const srcCount = await this.d.mongoReader.getDatabase().collection(chunk.collection)
-          .countDocuments({ cd: { $gte: new Date(chunk.lower_cd), $lt: new Date(chunk.upper_cd) } });
-        if (srcCount !== result.docsRead) {
-          clog.error(
-            { sourceCount: srcCount, docsRead: result.docsRead },
-            'SOURCE-COUNT MISMATCH: window holds more/fewer docs than were read — flagging chunk for redo',
-          );
-          await ledger.transition(chunk._id, 'done', 'failed', {
-            last_error: `source-count mismatch: source=${srcCount} read=${result.docsRead} — under/over-read; retry redoes the window`,
-          });
-          this.noteChunkFailure(clog, 'permanent');
-        }
+        await this.sourceCountGuard(chunk, result.docsRead, clog);
       }
 
       clog.info(
@@ -1272,6 +1263,41 @@ export class ChunkOrchestrator {
     } finally {
       this.autoResuming = false;
     }
+  }
+
+  /**
+   * Post-commit under-read guard. Direction matters:
+   *  - source > read (UNDER-read): the window holds docs the cursor never
+   *    saw — the data-loss signal this guard exists for. Chunk fails, retry
+   *    redoes the window.
+   *  - source < read (source SHRANK): docs were deleted between our read
+   *    and this recount. Field case: Mongo's retention TTL reaper deleting
+   *    at the retention horizon while the migration passes it — every
+   *    window one-retention-period old shrinks slightly, forever, so
+   *    failing here would flap on retry chasing a moving target. The
+   *    migration is a snapshot: it keeps what existed at read time; the
+   *    source-vs-live audit reports the drift separately.
+   */
+  private async sourceCountGuard(chunk: ChunkDoc, docsRead: number, clog: Logger): Promise<void> {
+    const srcCount = await this.d.mongoReader.getDatabase().collection(chunk.collection)
+      .countDocuments({ cd: { $gte: new Date(chunk.lower_cd), $lt: new Date(chunk.upper_cd) } });
+    if (srcCount === docsRead) return;
+    if (srcCount < docsRead) {
+      this.sourceShrankChunks++;
+      clog.warn(
+        { sourceCount: srcCount, docsRead, deleted: docsRead - srcCount },
+        'Source shrank after read (retention TTL / deletions) — chunk stays done; migrated set is the snapshot at read time',
+      );
+      return;
+    }
+    clog.error(
+      { sourceCount: srcCount, docsRead },
+      'SOURCE-COUNT MISMATCH (under-read): window holds docs the read never saw — flagging chunk for redo',
+    );
+    await this.d.ledger.transition(chunk._id, 'done', 'failed', {
+      last_error: `source-count mismatch: source=${srcCount} read=${docsRead} — under-read; retry redoes the window`,
+    });
+    this.noteChunkFailure(clog, 'permanent');
   }
 
   // -------------------------------------------------------------------------
@@ -1997,6 +2023,7 @@ export class ChunkOrchestrator {
       chunksDone: this.chunksDone,
       chunksFailed: this.chunksFailed,
       pauseReason: this.pauseReason,
+      sourceShrankChunks: this.sourceShrankChunks,
       docsPerSecond: elapsedSec > 0 ? this.totalDocsRead / elapsedSec : 0,
       stageMs: {
         read: Math.round(this.stageMs.read),

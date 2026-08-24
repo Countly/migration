@@ -808,6 +808,68 @@ describe('multi-collection scoping + ledger rebuild', () => {
     await mc.db(DB).collection('mig_ranges').deleteMany({ _id: fakeId } as never);
   }, 30_000);
 
+  it('source-count guard: retention shrinkage keeps the chunk done; under-read fails it', async () => {
+    // Field case: Mongo's TTL reaper deletes at the retention horizon while
+    // the migration passes it — read > source by a few hundred docs. That
+    // must NOT fail the chunk (retry would flap chasing the reaper);
+    // source > read (an under-read) is the true data-loss signal and must.
+    const GR = 'guard-run';
+    const GCOLL = 'drill_events_ttl_fake';
+    const lo = Date.UTC(2025, 7, 23), hi = Date.UTC(2025, 7, 30);
+    await mc.db(DB).collection(GCOLL).insertMany(Array.from({ length: 5 }, (_, i) => ({
+      _id: `ttl_${i}`, uid: 'u', did: 'd', ts: lo + i * 1000, cd: new Date(lo + i * 1000), c: 1,
+    })) as never[]);
+    const mkChunk = async (idx: number): Promise<string> => {
+      const id = `${GR}:${GCOLL}:${idx}`;
+      await mc.db(DB).collection('mig_ranges').insertOne({
+        _id: id, run_id: GR, collection: GCOLL, scope_a: null, scope_e: null, scope_n: null,
+        idx, lower_cd: lo, upper_cd: hi, status: 'done', pod_id: 'p', lease_until: null,
+        staging_table: null, docs_read: 0, docs_skipped: 0, rows_expected: 0, partitions: [],
+        attached: [], attach_method: 'attach', attempts: 1, last_error: null,
+        transform_version: 'v2', updated_at: new Date(),
+      } as never);
+      return id;
+    };
+    const guard = (orchestrator as unknown as {
+      sourceCountGuard: (c: unknown, n: number, l: unknown) => Promise<void>;
+    }).sourceCountGuard.bind(orchestrator);
+    const chunkOf = async (id: string): Promise<Record<string, unknown> | null> =>
+      mc.db(DB).collection('mig_ranges').findOne({ _id: id } as never);
+
+    // shrinkage: we read 8, source now holds 5 → stays done
+    const shrinkId = await mkChunk(0);
+    await guard(await chunkOf(shrinkId), 8, logger);
+    expect((await chunkOf(shrinkId))?.status).toBe('done');
+    expect((orchestrator.getStats() as { sourceShrankChunks: number }).sourceShrankChunks).toBeGreaterThanOrEqual(1);
+
+    // under-read: we read 3, source holds 5 → data-loss signal, fails
+    const underId = await mkChunk(1);
+    await guard(await chunkOf(underId), 3, logger);
+    expect((await chunkOf(underId))?.status).toBe('failed');
+
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: GR } as never);
+    await mc.db(DB).collection(GCOLL).drop();
+  }, 30_000);
+
+  it('source audit: post-migration deletions report as drift, never as defects', async () => {
+    const { rebuildLedger: rebuild, newRebuildProgress: newProgress } = await import('../../src/runtime/ledger-rebuild.ts');
+    const victim = await mc.db(DB).collection(COLL1).findOne({ _id: 'p_10' } as never) as Record<string, unknown>;
+    await mc.db(DB).collection(COLL1).deleteOne({ _id: 'p_10' } as never);
+    try {
+      const prog = newProgress();
+      await rebuild({ config, logger, ledger, dlq: dlqStore, hashResolver, progress: prog, checkOnly: true });
+      expect(prog.mismatchedWindows.length, JSON.stringify(prog.mismatchedWindows).slice(0, 1000)).toBe(0);
+      expect(prog.deletionDriftWindows.length).toBe(1); // the deleted doc's window: live > source
+      expect(prog.deletionDriftWindows[0].live).toBe(prog.deletionDriftWindows[0].source + 1);
+    } finally {
+      await mc.db(DB).collection(COLL1).insertOne(victim as never); // restore
+    }
+    const prog2 = newProgress();
+    await rebuild({ config, logger, ledger, dlq: dlqStore, hashResolver, progress: prog2, checkOnly: true });
+    expect(prog2.mismatchedWindows.length).toBe(0);
+    expect(prog2.deletionDriftWindows.length).toBe(0);
+  }, 60_000);
+
   it('reclaim: two recoverers race an expired chunk — exactly one wins', async () => {
     const RR = 'reclaim-race-run';
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: RR } as never);

@@ -125,6 +125,8 @@ const PAGE = `<!doctype html>
   body { margin: 0; background: var(--bg); color: var(--ink);
     font-family: Inter, -apple-system, Arial, sans-serif; font-size: 14px; line-height: 1.5; }
   h1, h2, .stat b { font-family: 'Plus Jakarta Sans', Inter, Arial, sans-serif; }
+  td.err, .coll-head .name { overflow-wrap: anywhere; word-break: break-word; }
+  td.err { max-width: 460px; }
   header { background: var(--card); border-bottom: 1px solid var(--line);
     padding: 14px 28px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
   .logo { display: flex; align-items: center; gap: 9px; font-family: 'Plus Jakarta Sans'; font-weight: 800; font-size: 20px; letter-spacing: -0.02em; }
@@ -688,7 +690,9 @@ async function tick() {
         (stats.status === 'completed' ? ' avg' : (multiPod ? ' \u00b7 ' + stats.cluster.pods + ' pods' : ''));
     }
     document.getElementById('s-skipped').textContent = fmt(stats.totalDocsSkipped);
-    document.getElementById('s-failed').textContent = fmt(stats.chunksFailed);
+    // ledger truth, not this pod's counter — in multi-pod each pod only
+    // counts its own failures, so the card under-reported cluster-wide
+    document.getElementById('s-failed').textContent = fmt((sum.byStatus || {}).failed || 0);
 
     const bs = sum.byStatus;
     const done = bs.done || 0;
@@ -697,11 +701,19 @@ async function tick() {
     const countable = sum.total - (bs.superseded || 0);
     document.getElementById('s-chunks').textContent = done + ' / ' + countable;
 
-    const remainingDocs = sum.perCollection.reduce((s, c) => s + (c.nonDoneRowsExpected || 0), 0);
-    const knownRemaining = bs.pending || 0;
+    // Remaining-docs estimate PER COLLECTION: a global avg-docs-per-chunk
+    // is dominated by the big collections that finish first, while the
+    // pending tail is thousands of tiny one-chunk collections — the global
+    // number over-estimated the ETA ~5x in the field (8630 min shown for a
+    // ~1-day remainder). A collection with no done chunks yet falls back to
+    // the global average.
     const doneDocsRead = sum.perCollection.reduce((s, c) => s + (c.doneDocsRead || 0), 0);
-    const avgDone = done > 0 ? doneDocsRead / done : 0;
-    const etaDocs = remainingDocs + knownRemaining * avgDone;
+    const globalAvg = done > 0 ? doneDocsRead / done : 0;
+    const etaDocs = sum.perCollection.reduce((s, c) => {
+      const cb = c.byStatus || {};
+      const cAvg = (cb.done || 0) > 0 ? (c.doneDocsRead || 0) / cb.done : globalAvg;
+      return s + (c.nonDoneRowsExpected || 0) + (cb.pending || 0) * cAvg;
+    }, 0);
     document.getElementById('s-eta').textContent =
       stats.status === 'completed' ? 'done' :
       (effRate > 0 && etaDocs > 0 ? Math.max(1, Math.round(etaDocs / effRate / 60)) + ' min' : '–');
@@ -730,24 +742,33 @@ async function tick() {
     document.getElementById('g1-ic').textContent = (countable > 0 && done === countable) ? '\\u2705' : (failedN > 0 ? '\\u274c' : '\\u23f3');
     document.getElementById('g1-det').textContent = done + '/' + countable + ' done' + (failedN ? ', ' + failedN + ' failed' : '') + (active ? ', ' + active + ' active' : '');
 
-    // Per-collection bars
-    const byColl = {};
-    for (const c of chunks) { if (c.status !== 'superseded') (byColl[c.collection] ||= []).push(c); }
+    // Per-collection bars from the server-side SUMMARY — the chunk list is
+    // truncated to the active window on big runs, and bars built from it
+    // showed a collection with one listed (failed) chunk as 1/1 = 100%
+    // failed while its thousands of done chunks were invisible.
     const collDiv = document.getElementById('collections');
-    collDiv.innerHTML = Object.entries(byColl).map(([name, list]) => {
-      const total = list.length;
-      const d = list.filter(c => c.status === 'done').length;
-      const a = list.filter(c => ['in_progress','written','attaching'].includes(c.status)).length;
-      const f = list.filter(c => c.status === 'failed').length;
+    collDiv.innerHTML = (sum.perCollection || []).map(pc => {
+      const st2 = pc.byStatus || {};
+      const total = Object.entries(st2).reduce((s2, kv) => s2 + (kv[0] === 'superseded' ? 0 : kv[1]), 0);
+      if (total === 0) return '';
+      const d = st2.done || 0;
+      const a = (st2.in_progress || 0) + (st2.written || 0) + (st2.attaching || 0);
+      const f = st2.failed || 0;
       return '<div class="collection">' +
-        '<div class="coll-head"><span class="name">' + esc(name) + '</span>' +
-        '<span class="pct">' + d + '/' + total + ' chunks \\u00b7 ' + Math.round(d / total * 100) + '%</span></div>' +
+        '<div class="coll-head"><span class="name">' + esc(pc.collection) + '</span>' +
+        '<span class="pct">' + d + '/' + total + ' chunks \\u00b7 ' + Math.round(d / total * 100) + '%' +
+        (f ? ' \\u00b7 ' + f + ' failed' : '') + '</span></div>' +
         '<div class="bar"><i class="done" style="width:' + (d / total * 100) + '%"></i>' +
         '<i class="active" style="width:' + (a / total * 100) + '%"></i>' +
         '<i class="failed" style="width:' + (f / total * 100) + '%"></i></div></div>';
     }).join('') || '<div class="empty">Waiting for first chunk…</div>';
 
-    document.getElementById('grid').innerHTML = chunks.map(c =>
+    document.getElementById('grid').innerHTML =
+      (chunkResp.truncated
+        ? '<div class="hint" style="margin-bottom:6px">large run &mdash; showing the ' + chunks.length +
+          ' active/failed chunks; ' + fmt(bs.done || 0) + ' done chunks of ' + fmt(countable) + ' are omitted here (progress in the counters and bars above)</div>'
+        : '') +
+      chunks.map(c =>
       '<span class="cell ' + c.status + '" title="' + esc(c.collection) + ' #' + c.idx +
       ' [' + new Date(c.lower_cd).toISOString().slice(0, 10) + ' \\u2192 ' + new Date(c.upper_cd).toISOString().slice(0, 10) + '] ' +
       c.status + (c.docs_read ? ' \\u00b7 ' + fmt(c.docs_read) + ' docs' : '') + '"></span>'
@@ -765,6 +786,9 @@ async function tick() {
 
 let dlqOffset = 0;
 function dlqPage(delta) { dlqOffset = Math.max(0, dlqOffset + delta); slowTick(); }
+// strings render QUOTED: stringify-coercions turn a number into the same
+// digits as a string, and unquoted they looked like a no-op in the UI
+function fmtVal(v) { return typeof v === 'string' ? '"' + esc(v) + '"' : esc(String(v)); }
 async function slowTick() {
   try {
     const [dlq, report, replay] = await Promise.all([
@@ -827,7 +851,7 @@ async function slowTick() {
       ? '<div class="empty">None</div>'
       : '<table><tr><th>Rule \\u00b7 field</th><th>Count</th><th>Sample</th></tr>' +
         co.map(c => '<tr><td class="err">' + esc(c.rule_key) + '</td><td>' + fmt(c.count) + '</td><td style="font-size:12px;color:var(--ink-2)">' +
-          (c.sample ? esc(c.sample.original) + ' \\u2192 ' + esc(c.sample.coerced) : '') + '</td></tr>').join('') + '</table>';
+          (c.sample ? fmtVal(c.sample.original) + ' \\u2192 ' + fmtVal(c.sample.coerced) : '') + '</td></tr>').join('') + '</table>';
 
     document.getElementById('ph3-s').textContent = report.dryRun ? 'this is a dry run' : 'run with DRY_RUN=1';
 

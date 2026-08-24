@@ -58,6 +58,8 @@ export interface RebuildProgress {
   summary: RebuildCollectionSummary[];
   /** checkOnly audits: windows where source count != live count */
   mismatchedWindows: Array<{ collection: string; lowerCd: string; upperCd: string; source: number; live: number }>;
+  /** live > source: docs deleted from Mongo after migration (retention TTL, GDPR) — drift, not a defect. */
+  deletionDriftWindows: Array<{ collection: string; lowerCd: string; upperCd: string; source: number; live: number }>;
   error: string | null;
   startedAt: number | null;
   finishedAt: number | null;
@@ -66,7 +68,7 @@ export interface RebuildProgress {
 export function newRebuildProgress(): RebuildProgress {
   return {
     status: 'not_run', phase: '', collectionsDone: 0, collectionsTotal: 0,
-    summary: [], mismatchedWindows: [], error: null, startedAt: null, finishedAt: null,
+    summary: [], mismatchedWindows: [], deletionDriftWindows: [], error: null, startedAt: null, finishedAt: null,
   };
 }
 
@@ -199,11 +201,17 @@ export async function rebuildLedger(opts: {
           ? 'pending'
           : live + unresolved === mongoCount ? 'done' : live === 0 ? 'pending' : 'failed';
         // pending (live=0) is 'not migrated yet', not a disagreement
-        if (checkOnly && !unscopableInMulti && live + unresolved !== mongoCount && live !== 0 && progress.mismatchedWindows.length < 200) {
-          progress.mismatchedWindows.push({
-            collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
-            source: mongoCount, live,
-          });
+        if (checkOnly && !unscopableInMulti && live + unresolved !== mongoCount && live !== 0) {
+          // live > source = the SOURCE shrank after migration (retention
+          // TTL, GDPR purges) — report as drift, not as a defect; only
+          // live < source means data is missing from the target.
+          const bucket = live + unresolved > mongoCount ? progress.deletionDriftWindows : progress.mismatchedWindows;
+          if (bucket.length < 200) {
+            bucket.push({
+              collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
+              source: mongoCount, live,
+            });
+          }
         }
         summary.mongoDocs += mongoCount;
         summary.liveRows += live;
@@ -260,7 +268,7 @@ export async function rebuildLedger(opts: {
     if (checkOnly) {
       progress.phase = 'done';
       logger.info(
-        { windows: allDocs.length, mismatches: progress.mismatchedWindows.length },
+        { windows: allDocs.length, mismatches: progress.mismatchedWindows.length, deletionDrift: progress.deletionDriftWindows.length },
         'Source audit complete — ledger untouched',
       );
     } else {
