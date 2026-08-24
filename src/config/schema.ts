@@ -143,13 +143,6 @@ export const configSchema = z.object({
         manifestDb: z.string().default("countly_drill"),
     }),
 
-    // ── Mirror mode (mirror-first playbook) ─────────────────────────────
-    mirror: z.object({
-        enabled: booleanFromEnv.default(false),
-        batchDocs: positiveIntFromEnv.default(500),
-        batchMs: positiveIntFromEnv.default(1_000),
-    }),
-
     // ── Worker / Multi-Pod ──────────────────────────────────────────────
     worker: z.object({
         podId: z.string().default(""),

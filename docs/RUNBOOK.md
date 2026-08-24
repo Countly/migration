@@ -84,39 +84,47 @@ incident.
 drill → optionally `bench/seed-failures.ts` for a full failure-scenario drill
 (breaker, DLQ, monitor, retry-failed).
 
-## Mirror-first playbook (customer keeps the old architecture until sign-off)
+## Tee-mirror cutover (customer keeps the old architecture until sign-off)
 
 For customers who require approval before switching: the old arch stays
-authoritative, the new arch receives a LIVE copy, and history is backfilled
-up to the moment mirroring began.
+authoritative, nginx TEES the same SDK requests to the new architecture
+(which re-ingests them with its own logic — drill, sessions, aggregations,
+profiles all populate natively), and the bulk migration backfills history
+up to the moment the tee was enabled.
 
-1. Deploy the new arch cluster. Point NO traffic at it.
-2. Start one mirror pod: same image, `MIRROR_MODE=true`, same MONGO/CLICKHOUSE
-   env as a migration pod. It tails the old cluster's change stream
-   (read-only), replicates every new drill_events insert with the same
-   transform as the bulk migration (cd preserved), and records its
-   **checkpoint** — shown on the dashboard's Mirror card.
-3. Run the bulk migration pods with `LEDGER_CD_UPPER_BOUND=<checkpoint>`
-   (the Mirror card prints the exact value and warns if a pod's bound does
-   not match). The mapper never crosses the bound; top-up is disabled; the
-   boundary overlap converges through pair-checked attach — same (_id, cd)
-   never lands twice.
-4. Verify + audits as usual: because the mirror preserves cd, they cover the
-   WHOLE timeline (migrated + mirrored) as one consistent set.
-5. Customer validates side-by-side for as long as needed; the mirror keeps
-   ClickHouse current ("caught up" on the card).
-6. On approval: switch SDK/API traffic to the new arch, let the mirror drain
-   to caught-up + idle, stop the mirror pod.
+CRITICAL: the tee re-ingests requests, so the same event exists in both
+systems under DIFFERENT identities (new _id, new cd). Nothing downstream
+can deduplicate across that seam — the ONLY protection is the time bound.
 
-Caveats the runbook owner must carry:
-- The mirror replicates INSERTS. In-place mutations on old-arch drill data
-  during the mirror window (app-user merges rewriting uid, GDPR erasures,
-  TTL deletions) are NOT propagated — the card counts them as
-  "non-insert ops". Before sign-off, run the reconciliation pass: re-apply
-  pending GDPR erasures through the new arch's compliance flow and re-run
-  the source audit (retention deletions show as drift, not defects).
-- If the mirror ever reports a resume-token loss (oplog rolled while the
-  mirror was down too long), there is a GAP: restart the mirror fresh, then
-  run an additional bounded migration for the gap window before trusting
-  the timeline again. Size the oplog for the longest tolerated mirror
-  downtime.
+1. Deploy the new arch cluster; point no direct traffic at it.
+2. Flip the nginx tee INSIDE a short old-ingestion pause (~60s): pause the
+   old API (SDKs queue and retry — nothing is lost), enable the tee,
+   resume. The pause creates a sharp boundary: every old-cluster doc with
+   cd before the pause predates the tee; everything after was teed.
+   Record any timestamp inside the pause window as THE BOUND.
+   - If a pause is not possible: bound = flip time + the old arch's worst
+     drill-write latency, and accept that the few seconds of teed traffic
+     inside that margin will be double-counted once (pick a quiet hour).
+3. Run the bulk migration with `LEDGER_CD_UPPER_BOUND=<bound>` on every
+   pod (epoch ms or ISO). The mapper never crosses it, top-up is disabled,
+   collections born after it are skipped, and preflight treats the growing
+   source as the expected state. The header badge shows `bounded · cd < …`
+   on every pod — if it is missing on any pod, STOP that pod.
+4. Verify + Audit-vs-source as usual: they cover the migrated (pre-bound)
+   region; post-bound windows show as pending/uncovered, never as defects.
+   The post-bound region is the tee's responsibility and is validated by
+   comparing dashboards between the two systems, not by this tool.
+5. Customer validates side-by-side as long as needed; both systems ingest
+   the same requests the whole time.
+6. On approval: point SDK traffic solely at the new arch, drop the tee,
+   decommission old ingestion on its own schedule.
+
+Caveats:
+- NEVER run without the bound while the tee is active — every post-flip
+  doc migrated from the old cluster is an undetectable duplicate of its
+  re-ingested twin.
+- GDPR erasures and app-user merges executed on the OLD system during the
+  validation window apply only there; re-apply them through the new arch
+  before sign-off.
+- Retention TTL keeps deleting on the old side throughout — the source
+  audit reports that as deletion drift, not as a defect.

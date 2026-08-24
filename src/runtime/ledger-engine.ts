@@ -63,8 +63,6 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
 
   const ledger = new LedgerStore(config.source.uri, config.state.manifestDb, logger);
   const dlq = new DlqStore(config.source.uri, config.state.manifestDb, logger);
-  const { MirrorStore } = await import('../state/mirror-store.ts');
-  const mirrorStore = new MirrorStore(config.source.uri, config.state.manifestDb, logger);
 
   const staging = new StagingManager(
     {
@@ -92,7 +90,6 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   await mongoReader.connect();
   await ledger.connect();
   await dlq.connect();
-  await mirrorStore.connect();
   await staging.connect();
   await hashResolver.build();
   logger.info('Ledger engine: all services connected (MongoDB + ClickHouse only)');
@@ -315,38 +312,12 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     pods: await ledger.podActivity(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId),
     leaseSec: config.ledger.leaseSec,
   }));
-  // Mirror state is DB-backed, so every pod's dashboard can show the tile —
-  // the mirror itself runs as its own pod (MIRROR_MODE=1).
-  app.get('/api/mirror', async () => {
-    const st = await mirrorStore.load(config.ledger.runId).catch(() => null);
-    if (!st) return { present: false, live: mirrorEngine ? mirrorEngine.getStats() : null };
-    const staleMs = st.updated_at ? Date.now() - st.updated_at.getTime() : null;
-    return {
-      present: true,
-      checkpointMs: st.checkpoint_ms,
-      docsMirrored: st.docs_mirrored,
-      docsSkipped: st.docs_skipped,
-      docsDlq: st.docs_dlq,
-      nonInsertOps: st.non_insert_ops,
-      atHead: st.at_head ?? false,
-      lastEventMs: st.last_event_ms,
-      staleMs,
-      cdUpperBoundMs: config.ledger.cdUpperBoundMs,
-      live: mirrorEngine ? mirrorEngine.getStats() : null,
-    };
-  });
   const { registerLedgerVizRoutes } = await import('../http/ledger-viz-route.ts');
   registerLedgerVizRoutes(app, { orchestrator, ledger, dlq, config });
   await app.listen({ port: config.service.port, host: config.service.host });
   logger.info({ port: config.service.port }, 'Ledger engine HTTP listening');
 
-  let mirrorEngine: import('./mirror-engine.ts').MirrorEngine | null = null;
-  if (config.mirror.enabled) {
-    const { MirrorEngine } = await import('./mirror-engine.ts');
-    mirrorEngine = new MirrorEngine({ config, logger, staging, dlq, mirrorStore, hashResolver });
-    logger.warn('MIRROR MODE: this pod tails the source change stream — the bulk migration runs on separate pods with LEDGER_CD_UPPER_BOUND set to the mirror checkpoint');
-  }
-  const runPromise = mirrorEngine ? mirrorEngine.run() : orchestrator.run();
+  const runPromise = orchestrator.run();
   runPromise.catch((err) => {
     // Keep the HTTP console alive: an operator with a typo'd MONGO_DB or a
     // missing target table needs to SEE the error, not a dead process.
@@ -360,7 +331,6 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, 'Ledger engine shutting down');
-    if (mirrorEngine) mirrorEngine.stop();
     orchestrator.stopAfterChunk();
     await app.close().catch(() => {});
     await mongoReader.close().catch(() => {});

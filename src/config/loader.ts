@@ -83,12 +83,6 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             manifestDb: env.MANIFEST_DB,
         },
 
-        mirror: {
-            enabled: env.MIRROR_MODE,
-            batchDocs: env.MIRROR_BATCH_DOCS,
-            batchMs: env.MIRROR_BATCH_MS,
-        },
-
         worker: {
             podId: env.POD_ID,
             enabled: env.MULTI_POD_ENABLED,
