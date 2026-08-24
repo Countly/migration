@@ -323,6 +323,12 @@ const PAGE = `<!doctype html>
 <!-- ══════════════════ GUIDE ══════════════════ -->
 <div class="pane" id="pane-guide">
   <div class="card">
+    <h2>Which cutover is this? <span class="hint">— pick once; the settings below are per-scenario, and the wrong bound setting is the one mistake this tool cannot detect afterwards</span></h2>
+    <div id="scenario-picker" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"></div>
+    <div id="scenario-steps"></div>
+  </div>
+
+  <div class="card">
     <h2>Preflight checks <span class="hint">— run anytime; read-only</span></h2>
     <button class="btn primary" id="btn-preflight" onclick="runPreflight(this)">Run preflight checks</button>
     <div id="preflight-result" style="margin-top:12px"></div>
@@ -804,6 +810,58 @@ async function tick() {
 
 let dlqOffset = 0;
 function dlqPage(delta) { dlqOffset = Math.max(0, dlqOffset + delta); slowTick(); }
+
+var SCENARIOS = [
+  { id: 'switch', name: '1 \u00b7 Two clusters, no mirroring',
+    bound: false,
+    html: '<p><b>Plain ingestion switch</b> (cutover-first, or bulk-before-cutover with a final drain).</p>' +
+      '<ul>' +
+      '<li><b>LEDGER_CD_UPPER_BOUND: LEAVE UNSET.</b> The migration must take everything, including data still arriving in the old cluster \u2014 top-up passes chase it until the final drain finds nothing new.</li>' +
+      '<li>Cutover-first: switch SDK ingestion to the new cluster, then run the migration (old drill data is frozen). Bulk-before-cutover: run the bulk first, switch ingestion, then let the final top-up pass drain the tail.</li>' +
+      '<li>Ignore the Tee boundary card \u2014 it is for mirrored setups only. Applying a bound here would ORPHAN newly arrived data.</li>' +
+      '<li>Sign-off: Verify + Audit vs source + content audit, DLQ pending = 0.</li>' +
+      '</ul>' },
+  { id: 'tee-old', name: '2 \u00b7 Mirror old \u2192 new',
+    bound: true,
+    html: '<p><b>Old cluster stays primary; nginx tees the same requests to the new stack</b>, which re-ingests them with its own logic (same event = different _id/cd on each side \u2014 nothing downstream can dedup across that seam).</p>' +
+      '<ul>' +
+      '<li>Flip the tee inside a ~60s old-ingestion pause (SDKs queue and retry \u2014 lossless). The pause creates a sharp boundary.</li>' +
+      '<li>Run <b>Detect boundary</b> (Overview tab) BEFORE the migration maps anything: a green gap = exact seam. Click <b>Apply this bound to the run</b> \u2014 one click covers every pod \u2014 or set <code>LEDGER_CD_UPPER_BOUND</code> in the deployment config.</li>' +
+      '<li><b>Every pod must show the</b> <code>bounded \u00b7 cd &lt; \u2026</code> <b>badge.</b> A pod without it migrates post-flip data = undetectable duplicates.</li>' +
+      '<li>During validation, re-run the boundary card\u2019s sync parity regularly: nginx mirror drops silently when the secondary is down; flagged hours are bounded backfill windows.</li>' +
+      '<li>GDPR erasures / user merges done on the old side during validation must be re-applied on the new stack before sign-off.</li>' +
+      '</ul>' },
+  { id: 'tee-new', name: '3 \u00b7 Mirror new \u2192 old',
+    bound: true,
+    html: '<p><b>New cluster is already primary; nginx mirrors back to the old stack</b> as the customer\u2019s rollback safety net during validation.</p>' +
+      '<ul>' +
+      '<li>Everything from scenario 2 applies unchanged \u2014 detection, bound, badge, sync parity. ClickHouse is the store that started cold in both directions, so the detector does not care which side is primary.</li>' +
+      '<li>The bound = the moment the new cluster became primary. Old-cluster docs after it are the mirror\u2019s copies \u2014 never migrate them.</li>' +
+      '<li>Post-flip data quality is validated by comparing dashboards between stacks, not by this tool: this migration owns only the pre-flip history.</li>' +
+      '</ul>' },
+  { id: 'inplace', name: '4 \u00b7 Single cluster, in-place upgrade',
+    bound: false,
+    html: '<p><b>One cluster upgraded to the new architecture</b>; old drill_events collections stay in the same MongoDB and are migrated into ClickHouse in the background while live traffic already flows into the same table.</p>' +
+      '<ul>' +
+      '<li><b>LEDGER_CD_UPPER_BOUND: LEAVE UNSET.</b> The upgrade itself froze the Mongo drill collections (new events go to ClickHouse natively); if a transition tail trickled in, top-up drains it. There is no tee, so there is nothing to duplicate.</li>' +
+      '<li>Live rows and migrated rows share the table safely: live cd is post-upgrade, migrated cd is historical \u2014 verify and the audits are built on that boundary (this is the tested live-parallel path).</li>' +
+      '<li>Backpressure matters most here \u2014 migration ATTACHes into the same ClickHouse serving production; the built-in throttle yields before parts pressure reaches live inserts.</li>' +
+      '<li>Sign-off: Verify + Audit vs source + content audit, DLQ pending = 0. Retention TTL deletions on old data show as drift, not defects.</li>' +
+      '</ul>' },
+];
+function renderScenario() {
+  var sel = localStorage.getItem('mig-scenario') || '';
+  document.getElementById('scenario-picker').innerHTML = SCENARIOS.map(function(s) {
+    return '<button class="btn' + (sel === s.id ? ' primary' : '') + '" onclick="pickScenario(\\'' + s.id + '\\')">' + s.name + '</button>';
+  }).join('');
+  var cur = SCENARIOS.find(function(s) { return s.id === sel; });
+  document.getElementById('scenario-steps').innerHTML = cur
+    ? '<div style="border-left:3px solid var(--' + (cur.bound ? 'blue' : 'green') + ');padding-left:12px">' + cur.html +
+      '<p><b>Bound setting for this scenario: ' + (cur.bound ? 'REQUIRED \u2014 <code>LEDGER_CD_UPPER_BOUND</code> set (or applied from the boundary card)' : 'must stay UNSET') + '</b></p></div>'
+    : '<div class="empty">Select the scenario \u2014 it decides whether the cd bound must be set (mirrored setups) or must stay unset (everything else).</div>';
+}
+function pickScenario(id) { localStorage.setItem('mig-scenario', id); renderScenario(); }
+renderScenario();
 
 async function applyBound(btn, ms) {
   if (!armed.get(btn)) {
