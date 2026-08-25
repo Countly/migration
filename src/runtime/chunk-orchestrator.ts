@@ -997,7 +997,15 @@ export class ChunkOrchestrator {
         // Every unmigratable doc (except already-migrated) is captured with
         // its raw source doc — accounted for and replayable, never dropped.
         if (skipReason !== SkipReason.ALREADY_MARKED_MIGRATED) {
-          state.transformErrors++;
+          // Structured skips (missing_uid etc.) are a DATA CONDITION, not a
+          // pipeline failure: they must not trip the fail-rate breaker.
+          // Field case: pockets of ancient uid-less docs made 100%-skip
+          // chunks breaker-fail FOREVER (any retry re-skips the same docs).
+          // Genuine transform exceptions still count; runaway skip volume
+          // is covered by the mass-DLQ pause threshold.
+          if (skipReason === SkipReason.TRANSFORM_ERROR) {
+            state.transformErrors++;
+          }
           if (config.ledger.captureTransformErrors) {
             dlqBatch.push({
               run_id: this.runId,

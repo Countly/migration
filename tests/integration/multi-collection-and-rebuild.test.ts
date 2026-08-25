@@ -870,6 +870,69 @@ describe('multi-collection scoping + ledger rebuild', () => {
     expect(prog2.deletionDriftWindows.length).toBe(0);
   }, 60_000);
 
+  it('a 100%-uid-less chunk completes done with docs in the DLQ — never a breaker loop', async () => {
+    // Field case: pockets of ancient docs with no uid (epoch-era windows)
+    // made chunks fail the fail-rate breaker with "100.0% of docs failed",
+    // and retrying could never fix them (the same docs skip again). A
+    // structured skip is a data condition: the chunk must complete, the
+    // docs must land in the DLQ pending the waive-or-replay policy call,
+    // and the window must stay audit-clean via DLQ attribution.
+    const SK = 'skiponly-run';
+    const SKCOLL = COLL1; // resolvable scope
+    const lo = Date.UTC(2027, 0, 1);
+    const docs = Array.from({ length: 1_500 }, (_, i) => ({
+      _id: `nouid_${i}`, did: `d${i}`, ts: lo + i * 1000, cd: new Date(lo + i * 1000), sg: { v: i }, c: 1,
+      // uid intentionally ABSENT
+    }));
+    await mc.db(DB).collection(SKCOLL).insertMany(docs as never[]);
+
+    Object.assign(process.env, {
+      SERVICE_NAME: 'skiponly', MONGO_URI, MONGO_DB: DB, MONGO_COUNTLY_DB: `${DB}_countly`,
+      MANIFEST_DB: DB, CLICKHOUSE_URL: CH_URL, CLICKHOUSE_PASSWORD: CH_PASSWORD, CLICKHOUSE_DB: DB,
+      LEDGER_RUN_ID: SK, LEDGER_CHUNK_DOCS_TARGET: '5000', MONGO_PAGE_SIZE: '500',
+      LEDGER_MONITOR_INTERVAL_MS: '0', BACKPRESSURE_ENABLED: 'false', MULTI_POD_ENABLED: 'false',
+      POD_ID: 'skip-pod',
+    });
+    delete process.env.LEDGER_CD_UPPER_BOUND;
+    const skConfig = loadConfig();
+    const { MongoReader } = await import('../../src/source/mongo-reader.ts');
+    const mongoReader2 = new MongoReader({
+      uri: MONGO_URI, database: DB, readPreference: 'primary', readConcern: 'local',
+      retryReads: true, appName: 'skip-pod', cursorBatchSize: 500, maxTimeMs: 60_000,
+    }, logger);
+    await mongoReader2.connect();
+    closers.push(() => mongoReader2.close());
+    const orch = new ChunkOrchestrator({
+      config: skConfig, logger, mongoReader: mongoReader2, ledger, dlq: dlqStore, staging,
+      retryPolicy: new RetryPolicy({ maxRetries: 2, baseDelayMs: 50, maxDelayMs: 200 }), hashResolver,
+    });
+    await orch.run();
+
+    const stats = orch.getStats();
+    expect(stats.status).toBe('completed'); // no breaker pause
+    expect(stats.chunksFailed).toBe(0);
+    const skChunks = await mc.db(DB).collection('mig_ranges')
+      .find({ run_id: SK, collection: SKCOLL, lower_cd: { $gte: 0 } } as never).toArray();
+    expect(skChunks.length).toBeGreaterThan(0);
+    // the uid-less 2027 docs are covered by the grid and every chunk is DONE
+    expect(Math.max(...skChunks.map((c) => c.upper_cd as number))).toBeGreaterThan(lo);
+    for (const c of skChunks) expect(c.status).toBe('done');
+
+    // every doc accounted: in the DLQ as pending 'skipped', none in live
+    const pend = await mc.db(DB).collection('mig_dlq_docs')
+      .countDocuments({ run_id: SK, status: 'pending', error: 'skip:missing_uid' } as never);
+    expect(pend).toBe(1_500);
+    const live = await ch.query({
+      query: `SELECT count() AS c FROM ${DB}.drill_events WHERE _id LIKE 'nouid%'`,
+      format: 'JSONEachRow',
+    });
+    expect(Number((await live.json<{ c: string }>())[0].c)).toBe(0);
+
+    await mc.db(DB).collection(SKCOLL).deleteMany({ _id: { $regex: '^nouid_' } } as never);
+    await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: SK } as never);
+    await mc.db(DB).collection('mig_dlq_docs').deleteMany({ run_id: SK } as never);
+  }, 120_000);
+
   it('reclaim: two recoverers race an expired chunk — exactly one wins', async () => {
     const RR = 'reclaim-race-run';
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: RR } as never);
