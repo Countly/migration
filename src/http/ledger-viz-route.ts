@@ -291,8 +291,7 @@ const PAGE = `<!doctype html>
   </div>
 
   <div class="controls">
-    <button class="btn" id="btn-pause" onclick="control('pause', 'Paused', this)">Pause</button>
-    <button class="btn primary" id="btn-resume" onclick="control('resume', 'Resumed', this)">Resume</button>
+    <button class="btn" id="btn-pauseresume" data-action="pause" onclick="togglePause(this)">\u23f8 Pause</button>
     <button class="btn" id="btn-retry" onclick="control('retry-failed', 'Failed chunks queued for redo', this, true)">Retry failed chunks</button>
     <button class="btn" id="btn-replay" onclick="control('replay-dlq', 'DLQ replay started — progress in the DLQ panel below', this)">Replay DLQ</button>
     <div id="pause-hint" style="display:none;margin-top:8px;padding:8px 12px;border-radius:8px;background:#FDEEDD;color:#A05A16;font-weight:600"></div>
@@ -825,10 +824,25 @@ async function tick() {
          stats.pauseReason === 'breaker-data' ? ' (systematic data problem \u2014 needs you)' : ' (by operator)') +
         ' \u2014 Retry / Replay / Waive only QUEUE work; click Resume to process it.';
     } else { hint.style.display = 'none'; }
-    var pb = document.getElementById('btn-pause'), rb = document.getElementById('btn-resume');
-    if (pb && rb) {
-      pb.classList.toggle('primary', !isPaused && stats.status === 'running');
-      rb.classList.toggle('primary', isPaused);
+    var prBtn = document.getElementById('btn-pauseresume');
+    if (prBtn) {
+      if (isPaused) {
+        prBtn.dataset.action = 'resume';
+        prBtn.innerHTML = '\u25b6 Resume';
+        prBtn.classList.add('primary');
+        prBtn.disabled = false;
+      } else if (stats.status === 'running') {
+        prBtn.dataset.action = 'pause';
+        prBtn.innerHTML = '\u23f8 Pause';
+        prBtn.classList.remove('primary');
+        prBtn.disabled = false;
+      } else {
+        // idle / completed / stopped / failed: nothing to pause or resume
+        prBtn.dataset.action = '';
+        prBtn.innerHTML = '\u23f8 Pause';
+        prBtn.classList.remove('primary');
+        prBtn.disabled = true;
+      }
     }
 
     const st = document.getElementById('b-status');
@@ -1004,6 +1018,12 @@ async function applyBound(btn, ms) {
   } catch (e) { toast('\u274c apply failed: ' + e.message); }
   btn.disabled = false;
   tick();
+}
+
+async function togglePause(btn) {
+  var action = btn.dataset.action;
+  if (!action) return;
+  await control(action, action === 'pause' ? 'Paused' : 'Resumed', btn);
 }
 
 async function detectBoundary(btn) {
