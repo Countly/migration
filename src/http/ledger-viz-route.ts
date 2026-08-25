@@ -280,7 +280,13 @@ const PAGE = `<!doctype html>
     <div class="stat"><small>Failed chunks</small><b id="s-failed">–</b></div>
     <div class="stat"><small>ETA</small><b id="s-eta">–</b></div>
   </div>
-  <div id="run-times" class="hint" style="margin:-12px 0 16px 2px"></div>
+  <div id="run-progress" style="display:none;margin:-8px 0 6px 2px">
+    <div style="height:10px;border-radius:6px;background:var(--line);overflow:hidden">
+      <div id="run-progress-fill" style="height:100%;width:0%;background:var(--green);transition:width .6s"></div>
+    </div>
+    <div id="run-progress-text" class="hint" style="margin-top:3px"></div>
+  </div>
+  <div id="run-times" class="hint" style="margin:-4px 0 16px 2px"></div>
   <div style="display:none">
   </div>
 
@@ -775,6 +781,28 @@ async function tick() {
     document.getElementById('s-eta').textContent =
       stats.status === 'completed' ? 'done' :
       (effRate > 0 && etaDocs > 0 ? Math.max(1, Math.round(etaDocs / effRate / 60)) + ' min' : '–');
+
+    // Progress = DOCUMENTS, not chunks: chunk sizes vary ~100x, so the
+    // chunk fraction misleads (field: 41% of chunks held 80% of the docs).
+    // The doc total for unread chunks is estimated (per-collection avg) —
+    // hence the '~'. Chunks shown alongside as the exact bookkeeping.
+    var prog = document.getElementById('run-progress');
+    var docsDoneN = sum.docsDone || 0;
+    var pct = stats.status === 'completed' ? 100
+            : (docsDoneN + etaDocs) > 0 ? Math.min(99.9, docsDoneN / (docsDoneN + etaDocs) * 100)
+            : null;
+    if (pct !== null && (docsDoneN > 0 || stats.status === 'completed')) {
+      prog.style.display = '';
+      document.getElementById('run-progress-fill').style.width = pct.toFixed(1) + '%';
+      document.getElementById('run-progress-text').textContent =
+        (stats.status === 'completed' ? '100% \u2014 migration complete' :
+          '\u2248 ' + pct.toFixed(1) + '% of documents migrated (' + fmt(Math.round(docsDoneN)) + ' done, ~' + fmt(Math.round(etaDocs)) + ' to go)') +
+        ' \u00b7 chunks: ' + fmt(done) + '/' + fmt(countable) + ' (' + (countable > 0 ? Math.round(done / countable * 100) : 0) + '%, exact)';
+      document.title = (stats.status === 'completed' ? '\u2713 done' : pct.toFixed(0) + '%') + ' \u00b7 Countly Data Migration';
+    } else {
+      prog.style.display = 'none';
+      document.title = 'Countly Data Migration';
+    }
 
     var rt = stats.runTimes || {};
     var rtEl = document.getElementById('run-times');
