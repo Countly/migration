@@ -139,6 +139,48 @@ export class LedgerStore {
       .toArray() as never;
   }
 
+  /**
+   * The "tape": every chunk in GLOBAL CLAIM ORDER (collection asc, idx
+   * desc — the exact order claimNextGlobal serves). The chunk map renders
+   * a row-aligned window over it so the migration cursor stays visually
+   * anchored and the view advances line by line, never cell by cell.
+   */
+  async findFrontier(runId: string): Promise<ChunkDoc | null> {
+    return this.c().findOne(
+      { run_id: runId, status: { $in: ['pending', 'in_progress', 'written', 'attaching'] } },
+      { sort: { collection: 1, idx: -1 } },
+    );
+  }
+
+  /** Tape position of a chunk = how many chunks precede it in claim order. */
+  async countTapeBefore(runId: string, chunk: { collection: string; idx: number }): Promise<number> {
+    return this.c().countDocuments({
+      run_id: runId,
+      $or: [
+        { collection: { $lt: chunk.collection } },
+        { collection: chunk.collection, idx: { $gt: chunk.idx } },
+      ],
+    });
+  }
+
+  async tapeSlice(runId: string, skip: number, limit: number): Promise<ChunkDoc[]> {
+    return this.c()
+      .find({ run_id: runId })
+      .sort({ collection: 1, idx: -1 })
+      .skip(skip)
+      .limit(limit)
+      .toArray() as never;
+  }
+
+  /** All failed chunks (capped) — the failed table must never depend on the map window. */
+  async listFailed(runId: string, limit = 200): Promise<ChunkDoc[]> {
+    return this.c()
+      .find({ run_id: runId, status: 'failed' })
+      .sort({ collection: 1, idx: 1 })
+      .limit(limit)
+      .toArray() as never;
+  }
+
   /** Rebuild support: replace this run's entire ledger with regenerated chunks. */
   async replaceAllForRun(runId: string, docs: ChunkDoc[]): Promise<number> {
     await this.c().deleteMany({ run_id: runId });

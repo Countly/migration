@@ -36,10 +36,29 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
     // enough to render (a 10TB run can have tens of thousands of chunks).
     const summary = await deps.ledger.summarize(runId());
     const truncated = summary.total > 2_000;
-    const chunks = truncated
-      ? await deps.ledger.listActive(runId(), 500)
-      : await deps.ledger.listAll(runId());
-    return { runId: runId(), summary, chunks, truncated };
+    if (!truncated) {
+      const chunks = await deps.ledger.listAll(runId());
+      return { runId: runId(), summary, chunks, truncated };
+    }
+    // Row-aligned window over the claim-order tape: the map's cursor stays
+    // visually anchored and the view slides LINE BY LINE (field feedback:
+    // cells vanishing one by one made the map unreadable).
+    const COLS = 48, ROWS_BEFORE = 3, ROWS_TOTAL = 12;
+    const frontier = await deps.ledger.findFrontier(runId());
+    let start = 0;
+    if (frontier) {
+      const pos = await deps.ledger.countTapeBefore(runId(), frontier as { collection: string; idx: number });
+      start = Math.max(0, (Math.floor(pos / COLS) - ROWS_BEFORE) * COLS);
+    } else {
+      start = Math.max(0, (Math.ceil(summary.total / COLS) - ROWS_TOTAL) * COLS); // all done: show the tail
+    }
+    const chunks = await deps.ledger.tapeSlice(runId(), start, COLS * ROWS_TOTAL);
+    const failedChunks = await deps.ledger.listFailed(runId());
+    return {
+      runId: runId(), summary, chunks, truncated,
+      tape: { start, cols: COLS, total: summary.total, frontierId: frontier?._id ?? null },
+      failedChunks,
+    };
   });
 
   // Counts + grouped errors are aggregations — cheap at thousands, real
@@ -163,6 +182,10 @@ const PAGE = `<!doctype html>
   .bar .failed { background: var(--red); }
   @keyframes pulse { 50% { opacity: 0.55; } }
   .grid { display: flex; flex-wrap: wrap; gap: 4px; }
+  .grid.tape { display: grid; grid-template-columns: repeat(48, 12px); gap: 3px; justify-content: start; }
+  .grid.tape .cell { width: 12px; height: 12px; border-radius: 3px; }
+  .cell.frontier { outline: 2px solid var(--ink); outline-offset: 1px; }
+  .cell.spacer { background: transparent; }
   .cell { width: 16px; height: 16px; border-radius: 4px; background: var(--line); cursor: default; }
   .cell.done { background: var(--green); }
   .cell.in_progress { background: var(--blue); animation: pulse 1.2s ease-in-out infinite; }
@@ -846,18 +869,23 @@ async function tick() {
     (donePcs > 0 ? '<div class="collection" style="color:var(--green);font-weight:600;padding:6px 0">\u2713 ' + fmt(donePcs) + ' collection(s) fully migrated' + (openPcs.length === 0 ? ' \u2014 all done' : ' (hidden)') + '</div>' : '') ||
     '<div class="empty">Waiting for first chunk…</div>';
 
+    var gridEl = document.getElementById('grid');
+    var tape = chunkResp.tape;
+    gridEl.className = tape ? 'grid tape' : 'grid';
     document.getElementById('grid').innerHTML =
-      (chunkResp.truncated
-        ? '<div class="hint" style="margin-bottom:6px">large run &mdash; showing the ' + chunks.length +
-          ' active/failed chunks; ' + fmt(bs.done || 0) + ' done chunks of ' + fmt(countable) + ' are omitted here (progress in the counters and bars above)</div>'
+      (tape
+        ? '<div class="hint" style="grid-column: 1 / -1; margin-bottom:4px">migration cursor at chunk ' +
+          fmt(tape.start + Math.max(0, chunks.findIndex(function(c) { return c._id === tape.frontierId; }))) +
+          ' of ' + fmt(tape.total) + ' \u2014 rows scroll as lines complete; ' +
+          '3 rows behind and 8 ahead of the cursor</div>'
         : '') +
       chunks.map(c =>
-      '<span class="cell ' + c.status + '" title="' + esc(c.collection) + ' #' + c.idx +
+      '<span class="cell ' + c.status + (tape && c._id === tape.frontierId ? ' frontier' : '') + '" title="' + esc(c.collection) + ' #' + c.idx +
       ' [' + new Date(c.lower_cd).toISOString().slice(0, 10) + ' \\u2192 ' + new Date(c.upper_cd).toISOString().slice(0, 10) + '] ' +
       c.status + (c.docs_read ? ' \\u00b7 ' + fmt(c.docs_read) + ' docs' : '') + '"></span>'
     ).join('');
 
-    const failed = chunks.filter(c => c.status === 'failed');
+    const failed = chunkResp.failedChunks || chunks.filter(c => c.status === 'failed');
     document.getElementById('failed').innerHTML = failed.length === 0
       ? '<div class="empty">None 🎉</div>'
       : '<table><tr><th>Chunk</th><th>Range</th><th>Attempts</th><th>Error</th></tr>' +

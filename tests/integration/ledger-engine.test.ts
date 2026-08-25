@@ -243,6 +243,31 @@ describe('LedgerStore', () => {
     await mc3.close();
   });
 
+  it('tape window: frontier, position, and slice follow the global claim order', async () => {
+    const TR = 'tape-run';
+    // claim order = collection asc, idx desc: collA#2, collA#1, collA#0, collB#1, collB#0
+    await ledger.initChunks(TR, 'collA', [0, 1, 2].map((i) => ({ lowerCd: i * 10, upperCd: (i + 1) * 10 })), 'v1');
+    await ledger.initChunks(TR, 'collB', [0, 1].map((i) => ({ lowerCd: i * 10, upperCd: (i + 1) * 10 })), 'v1');
+    const mc4 = new MongoClient(MONGO_URI);
+    await mc4.connect();
+    const mark = (id: string, status: string): Promise<unknown> =>
+      mc4.db(DB).collection('mig_ranges').updateOne({ _id: id } as never, { $set: { status } } as never);
+    // first two tape positions done; a FAILED chunk next must not pin the frontier
+    await mark(`${TR}:collA:2`, 'done');
+    await mark(`${TR}:collA:1`, 'done');
+    await mark(`${TR}:collA:0`, 'failed');
+
+    const frontier = (await ledger.findFrontier(TR))!;
+    expect(frontier._id).toBe(`${TR}:collB:1`); // failed is passed over, tape order holds
+    expect(await ledger.countTapeBefore(TR, frontier)).toBe(3);
+
+    const slice = await ledger.tapeSlice(TR, 1, 3);
+    expect(slice.map((c) => c._id)).toEqual([`${TR}:collA:1`, `${TR}:collA:0`, `${TR}:collB:1`]);
+
+    await mc4.db(DB).collection('mig_ranges').deleteMany({ run_id: TR } as never);
+    await mc4.close();
+  });
+
   it('guarded transitions reject wrong from-state', async () => {
     const moved = await ledger.transition('r1:coll:2', 'pending', 'done');
     expect(moved).toBeNull(); // it's in_progress, not pending
