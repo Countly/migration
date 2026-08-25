@@ -231,6 +231,7 @@ export class ChunkOrchestrator {
       await this.d.staging.runDedupCanary();
       await this.checkDlqPressure(this.logger, true); // inherited mass-DLQ pauses a resumed run too
       this.startInvariantMonitor();
+      await this.d.ledger.markRunStarted(this.runId).catch(() => {});
     }
 
     const db = this.d.mongoReader.getDatabase();
@@ -373,6 +374,9 @@ export class ChunkOrchestrator {
     if (this.resumeProbeTimer) clearInterval(this.resumeProbeTimer);
     this.status = this.stopping ? 'stopped' : 'completed';
     this.finishedAt = Date.now();
+    if (this.status === 'completed' && !this.dryRun) {
+      await this.d.ledger.markRunCompleted(this.runId).catch(() => {});
+    }
     this.logger.info(
       {
         status: this.status,

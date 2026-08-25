@@ -123,8 +123,17 @@ export class LedgerStore {
 
   /** Non-terminal + failed chunk details, capped — the interesting ones on huge runs. */
   async listActive(runId: string, limit = 500): Promise<ChunkDoc[]> {
+    // recently-done chunks stay listed for 2 min: on huge runs the map only
+    // shows this active window, and completions VANISHING instead of
+    // turning green read as "weird animation" in the field
     return this.c()
-      .find({ run_id: runId, status: { $in: ['pending', 'in_progress', 'written', 'attaching', 'failed'] } })
+      .find({
+        run_id: runId,
+        $or: [
+          { status: { $in: ['pending', 'in_progress', 'written', 'attaching', 'failed'] } },
+          { status: 'done', updated_at: { $gt: new Date(Date.now() - 120_000) } },
+        ],
+      })
       .sort({ collection: 1, idx: 1 })
       .limit(limit)
       .toArray() as never;
@@ -427,6 +436,38 @@ export class LedgerStore {
   private rc(): Collection<{ _id: string; cd_upper_bound_ms: number; set_at: Date; set_by: string }> {
     if (!this.coll) throw new Error('LedgerStore not connected');
     return this.client.db(this.dbName).collection('mig_run_config');
+  }
+
+  /** First-ever start and first full completion — the run's wall-clock story. */
+  async markRunStarted(runId: string): Promise<void> {
+    await this.rc().updateOne(
+      { _id: runId },
+      { $setOnInsert: { run_started_at: new Date() } as never },
+      { upsert: true },
+    );
+    // $setOnInsert misses the case where the doc exists (e.g. a stored
+    // bound was applied before the first pod started) — pipeline-update
+    // fills it exactly once either way
+    await this.rc().updateOne(
+      { _id: runId },
+      [{ $set: { run_started_at: { $ifNull: ['$run_started_at', '$$NOW'] } } }] as never,
+    );
+  }
+
+  async markRunCompleted(runId: string): Promise<void> {
+    await this.rc().updateOne(
+      { _id: runId },
+      [{ $set: { run_completed_at: { $ifNull: ['$run_completed_at', '$$NOW'] } } }] as never,
+      { upsert: true },
+    );
+  }
+
+  async getRunTimes(runId: string): Promise<{ startedAtMs: number | null; completedAtMs: number | null }> {
+    const doc = await this.rc().findOne({ _id: runId }) as unknown as { run_started_at?: Date; run_completed_at?: Date } | null;
+    return {
+      startedAtMs: doc?.run_started_at ? doc.run_started_at.getTime() : null,
+      completedAtMs: doc?.run_completed_at ? doc.run_completed_at.getTime() : null,
+    };
   }
 
   async getStoredBound(runId: string): Promise<number | null> {

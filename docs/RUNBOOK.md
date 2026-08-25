@@ -156,3 +156,23 @@ Caveats:
 
 The boundary detector only SUGGESTS a value; it is never applied
 automatically — in the no-tee mode applying it would orphan new arrivals.
+
+## DLQ: `skip:missing_uid` — orphan docs of deleted users
+
+Old deployments accumulate drill documents with NO `uid` (often also no
+`ts`/`did`, cd around the epoch): these are orphan docs of app users that
+were deleted in the old system — the user record and its uid link are
+gone, the event document remained. They cannot be attributed to any user
+in either the old or the new system.
+
+**Standard call: Waive.** They are captured in full in the DLQ (nothing is
+silently dropped), the waive is recorded and counted, and the source audit
+attributes each window's shortfall to its waived docs — sign-off stays
+exact. Only consider a sentinel-uid replay instead if the affected volume
+is large enough to distort historical event totals for a customer AND the
+docs carry usable ts/did (check a few samples in the DLQ panel first).
+
+Chunks that were 100% such docs complete as done (structured skips do not
+trip the fail-rate breaker); the mass-DLQ pause that fires when millions
+of them accumulate is the built-in "stop and decide" moment — after
+waiving, click Resume.

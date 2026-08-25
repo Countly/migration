@@ -257,12 +257,16 @@ const PAGE = `<!doctype html>
     <div class="stat"><small>Failed chunks</small><b id="s-failed">–</b></div>
     <div class="stat"><small>ETA</small><b id="s-eta">–</b></div>
   </div>
+  <div id="run-times" class="hint" style="margin:-12px 0 16px 2px"></div>
+  <div style="display:none">
+  </div>
 
   <div class="controls">
     <button class="btn" id="btn-pause" onclick="control('pause', 'Paused', this)">Pause</button>
     <button class="btn primary" id="btn-resume" onclick="control('resume', 'Resumed', this)">Resume</button>
     <button class="btn" id="btn-retry" onclick="control('retry-failed', 'Failed chunks queued for redo', this, true)">Retry failed chunks</button>
     <button class="btn" id="btn-replay" onclick="control('replay-dlq', 'DLQ replay started — progress in the DLQ panel below', this)">Replay DLQ</button>
+    <div id="pause-hint" style="display:none;margin-top:8px;padding:8px 12px;border-radius:8px;background:#FDEEDD;color:#A05A16;font-weight:600"></div>
     <button class="btn" id="btn-waive" onclick="control('waive-dlq', 'Pending DLQ entries waived', this, true)">Waive pending DLQ</button>
     <span class="btn-note">Destructive actions ask for a second click. Every action shows a receipt.</span>
   </div>
@@ -691,20 +695,34 @@ async function tick() {
     // Durable count from the ledger when available (process counters reset
     // on restart; the chunk ledger doesn't).
     if (window.__ledgerDocsDone !== undefined && window.__ledgerDocsDone >= stats.totalRowsInserted) {
-      document.getElementById('s-rows').textContent = fmt(window.__ledgerDocsDone);
+      setBigStat('s-rows', window.__ledgerDocsDone);
     } else {
-      document.getElementById('s-rows').textContent = fmt(stats.totalRowsInserted);
+      setBigStat('s-rows', stats.totalRowsInserted);
     }
     var dpsEl = document.getElementById('s-dps');
-    // Cluster rate comes from the shared ledger (docs finished in the last
-    // 2 min across ALL pods); the local counter only sees this pod.
+    // REALTIME rate: docs completed in the last ~60s, measured client-side
+    // from the ledger-truth docsDone counter (cluster-wide by definition).
+    // The lifetime average was "super confusing" in the field — it mixes
+    // hours of history into a number that never reflects what is happening
+    // right now.
+    rateSamples.push({ t: Date.now(), d: sum.docsDone || 0 });
+    while (rateSamples.length > 2 && rateSamples[0].t < Date.now() - 75000) rateSamples.shift();
+    var span = (rateSamples[rateSamples.length - 1].t - rateSamples[0].t) / 1000;
+    var liveRate = span >= 10 ? (rateSamples[rateSamples.length - 1].d - rateSamples[0].d) / span : null;
     var multiPod = stats.cluster && stats.cluster.pods > 1;
-    var effRate = multiPod && stats.status === 'running' ? stats.cluster.docsPerSecond : stats.docsPerSecond;
-    if (stats.totalRowsInserted === 0 && stats.status !== 'running' && !(stats.cluster && stats.cluster.docsPerSecond > 0)) {
-      dpsEl.textContent = '\u2013';
+    var effRate = liveRate !== null ? liveRate
+                : multiPod && stats.status === 'running' ? stats.cluster.docsPerSecond
+                : stats.docsPerSecond;
+    if (stats.status === 'completed') {
+      // a pod restarted after completion migrated nothing itself — its
+      // local average is 0 and would read as an anomaly
+      dpsEl.textContent = stats.docsPerSecond >= 1 ? fmt(stats.docsPerSecond) + ' avg' : '\u2013';
+    } else if (liveRate !== null) {
+      dpsEl.textContent = fmt(Math.round(liveRate)) + ' \u00b7 60s' + (multiPod ? ' \u00b7 ' + stats.cluster.pods + ' pods' : '');
+    } else if (stats.status === 'running') {
+      dpsEl.textContent = 'measuring\u2026';
     } else {
-      dpsEl.textContent = fmt(effRate) +
-        (stats.status === 'completed' ? ' avg' : (multiPod ? ' \u00b7 ' + stats.cluster.pods + ' pods' : ''));
+      dpsEl.textContent = '\u2013';
     }
     document.getElementById('s-skipped').textContent = fmt(stats.totalDocsSkipped);
     // ledger truth, not this pod's counter — in multi-pod each pod only
@@ -734,6 +752,33 @@ async function tick() {
     document.getElementById('s-eta').textContent =
       stats.status === 'completed' ? 'done' :
       (effRate > 0 && etaDocs > 0 ? Math.max(1, Math.round(etaDocs / effRate / 60)) + ' min' : '–');
+
+    var rt = stats.runTimes || {};
+    var rtEl = document.getElementById('run-times');
+    if (rt.startedAtMs) {
+      var endMs = rt.completedAtMs || Date.now();
+      var mins = Math.max(1, Math.round((endMs - rt.startedAtMs) / 60000));
+      var dur = mins >= 60 ? Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm' : mins + 'm';
+      rtEl.textContent = 'started ' + new Date(rt.startedAtMs).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' +
+        (rt.completedAtMs
+          ? ' \u00b7 finished ' + new Date(rt.completedAtMs).toISOString().slice(0, 16).replace('T', ' ') + ' UTC \u00b7 total ' + dur
+          : ' \u00b7 running for ' + dur);
+    } else { rtEl.textContent = ''; }
+
+    var isPaused = stats.status === 'paused';
+    var hint = document.getElementById('pause-hint');
+    if (isPaused) {
+      hint.style.display = '';
+      hint.textContent = '\u23f8 ENGINE PAUSED' +
+        (stats.pauseReason === 'breaker-transient' ? ' (backend outage \u2014 auto-resume armed)' :
+         stats.pauseReason === 'breaker-data' ? ' (systematic data problem \u2014 needs you)' : ' (by operator)') +
+        ' \u2014 Retry / Replay / Waive only QUEUE work; click Resume to process it.';
+    } else { hint.style.display = 'none'; }
+    var pb = document.getElementById('btn-pause'), rb = document.getElementById('btn-resume');
+    if (pb && rb) {
+      pb.classList.toggle('primary', !isPaused && stats.status === 'running');
+      rb.classList.toggle('primary', isPaused);
+    }
 
     const st = document.getElementById('b-status');
     st.textContent = stats.status +
@@ -771,10 +816,22 @@ async function tick() {
     // showed a collection with one listed (failed) chunk as 1/1 = 100%
     // failed while its thousands of done chunks were invisible.
     const collDiv = document.getElementById('collections');
-    collDiv.innerHTML = (sum.perCollection || []).map(pc => {
+    // fully-migrated collections collapse to ONE summary line — at 2,400
+    // collections the finished ones buried the actionable panels below
+    var pcs = (sum.perCollection || []).filter(pc => {
+      const st2 = pc.byStatus || {};
+      return Object.entries(st2).reduce((s2, kv) => s2 + (kv[0] === 'superseded' ? 0 : kv[1]), 0) > 0;
+    });
+    var openPcs = [], donePcs = 0;
+    for (const pc of pcs) {
       const st2 = pc.byStatus || {};
       const total = Object.entries(st2).reduce((s2, kv) => s2 + (kv[0] === 'superseded' ? 0 : kv[1]), 0);
-      if (total === 0) return '';
+      const d = st2.done || 0, f = st2.failed || 0;
+      if (d === total && f === 0) donePcs++; else openPcs.push(pc);
+    }
+    collDiv.innerHTML = openPcs.map(pc => {
+      const st2 = pc.byStatus || {};
+      const total = Object.entries(st2).reduce((s2, kv) => s2 + (kv[0] === 'superseded' ? 0 : kv[1]), 0);
       const d = st2.done || 0;
       const a = (st2.in_progress || 0) + (st2.written || 0) + (st2.attaching || 0);
       const f = st2.failed || 0;
@@ -785,7 +842,9 @@ async function tick() {
         '<div class="bar"><i class="done" style="width:' + (d / total * 100) + '%"></i>' +
         '<i class="active" style="width:' + (a / total * 100) + '%"></i>' +
         '<i class="failed" style="width:' + (f / total * 100) + '%"></i></div></div>';
-    }).join('') || '<div class="empty">Waiting for first chunk…</div>';
+    }).join('') +
+    (donePcs > 0 ? '<div class="collection" style="color:var(--green);font-weight:600;padding:6px 0">\u2713 ' + fmt(donePcs) + ' collection(s) fully migrated' + (openPcs.length === 0 ? ' \u2014 all done' : ' (hidden)') + '</div>' : '') ||
+    '<div class="empty">Waiting for first chunk…</div>';
 
     document.getElementById('grid').innerHTML =
       (chunkResp.truncated
@@ -810,6 +869,14 @@ async function tick() {
 
 let dlqOffset = 0;
 function dlqPage(delta) { dlqOffset = Math.max(0, dlqOffset + delta); slowTick(); }
+
+var rateSamples = [];
+// billions overflowed the stat card; compact display, full number on hover
+function setBigStat(id, n) {
+  var el = document.getElementById(id);
+  if (n >= 1e9) { el.textContent = (n / 1e9).toFixed(2) + ' B'; el.title = fmt(n); }
+  else { el.textContent = fmt(n); el.title = ''; }
+}
 
 var SCENARIOS = [
   { id: 'switch', name: '1 \u00b7 Two clusters, no mirroring',
@@ -963,6 +1030,9 @@ async function slowTick() {
         '<span class="pill ' + k + '">' + k + ': ' + fmt(bs[k] || 0) + '</span>').join('') +
       (pending === 0 ? ' <span style="color:var(--green);font-size:12px;font-weight:600">ready for sign-off</span>'
                      : ' <span style="color:#A05A16;font-size:12px">sign-off requires pending = 0 (fix &amp; replay, or waive)</span>') +
+      ((dlq.topErrors || []).some(function(t) { return (t.error || '').indexOf('missing_uid') >= 0; })
+        ? '<div class="hint" style="margin-top:4px">skip:missing_uid = orphan docs of users deleted in the old system (the user record and its uid link are gone; the event doc remained). They cannot be attributed to anyone in either system \u2014 the standard call is <b>Waive</b>.</div>'
+        : '') +
       (dlq.storage && dlq.storage.dlqBytes > 0
         ? ' <span class="pill" style="background:var(--bg)">storage: ' + (dlq.storage.dlqBytes > 1e9 ? (dlq.storage.dlqBytes / 1e9).toFixed(1) + ' GB' : Math.max(1, Math.round(dlq.storage.dlqBytes / 1e6)) + ' MB') +
           (dlq.storage.diskFreePct !== null ? ' \u00b7 manifest-db disk ' + dlq.storage.diskFreePct + '% free' : '') + '</span>'

@@ -212,10 +212,12 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   });
   app.get('/stats', async () => {
     const stats = orchestrator.getStats();
-    const cluster = await ledger
-      .clusterRate(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId, 120)
-      .catch(() => null);
-    return { ...stats, cluster };
+    const runId = config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId;
+    const [cluster, runTimes] = await Promise.all([
+      ledger.clusterRate(runId, 120).catch(() => null),
+      ledger.getRunTimes(config.ledger.runId).catch(() => ({ startedAtMs: null, completedAtMs: null })),
+    ]);
+    return { ...stats, cluster, runTimes };
   });
   app.get('/report', async () => orchestrator.getReport());
   app.post('/control/pause', async () => { orchestrator.pause(); return { status: orchestrator.getStatus() }; });
