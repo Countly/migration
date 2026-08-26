@@ -480,6 +480,42 @@ export class LedgerStore {
     return this.client.db(this.dbName).collection('mig_run_config');
   }
 
+  /**
+   * Map-time document estimates: the FIXED denominator for progress. The
+   * live "to go" used to be re-estimated from moving averages and would
+   * fluctuate (even increase); freezing the total at mapping makes
+   * progress a true countdown. Top-up appends $inc by an exact delta count
+   * — the total growing then is honest (new data really arrived).
+   */
+  private est(): Collection<{ _id: string; run_id: string; collection: string; estimated: number }> {
+    if (!this.coll) throw new Error('LedgerStore not connected');
+    return this.client.db(this.dbName).collection('mig_collection_est');
+  }
+
+  async setCollectionEstimate(runId: string, collection: string, estimated: number): Promise<void> {
+    await this.est().updateOne(
+      { _id: `${runId}:${collection}` },
+      { $set: { run_id: runId, collection, estimated } },
+      { upsert: true },
+    );
+  }
+
+  async incCollectionEstimate(runId: string, collection: string, delta: number): Promise<void> {
+    await this.est().updateOne(
+      { _id: `${runId}:${collection}` },
+      { $inc: { estimated: delta }, $setOnInsert: { run_id: runId, collection } },
+      { upsert: true },
+    );
+  }
+
+  async sumEstimates(runId: string): Promise<number | null> {
+    const rows = await this.est().aggregate<{ total: number }>([
+      { $match: { run_id: runId } },
+      { $group: { _id: null, total: { $sum: '$estimated' } } },
+    ]).toArray();
+    return rows.length > 0 ? rows[0].total : null; // null = run mapped before this feature
+  }
+
   /** First-ever start and first full completion — the run's wall-clock story. */
   async markRunStarted(runId: string): Promise<void> {
     await this.rc().updateOne(

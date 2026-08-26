@@ -35,10 +35,11 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
     // Summary is O(collections); full chunk details only while they're small
     // enough to render (a 10TB run can have tens of thousands of chunks).
     const summary = await deps.ledger.summarize(runId());
+    const estTotal = await deps.ledger.sumEstimates(runId()).catch(() => null);
     const truncated = summary.total > 2_000;
     if (!truncated) {
       const chunks = await deps.ledger.listAll(runId());
-      return { runId: runId(), summary, chunks, truncated };
+      return { runId: runId(), summary, chunks, truncated, estTotal };
     }
     // Row-aligned window over the claim-order tape: the map's cursor stays
     // visually anchored and the view slides LINE BY LINE (field feedback:
@@ -55,7 +56,7 @@ export function registerLedgerVizRoutes(app: FastifyInstance, deps: LedgerVizDep
     const chunks = await deps.ledger.tapeSlice(runId(), start, COLS * ROWS_TOTAL);
     const failedChunks = await deps.ledger.listFailed(runId());
     return {
-      runId: runId(), summary, chunks, truncated,
+      runId: runId(), summary, chunks, truncated, estTotal,
       tape: { start, cols: COLS, total: summary.total, frontierId: frontier?._id ?? null },
       failedChunks,
     };
@@ -786,16 +787,31 @@ async function tick() {
     // The doc total for unread chunks is estimated (per-collection avg) —
     // hence the '~'. Chunks shown alongside as the exact bookkeeping.
     var prog = document.getElementById('run-progress');
-    var docsDoneN = sum.docsDone || 0;
-    var pct = stats.status === 'completed' ? 100
-            : (docsDoneN + etaDocs) > 0 ? Math.min(99.9, docsDoneN / (docsDoneN + etaDocs) * 100)
-            : null;
-    if (pct !== null && (docsDoneN > 0 || stats.status === 'completed')) {
+    // FROZEN denominator: the map-time total (exact delta added on top-up).
+    // Progress counts documents READ from the source (incl. skipped/DLQ'd,
+    // matching what MongoDB holds); "to go" = total - read only ever
+    // shrinks. Runs mapped before estimates existed fall back to the old
+    // moving estimate.
+    var readDone = sum.perCollection.reduce(function(s2, c2) { return s2 + (c2.doneDocsRead || 0); }, 0);
+    var estTotal = chunkResp.estTotal;
+    var pct = null, doneShow = 0, togoShow = 0;
+    if (stats.status === 'completed') {
+      pct = 100;
+    } else if (estTotal !== null && estTotal !== undefined && estTotal > 0) {
+      doneShow = readDone;
+      togoShow = Math.max(0, estTotal - readDone);
+      pct = Math.min(99.9, readDone / estTotal * 100);
+    } else if ((sum.docsDone || 0) + etaDocs > 0) {
+      doneShow = sum.docsDone || 0;
+      togoShow = etaDocs;
+      pct = Math.min(99.9, doneShow / (doneShow + togoShow) * 100);
+    }
+    if (pct !== null && (doneShow > 0 || stats.status === 'completed')) {
       prog.style.display = '';
       document.getElementById('run-progress-fill').style.width = pct.toFixed(1) + '%';
       document.getElementById('run-progress-text').textContent =
         (stats.status === 'completed' ? '100% \u2014 migration complete' :
-          '\u2248 ' + pct.toFixed(1) + '% of documents migrated (' + fmt(Math.round(docsDoneN)) + ' done, ~' + fmt(Math.round(etaDocs)) + ' to go)') +
+          '\u2248 ' + pct.toFixed(1) + '% \u2014 ' + fmt(Math.round(doneShow)) + ' of ~' + fmt(Math.round(doneShow + togoShow)) + ' source docs processed (' + fmt(Math.round(togoShow)) + ' to go)') +
         ' \u00b7 chunks: ' + fmt(done) + '/' + fmt(countable) + ' (' + (countable > 0 ? Math.round(done / countable * 100) : 0) + '%, exact)';
       document.title = (stats.status === 'completed' ? '\u2713 done' : pct.toFixed(0) + '%') + ' \u00b7 Countly Data Migration';
     } else {

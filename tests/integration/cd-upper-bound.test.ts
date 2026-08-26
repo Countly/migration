@@ -200,6 +200,11 @@ describe('cd upper bound (tee-mirror duplication guard)', () => {
     const res2 = await ch.query({ query: `SELECT count() AS c FROM ${DB}.drill_events`, format: 'JSONEachRow' });
     expect(Number((await res2.json<{ c: string }>())[0].c)).toBe(HIST);
 
+    // frozen progress denominator: the bound-clamped map counted the span
+    // EXACTLY, so the stored estimate equals the migrated history and the
+    // second run (which appended nothing) did not disturb it
+    expect(await ledger.sumEstimates(RUN)).toBe(HIST);
+
     // verify + source audit stay green with a growing source: post-bound
     // windows derived from the source show live=0 (pending), never defects
     const verify = await orchestrator.verifyMigration();

@@ -463,6 +463,9 @@ export class ChunkOrchestrator {
 
     const created = await ledger.initChunks(this.runId, collection, bounds, config.transform.version, defaults ? chScopeOf(defaults) : null);
     if (created > 0) {
+      if (!this.dryRun) {
+        await ledger.setCollectionEstimate(this.runId, collection, estimated).catch(() => {});
+      }
       log.info({ estimated, chunks: bounds.length, created, scoped: !!defaults, dryRun: this.dryRun }, 'Chunk list ready');
       return created;
     }
@@ -488,6 +491,9 @@ export class ChunkOrchestrator {
     const appended = await ledger.appendChunks(
       this.runId, collection, deltaBounds, hw.maxIdx + 1, config.transform.version, defaults ? chScopeOf(defaults) : null,
     );
+    if (appended > 0) {
+      await ledger.incCollectionEstimate(this.runId, collection, deltaCount).catch(() => {});
+    }
     log.info({ appended, deltaDocs: deltaCount, from: new Date(hw.maxUpperCd).toISOString(), to: new Date(upper.cd).toISOString() },
       'Top-up: delta chunks appended for data that arrived after mapping');
     return appended;
