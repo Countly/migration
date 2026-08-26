@@ -589,12 +589,21 @@ async function runAuditSource(btn) {
       await new Promise(r => setTimeout(r, 2000));
     }
     const mm = st.mismatchedWindows || [];
+    const cs = st.checksumMismatchWindows || [];
+    const drift = st.deletionDriftWindows || [];
     document.getElementById('audit-result').innerHTML = st.status === 'failed'
       ? '\u274c source audit failed: ' + esc(st.error)
-      : (mm.length === 0
-        ? '\u2705 <b>Source audit passed</b> \u2014 every window recounted directly against MongoDB matches the live table.'
-        : '<b style="color:#B71C1C">\u274c ' + mm.length + ' window(s) disagree with the source</b> \u2014 heal via Rebuild ledger from data (Help tab) then Retry failed chunks: ' +
-          esc(mm.slice(0, 3).map(w => w.collection.slice(0, 18) + ' [' + w.lowerCd.slice(0, 10) + '] src=' + w.source + ' live=' + w.live).join(' \u00b7 ')));
+      : (mm.length === 0 && cs.length === 0
+        ? '\u2705 <b>Source audit passed</b> \u2014 every window recounted AND cd-checksummed directly against MongoDB matches the live table.' +
+          (drift.length ? ' <span class="hint">(' + drift.length + ' window(s) show deletion drift \u2014 source shrank after migration: retention/GDPR, not a defect)</span>' : '')
+        : (mm.length
+            ? '<b style="color:#B71C1C">\u274c ' + mm.length + ' window(s) disagree with the source</b> \u2014 heal via Rebuild ledger from data (Help tab) then Retry failed chunks: ' +
+              esc(mm.slice(0, 3).map(w => w.collection.slice(0, 18) + ' [' + w.lowerCd.slice(0, 10) + '] src=' + w.source + ' live=' + w.live).join(' \u00b7 '))
+            : '') +
+          (cs.length
+            ? '<div><b style="color:#B71C1C">\u274c ' + cs.length + ' window(s) hold the RIGHT COUNT of the WRONG documents (cd-checksum mismatch)</b> \u2014 identity swap; heal via Rebuild + Retry: ' +
+              esc(cs.slice(0, 3).map(w => w.collection.slice(0, 18) + ' [' + w.lowerCd.slice(0, 10) + '] n=' + w.count + ' \u0394cd=' + w.sumDeltaMs + 'ms').join(' \u00b7 ')) + '</div>'
+            : ''));
   } catch (e) { toast('\u274c audit failed: ' + e.message); }
   btn.disabled = false; btn.textContent = btn.dataset.label;
 }

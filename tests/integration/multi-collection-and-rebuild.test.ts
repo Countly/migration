@@ -933,6 +933,55 @@ describe('multi-collection scoping + ledger rebuild', () => {
     await mc.db(DB).collection('mig_dlq_docs').deleteMany({ run_id: SK } as never);
   }, 120_000);
 
+  it('checksum audit: right COUNT of the wrong documents is caught (identity swap)', async () => {
+    const { rebuildLedger: rebuild, newRebuildProgress: newProgress } = await import('../../src/runtime/ledger-rebuild.ts');
+    const config2 = loadConfig();
+    const runCheck = async (): Promise<{ mm: number; cs: Array<{ collection: string; sumDeltaMs: number }> }> => {
+      const prog = newProgress();
+      await rebuild({ config: config2, logger, ledger, dlq: dlqStore, hashResolver, progress: prog, checkOnly: true });
+      return { mm: prog.mismatchedWindows.length, cs: prog.checksumMismatchWindows };
+    };
+    // baseline (earlier tests may have left benign identity noise — the
+    // assertion is the DELTA this test's own swap produces)
+    const base = await runCheck();
+
+    // identity swap inside one window: remove p_40, insert an impostor with
+    // cd shifted by 1ms — COUNT stays identical, the fingerprint must not
+    const cd40 = BASE + 40 * 60_000;
+    await staging.deleteLiveByPairs([{ id: 'p_40', cdMs: cd40 }]);
+    await ch.insert({
+      table: `${DB}.drill_events`,
+      values: [{
+        a: APP, e: '[CLY]_custom', n: EV1, uid: '0', did: 'd40', _id: 'impostor_40',
+        ts: new Date(cd40 + 1).toISOString().replace('T', ' ').replace('Z', ''),
+        cd: new Date(cd40 + 1).toISOString().replace('T', ' ').replace('Z', ''),
+        up: {}, sg: {}, c: 1, s: 0, dur: 0,
+      }],
+      format: 'JSONEachRow',
+    });
+
+    const swapped = await runCheck();
+    expect(swapped.mm).toBe(base.mm); // counts still agree — the old blind spot
+    expect(swapped.cs.length).toBe(base.cs.length + 1);
+    const mine = swapped.cs.find((w) => w.collection === COLL1 && Math.abs(w.sumDeltaMs) === 1);
+    expect(mine, JSON.stringify(swapped.cs)).toBeTruthy();
+
+    // restore the original row
+    await staging.deleteLiveByPairs([{ id: 'impostor_40', cdMs: cd40 + 1 }]);
+    await ch.insert({
+      table: `${DB}.drill_events`,
+      values: [{
+        a: APP, e: '[CLY]_custom', n: EV1, uid: '0', did: 'd40', _id: 'p_40',
+        ts: new Date(cd40).toISOString().replace('T', ' ').replace('Z', ''),
+        cd: new Date(cd40).toISOString().replace('T', ' ').replace('Z', ''),
+        up: {}, sg: { v: 40 }, c: 1, s: 0, dur: 0,
+      }],
+      format: 'JSONEachRow',
+    });
+    const restored = await runCheck();
+    expect(restored.cs.length).toBe(base.cs.length);
+  }, 120_000);
+
   it('reclaim: two recoverers race an expired chunk — exactly one wins', async () => {
     const RR = 'reclaim-race-run';
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: RR } as never);

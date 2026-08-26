@@ -60,6 +60,8 @@ export interface RebuildProgress {
   mismatchedWindows: Array<{ collection: string; lowerCd: string; upperCd: string; source: number; live: number }>;
   /** live > source: docs deleted from Mongo after migration (retention TTL, GDPR) — drift, not a defect. */
   deletionDriftWindows: Array<{ collection: string; lowerCd: string; upperCd: string; source: number; live: number }>;
+  /** counts MATCH but the cd-sum fingerprint differs: same number of docs, WRONG docs (identity swap). */
+  checksumMismatchWindows: Array<{ collection: string; lowerCd: string; upperCd: string; count: number; sumDeltaMs: number }>;
   error: string | null;
   startedAt: number | null;
   finishedAt: number | null;
@@ -68,7 +70,7 @@ export interface RebuildProgress {
 export function newRebuildProgress(): RebuildProgress {
   return {
     status: 'not_run', phase: '', collectionsDone: 0, collectionsTotal: 0,
-    summary: [], mismatchedWindows: [], deletionDriftWindows: [], error: null, startedAt: null, finishedAt: null,
+    summary: [], mismatchedWindows: [], deletionDriftWindows: [], checksumMismatchWindows: [], error: null, startedAt: null, finishedAt: null,
   };
 }
 
@@ -175,16 +177,24 @@ export async function rebuildLedger(opts: {
       let idx = 0;
       for (const b of bounds) {
         progress.phase = `counting ${collection} chunk ${idx + 1}/${bounds.length}`;
-        const mongoCount = await coll.countDocuments({
-          cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) },
-        });
-        const liveRaw = await staging.countLiveInCdRange(b.lowerCd, b.upperCd, scope);
+        // count + cd-sum in one index-covered pass: the sum is an order-free
+        // fingerprint of WHICH docs the window holds, not just how many
+        const [mongoAgg] = await coll.aggregate<{ n: number; sumCd: number }>([
+          { $match: { cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } } },
+          { $group: { _id: null, n: { $sum: 1 }, sumCd: { $sum: { $mod: [{ $toLong: '$cd' }, 4294967296] } } } },
+        ]).toArray();
+        const mongoCount = mongoAgg?.n ?? 0;
+        const mongoSumCd = mongoAgg?.sumCd ?? 0;
+        const liveAgg = await staging.countAndSumLiveCdRange(b.lowerCd, b.upperCd, scope);
+        const liveRaw = liveAgg.n;
         // Subtract this collection's sweep rows whose derived cd fell in-window
         let lo = 0, hi = sweptCds.length;
         while (lo < hi) { const m = (lo + hi) >> 1; if (sweptCds[m] < b.lowerCd) lo = m + 1; else hi = m; }
         let sweptIn = 0;
-        for (let i = lo; i < sweptCds.length && sweptCds[i] < b.upperCd; i++) sweptIn++;
+        let sweptSum = 0;
+        for (let i = lo; i < sweptCds.length && sweptCds[i] < b.upperCd; i++) { sweptIn++; sweptSum += sweptCds[i] % 4294967296; } // same mod as both fingerprints
         const live = liveRaw - sweptIn;
+        const liveSumCd = liveAgg.sumCd - sweptSum;
 
         // Docs in this window that are KNOWN unmigrated (pending/waived DLQ)
         // legitimately explain source > live — without this, a window whose
@@ -212,6 +222,17 @@ export async function rebuildLedger(opts: {
               source: mongoCount, live,
             });
           }
+        }
+        // Checksum: only meaningful on windows that are count-exact with no
+        // DLQ residue — equal counts hiding DIFFERENT docs is the one error
+        // class pure counting cannot see. Number-safety: cd sums stay well
+        // under 2^53 for any window a chunk target allows.
+        if (checkOnly && !unscopableInMulti && unresolved === 0 && live === mongoCount && live > 0
+            && liveSumCd !== mongoSumCd && progress.checksumMismatchWindows.length < 200) {
+          progress.checksumMismatchWindows.push({
+            collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
+            count: mongoCount, sumDeltaMs: liveSumCd - mongoSumCd,
+          });
         }
         summary.mongoDocs += mongoCount;
         summary.liveRows += live;
@@ -268,7 +289,7 @@ export async function rebuildLedger(opts: {
     if (checkOnly) {
       progress.phase = 'done';
       logger.info(
-        { windows: allDocs.length, mismatches: progress.mismatchedWindows.length, deletionDrift: progress.deletionDriftWindows.length },
+        { windows: allDocs.length, mismatches: progress.mismatchedWindows.length, deletionDrift: progress.deletionDriftWindows.length, checksumMismatches: progress.checksumMismatchWindows.length },
         'Source audit complete — ledger untouched',
       );
     } else {

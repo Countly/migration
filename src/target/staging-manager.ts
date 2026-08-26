@@ -522,16 +522,29 @@ export class StagingManager {
 
   /** Grouped verification: rows in the live table within given cd bounds. */
   async countLiveInCdRange(lowerCdMs: number, upperCdMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
+    return (await this.countAndSumLiveCdRange(lowerCdMs, upperCdMs, scope)).n;
+  }
+
+  /**
+   * Count + cd-checksum in one pass: sum of cd epoch-ms is an order-free
+   * fingerprint of WHICH documents a window holds. Two windows with equal
+   * counts but different document sets (N missing + N extra) match on
+   * count and mismatch on the sum — the blind spot counts alone leave.
+   * Summed MOD 2^32 per row (identically on both sides) so a multi-million
+   * -doc window stays exactly representable in a JS number — raw ms sums
+   * would exceed 2^53 and compare as mangled doubles.
+   */
+  async countAndSumLiveCdRange(lowerCdMs: number, upperCdMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<{ n: number; sumCd: number }> {
     const res = await this.ch().query({
-      query: `SELECT count() AS c FROM ${this.fq(this.config.table)}
+      query: `SELECT count() AS c, sum(toUnixTimestamp64Milli(cd) % 4294967296) AS s FROM ${this.fq(this.config.table)}
               WHERE cd >= fromUnixTimestamp64Milli({lo:Int64})
                 AND cd <  fromUnixTimestamp64Milli({hi:Int64})
                 ${this.scopeSql(scope)}`,
       query_params: { lo: lowerCdMs, hi: upperCdMs, ...this.scopeParams(scope) },
       format: 'JSONEachRow',
     });
-    const rows = await res.json<{ c: string }>();
-    return Number(rows[0]?.c ?? 0);
+    const rows = await res.json<{ c: string; s: string }>();
+    return { n: Number(rows[0]?.c ?? 0), sumCd: Number(rows[0]?.s ?? 0) };
   }
 
   /**
