@@ -210,6 +210,87 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       ? { status: 'error', engine: 'ledger', error: stats.fatalError }
       : { status: 'ok', engine: 'ledger' };
   });
+  // ── SSH-first monitoring ────────────────────────────────────────────
+  // 1) progress heartbeat: one structured log line per minute — visible via
+  //    `kubectl logs -f` / `docker logs` with no network access, and flows
+  //    into any log pipeline (the new-arch stack ships alloy → Loki).
+  // 2) /status.txt: the dashboard as plain text — `watch -n5 curl -s
+  //    localhost:8080/status.txt` over ssh IS the dashboard.
+  const runIdEff = (): string => config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId;
+  const hb = { t: Date.now(), docs: -1, rate: null as number | null, completedLogged: false };
+  const collectProgress = async (): Promise<Record<string, unknown>> => {
+    const sum = await ledger.summarize(runIdEff());
+    const read = sum.perCollection.reduce((s, c) => s + (c.doneDocsRead || 0), 0);
+    const est = await ledger.sumEstimates(runIdEff()).catch(() => null);
+    const stats = orchestrator.getStats();
+    const dlqCounts = await dlq.countByStatus(runIdEff()).catch(() => ({} as Record<string, number>));
+    const times = await ledger.getRunTimes(config.ledger.runId).catch(() => ({ startedAtMs: null, completedAtMs: null }));
+    const bs = sum.byStatus as Record<string, number>;
+    const countable = sum.total - (bs.superseded ?? 0);
+    return {
+      status: stats.status, pauseReason: stats.pauseReason,
+      docsRead: read, docsTotalEst: est,
+      pct: est && est > 0 ? Math.min(99.9, Math.round(read / est * 1000) / 10) : null,
+      chunksDone: bs.done ?? 0, chunksTotal: countable, failed: bs.failed ?? 0,
+      dlqPending: dlqCounts.pending ?? 0, dlqWaived: dlqCounts.waived ?? 0,
+      skipped: stats.totalDocsSkipped, coercions: stats.totalCoercions,
+      cdUpperBoundMs: config.ledger.cdUpperBoundMs,
+      startedAtMs: times.startedAtMs, completedAtMs: times.completedAtMs,
+      docsPerSecond: hb.rate,
+    };
+  };
+  const heartbeatTimer = setInterval(async () => {
+    try {
+      const p = await collectProgress();
+      const read = p.docsRead as number;
+      const now = Date.now();
+      if (hb.docs >= 0) hb.rate = Math.max(0, Math.round((read - hb.docs) / ((now - hb.t) / 1000)));
+      hb.t = now; hb.docs = read;
+      p.docsPerSecond = hb.rate;
+      if (p.status === 'completed') {
+        if (!hb.completedLogged) { hb.completedLogged = true; logger.info({ progress: p }, 'migration progress heartbeat (final)'); }
+        return;
+      }
+      hb.completedLogged = false;
+      logger.info({ progress: p }, 'migration progress heartbeat');
+    } catch { /* heartbeat must never hurt the run */ }
+  }, 60_000);
+  heartbeatTimer.unref?.();
+
+  app.get('/status.txt', async (_req, reply) => {
+    const p = await collectProgress();
+    const pods = await ledger.podActivity(runIdEff()).catch(() => []);
+    const w = 36;
+    const pctN = (p.pct as number | null);
+    const filled = pctN !== null ? Math.round((p.status === 'completed' ? 100 : pctN) / 100 * w) : 0;
+    const bar = '#'.repeat(filled) + '.'.repeat(w - filled);
+    const num = (n: unknown): string => Number(n ?? 0).toLocaleString('en-US');
+    const iso = (ms: unknown): string => ms ? new Date(ms as number).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '?';
+    const mins = p.startedAtMs ? Math.max(1, Math.round((((p.completedAtMs as number) || Date.now()) - (p.startedAtMs as number)) / 60000)) : 0;
+    const dur = mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`;
+    const rate = p.docsPerSecond as number | null;
+    const togo = p.docsTotalEst !== null ? Math.max(0, (p.docsTotalEst as number) - (p.docsRead as number)) : null;
+    const eta = rate && rate > 0 && togo !== null ? `~${Math.max(1, Math.round(togo / rate / 60))} min` : '-';
+    const lines = [
+      `Countly Data Migration - run ${config.ledger.runId} [${String(p.status).toUpperCase()}${p.pauseReason ? ': ' + p.pauseReason : ''}]`,
+      `[${bar}] ${p.status === 'completed' ? '100' : pctN !== null ? pctN.toFixed(1) : '?'}%`,
+      `docs:    ${num(p.docsRead)}${p.docsTotalEst !== null ? ` / ~${num(p.docsTotalEst)} (${togo !== null ? num(togo) : '?'} to go)` : ''}`,
+      `rate:    ${p.status === 'completed' ? '-' : rate !== null ? num(rate) + ' docs/s' : 'measuring (first minute)'}    eta: ${p.status === 'completed' ? 'done' : eta}`,
+      `chunks:  ${num(p.chunksDone)} / ${num(p.chunksTotal)}    failed: ${num(p.failed)}    skipped: ${num(p.skipped)}    coercions: ${num(p.coercions)}`,
+      `dlq:     pending ${num(p.dlqPending)} / waived ${num(p.dlqWaived)}${(p.dlqPending as number) > 0 ? '   <- sign-off needs pending = 0 (replay or waive)' : ''}`,
+      `time:    started ${iso(p.startedAtMs)}${p.completedAtMs ? ` - finished ${iso(p.completedAtMs)} - total ${dur}` : p.startedAtMs ? ` - running for ${dur}` : ''}`,
+    ];
+    if (p.cdUpperBoundMs) lines.push(`bound:   cd < ${iso(p.cdUpperBoundMs)} (tee-mirror mode: post-flip data belongs to the mirror)`);
+    if (p.status === 'paused') lines.push(`PAUSED:  retry/replay/waive only QUEUE work - POST /control/resume to process (see RUNBOOK curl cookbook)`);
+    if (pods.length > 0) {
+      lines.push('pods:    ' + pods.map((row) => {
+        const ago = row.lastSeen ? Math.round((Date.now() - new Date(row.lastSeen).getTime()) / 1000) : null;
+        return `${row.pod} (${row.done} chunks${ago !== null ? `, seen ${ago}s ago` : ''})`;
+      }).join(' | '));
+    }
+    reply.type('text/plain; charset=utf-8').send(lines.join('\n') + '\n');
+  });
+
   app.get('/stats', async () => {
     const stats = orchestrator.getStats();
     const runId = config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId;

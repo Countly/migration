@@ -176,3 +176,51 @@ Chunks that were 100% such docs complete as done (structured skips do not
 trip the fail-rate breaker); the mass-DLQ pause that fires when millions
 of them accumulate is the built-in "stop and decide" moment — after
 waiving, click Resume.
+
+## SSH-only operation (no browser access to the dashboard port)
+
+Everything the dashboard shows and does is plain HTTP on the pod
+(default SERVICE_PORT 8080). Three tools:
+
+**1. Live status in the terminal** (the dashboard as text):
+```
+watch -n 5 'curl -s localhost:8080/status.txt'
+```
+
+**2. Progress heartbeat in the logs** — one structured line per minute
+(`migration progress heartbeat`: docs read/total/%, docs/s, chunks,
+failed, DLQ, status + pause reason). No network access needed:
+```
+kubectl logs -f deploy/drill-migrator | grep 'progress heartbeat'
+docker logs -f drill-migrator-p1 2>&1 | grep 'progress heartbeat'
+```
+These lines also flow into the stack's log pipeline (alloy → Loki), so
+Grafana log panels/alerts work with zero extra plumbing.
+
+**3. Actions via curl** (same endpoints the buttons call; POSTs need the
+JSON content type):
+```
+# state
+curl -s localhost:8080/status.txt                 # human snapshot
+curl -s localhost:8080/stats                      # full JSON (incl. cluster rate, run times)
+curl -s localhost:8080/api/pods                   # pod table
+curl -s localhost:8080/report                     # skips, coercions, DLQ summary
+
+# control
+curl -s -X POST localhost:8080/control/pause         -H 'content-type: application/json' -d '{}'
+curl -s -X POST localhost:8080/control/resume        -H 'content-type: application/json' -d '{}'
+curl -s -X POST localhost:8080/control/retry-failed  -H 'content-type: application/json' -d '{}'
+curl -s -X POST localhost:8080/control/replay-dlq    -H 'content-type: application/json' -d '{}'   # progress: /api/replay
+curl -s -X POST localhost:8080/control/waive-dlq     -H 'content-type: application/json' -d '{}'   # ALL pending; or {"ids":[...]}
+
+# sign-off checks (background tasks: POST to start, GET to poll)
+curl -s -X POST localhost:8080/control/verify        -H 'content-type: application/json' -d '{}'; curl -s localhost:8080/api/verify
+curl -s -X POST localhost:8080/control/audit-source  -H 'content-type: application/json' -d '{}'; curl -s localhost:8080/api/audit-source
+curl -s -X POST localhost:8080/control/audit-content -H 'content-type: application/json' -d '{}'; curl -s localhost:8080/api/audit-content
+
+# tee-mirror cutovers
+curl -s -X POST localhost:8080/control/detect-boundary -H 'content-type: application/json' -d '{}'; curl -s localhost:8080/api/boundary
+curl -s -X POST localhost:8080/control/apply-bound     -H 'content-type: application/json' -d '{"boundMs": 1787561650562}'
+```
+Reminder: retry/replay/waive only QUEUE work while the engine is paused —
+finish with `/control/resume`. Any pod answers; state is shared.

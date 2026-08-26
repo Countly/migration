@@ -743,10 +743,24 @@ async function tick() {
     // The lifetime average was "super confusing" in the field — it mixes
     // hours of history into a number that never reflects what is happening
     // right now.
+    // ADAPTIVE window: the ledger only learns work at chunk completion, so
+    // a fixed 60s window strobes with big chunks (0 docs/s, then a spike —
+    // field report at 4 pods). Keep 10 min of samples and measure over the
+    // shortest span containing >=3 completion events; always NORMALIZED to
+    // per-second and shown without a window label (the label read as "is
+    // it per 60s?" — the header already says DOCS / SECOND).
     rateSamples.push({ t: Date.now(), d: sum.docsDone || 0 });
-    while (rateSamples.length > 2 && rateSamples[0].t < Date.now() - 75000) rateSamples.shift();
-    var span = (rateSamples[rateSamples.length - 1].t - rateSamples[0].t) / 1000;
-    var liveRate = span >= 10 ? (rateSamples[rateSamples.length - 1].d - rateSamples[0].d) / span : null;
+    while (rateSamples.length > 2 && rateSamples[0].t < Date.now() - 600000) rateSamples.shift();
+    var last = rateSamples[rateSamples.length - 1];
+    var windowStart = rateSamples[0];
+    var changes = 0;
+    for (var ri = rateSamples.length - 2; ri >= 0; ri--) {
+      if (rateSamples[ri].d !== rateSamples[ri + 1].d) changes++;
+      windowStart = rateSamples[ri];
+      if (changes >= 3 && (last.t - windowStart.t) >= 10000) break;
+    }
+    var rspan = (last.t - windowStart.t) / 1000;
+    var liveRate = rspan >= 10 ? Math.max(0, (last.d - windowStart.d) / rspan) : null;
     var multiPod = stats.cluster && stats.cluster.pods > 1;
     var effRate = liveRate !== null ? liveRate
                 : multiPod && stats.status === 'running' ? stats.cluster.docsPerSecond
@@ -756,7 +770,7 @@ async function tick() {
       // local average is 0 and would read as an anomaly
       dpsEl.textContent = stats.docsPerSecond >= 1 ? fmt(stats.docsPerSecond) + ' avg' : '\u2013';
     } else if (liveRate !== null) {
-      dpsEl.textContent = fmt(Math.round(liveRate)) + ' \u00b7 60s' + (multiPod ? ' \u00b7 ' + stats.cluster.pods + ' pods' : '');
+      dpsEl.textContent = fmt(Math.round(liveRate)) + (multiPod ? ' \u00b7 ' + stats.cluster.pods + ' pods' : '');
     } else if (stats.status === 'running') {
       dpsEl.textContent = 'measuring\u2026';
     } else {
