@@ -1,0 +1,1133 @@
+{
+  "description": "Input corpus for the ingestion-matching transformer differential harness (drill migration overhaul item D4, Countly/migration#6). Each entry's doc is a MongoDB drill event document as the Node driver (default options) would deliver it. Values plain JSON cannot express use {\"$$t\": ...} wrappers decoded by decode.mjs. This file must stay byte-identical between countly-platform test/unit/fixtures/drill-transform-differential/ and Countly/migration tests/differential/.",
+  "baseline": "ts=1704067200000 (2024-01-01 00:00:00.000 UTC), cd=1704067205000",
+  "entries": [
+    {
+      "id": "custom-event-full",
+      "group": "known-events",
+      "notes": "New-format custom event exactly as processToDrill writes it, all fields populated.",
+      "doc": {
+        "_id": "req1hash_u1_1704067200000_0",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_custom",
+        "n": "purchase",
+        "uid": "u1",
+        "_uid": "6543ab",
+        "did": "device-001",
+        "lsid": "lsid-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "lu": { "$$t": "date", "ms": 1703980800000 },
+        "c": 2,
+        "s": 19.99,
+        "dur": 3.5,
+        "up": { "cc": "US", "p": "iOS", "av": "2.1.0", "hour": 14, "dow": 1 },
+        "custom": { "tier": "premium", "beta": "true" },
+        "cmp": { "c": "Organic" },
+        "sg": { "item": "sku-123", "qty": 2, "price": 9.995, "gift": false }
+      }
+    },
+    {
+      "id": "view-visit",
+      "group": "known-events",
+      "notes": "New-format [CLY]_view with visit=1; processToDrill sets n to the event key, not sg.name.",
+      "doc": {
+        "_id": "5f1c_u1_view1",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_view",
+        "n": "[CLY]_view",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "s": 0,
+        "dur": 0,
+        "up": { "p": "Android" },
+        "sg": { "name": "Home", "visit": 1, "start": 1, "segment": "Android" }
+      }
+    },
+    {
+      "id": "view-update",
+      "group": "known-events",
+      "notes": "[CLY]_view_update carries duration; not in the derivation switch on either side.",
+      "doc": {
+        "_id": "5f1c_u1_view1_up",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_view_update",
+        "n": "[CLY]_view_update",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067201000,
+        "cd": { "$$t": "date", "ms": 1704067206000 },
+        "c": 1,
+        "s": 0,
+        "dur": 12.5,
+        "up": { "p": "Android" },
+        "sg": { "name": "Home", "exit": 1, "bounce": 1 }
+      }
+    },
+    {
+      "id": "action-event",
+      "group": "known-events",
+      "notes": "New-format [CLY]_action with n already set by ingestion.",
+      "doc": {
+        "_id": "req2_u1_1704067202000_0",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_action",
+        "n": "[CLY]_action",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067202000,
+        "cd": { "$$t": "date", "ms": 1704067207000 },
+        "c": 1,
+        "s": 0,
+        "dur": 0,
+        "up": { "p": "web" },
+        "sg": { "type": "click", "x": 100, "y": 250, "view": "/home", "width": 1920, "height": 1080 }
+      }
+    },
+    {
+      "id": "nps-event",
+      "group": "known-events",
+      "notes": "New-format [CLY]_nps.",
+      "doc": {
+        "_id": "req3_u1_1704067203000_0",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_nps",
+        "n": "[CLY]_nps",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067203000,
+        "cd": { "$$t": "date", "ms": 1704067208000 },
+        "c": 1,
+        "s": 0,
+        "dur": 0,
+        "up": {},
+        "sg": { "widget_id": "64f0aa11bb22cc33dd44ee55", "rating": 9, "comment": "great app" }
+      }
+    },
+    {
+      "id": "survey-event",
+      "group": "known-events",
+      "notes": "New-format [CLY]_survey.",
+      "doc": {
+        "_id": "req4_u1_1704067204000_0",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_survey",
+        "n": "[CLY]_survey",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067204000,
+        "cd": { "$$t": "date", "ms": 1704067209000 },
+        "c": 1,
+        "s": 0,
+        "dur": 0,
+        "up": {},
+        "sg": { "widget_id": "64f0aa11bb22cc33dd44ee66", "answers": { "q1": "yes", "q2": "no" } }
+      }
+    },
+    {
+      "id": "star-rating-event",
+      "group": "known-events",
+      "notes": "New-format [CLY]_star_rating.",
+      "doc": {
+        "_id": "req5_u1_1704067205000_0",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_star_rating",
+        "n": "[CLY]_star_rating",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067205000,
+        "cd": { "$$t": "date", "ms": 1704067210000 },
+        "c": 1,
+        "s": 0,
+        "dur": 0,
+        "up": {},
+        "sg": { "widget_id": "64f0aa11bb22cc33dd44ee77", "rating": 5, "platform": "iOS", "app_version": "2.1.0" }
+      }
+    },
+    {
+      "id": "crash-event",
+      "group": "known-events",
+      "notes": "New-format [CLY]_crash.",
+      "doc": {
+        "_id": "req6_u1_1704067206000_0",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_crash",
+        "n": "[CLY]_crash",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067206000,
+        "cd": { "$$t": "date", "ms": 1704067211000 },
+        "c": 1,
+        "s": 0,
+        "dur": 0,
+        "up": { "p": "Android" },
+        "sg": { "group": "8f7a6b5c4d3e2f1a", "nonfatal": false, "os": "Android 14" }
+      }
+    },
+    {
+      "id": "session-event",
+      "group": "known-events",
+      "notes": "New-format [CLY]_session; _id is the request id.",
+      "doc": {
+        "_id": "req7requestid",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_session",
+        "n": "[CLY]_session",
+        "uid": "u1",
+        "did": "device-001",
+        "lsid": "lsid-002",
+        "ts": 1704067207000,
+        "cd": { "$$t": "date", "ms": 1704067212000 },
+        "c": 1,
+        "s": 0,
+        "dur": 0,
+        "up": { "cc": "DE", "p": "iOS" }
+      }
+    },
+    {
+      "id": "consent-event-extra-fields",
+      "group": "known-events",
+      "notes": "Non-schema doc fields (after/cvid/pvid/id/peid/_uid/up_extra) must not leak into the row.",
+      "doc": {
+        "_id": "req8_u1_1704067208000_0",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_consent",
+        "n": "[CLY]_consent",
+        "uid": "u1",
+        "_uid": "6543ab",
+        "did": "device-001",
+        "ts": 1704067208000,
+        "cd": { "$$t": "date", "ms": 1704067213000 },
+        "c": 1,
+        "s": 0,
+        "dur": 0,
+        "up": {},
+        "sg": { "change": "{\"sessions\":true}" },
+        "after": { "sessions": true },
+        "cvid": "view-1",
+        "pvid": "view-0",
+        "id": "evt-1",
+        "peid": "parent-1",
+        "up_extra": { "seg": "beta" }
+      }
+    },
+    {
+      "id": "legacy-custom-event",
+      "group": "legacy-events",
+      "notes": "Legacy doc: raw event name in e, no n. Must become e=[CLY]_custom, n=<raw name>.",
+      "doc": {
+        "_id": "656565656565656565656565",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "s": 5.5,
+        "up": { "cc": "US" },
+        "sg": { "item": "sku-9" }
+      }
+    },
+    {
+      "id": "legacy-view-derive-n",
+      "group": "legacy-events",
+      "notes": "Legacy [CLY]_view without n: n derived from sg.name.",
+      "doc": {
+        "_id": "656565656565656565656566",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_view",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "name": "Main Menu", "visit": 1 }
+      }
+    },
+    {
+      "id": "legacy-action-view-fallback",
+      "group": "legacy-events",
+      "notes": "Legacy [CLY]_action with blank sg.name: n falls back to sg.view.",
+      "doc": {
+        "_id": "656565656565656565656567",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_action",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "name": "   ", "view": "/cart", "type": "click" }
+      }
+    },
+    {
+      "id": "legacy-nps-widget-id",
+      "group": "legacy-events",
+      "notes": "Legacy [CLY]_nps without n: n derived from sg.widget_id.",
+      "doc": {
+        "_id": "656565656565656565656568",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_nps",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "widget_id": "64f0aa11bb22cc33dd44ee88", "rating": 3 }
+      }
+    },
+    {
+      "id": "legacy-star-rating-no-sg",
+      "group": "legacy-events",
+      "notes": "Legacy [CLY]_star_rating with no sg at all: n falls back to e.",
+      "doc": {
+        "_id": "656565656565656565656569",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_star_rating",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "legacy-crash-group",
+      "group": "legacy-events",
+      "notes": "Legacy [CLY]_crash without n: n derived from sg.group.",
+      "doc": {
+        "_id": "65656565656565656565656a",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_crash",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "group": "deadbeefcafe0123", "nonfatal": true }
+      }
+    },
+    {
+      "id": "legacy-session-no-n",
+      "group": "legacy-events",
+      "notes": "Legacy [CLY]_session without n: default branch, n falls back to e.",
+      "doc": {
+        "_id": "65656565656565656565656b",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_session",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "s": 0,
+        "dur": 42
+      }
+    },
+    {
+      "id": "legacy-unknown-internal-event",
+      "group": "legacy-events",
+      "notes": "Internal event not in the derivation switch ([CLY]_push_action): n falls back to e.",
+      "doc": {
+        "_id": "65656565656565656565656c",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_push_action",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "i": "message-1", "b": 0 }
+      }
+    },
+    {
+      "id": "n-preservation-view",
+      "group": "legacy-events",
+      "notes": "Dedup-parity rule: when the doc already has non-blank n, it wins over sg-derived n. A [CLY]_view doc with n=[CLY]_view and sg.name=Other must keep n=[CLY]_view, matching the live-ingested row.",
+      "doc": {
+        "_id": "65656565656565656565656d",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "[CLY]_view",
+        "n": "[CLY]_view",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "name": "Other", "visit": 1 }
+      }
+    },
+    {
+      "id": "missing-a",
+      "group": "required-fields",
+      "notes": "No a and no collection defaults: skip.",
+      "doc": {
+        "_id": "65656565656565656565656e",
+        "e": "purchase",
+        "uid": "u1",
+        "ts": 1704067200000
+      }
+    },
+    {
+      "id": "blank-a",
+      "group": "required-fields",
+      "notes": "Whitespace-only a is blank: skip.",
+      "doc": {
+        "_id": "65656565656565656565656f",
+        "a": "   ",
+        "e": "purchase",
+        "uid": "u1",
+        "ts": 1704067200000
+      }
+    },
+    {
+      "id": "numeric-a",
+      "group": "required-fields",
+      "notes": "Numeric a must be stringified for the LowCardinality(String) column.",
+      "doc": {
+        "_id": "656565656565656565656570",
+        "a": 12345,
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "missing-e",
+      "group": "required-fields",
+      "notes": "No e and no collection defaults: skip.",
+      "doc": {
+        "_id": "656565656565656565656571",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "uid": "u1",
+        "ts": 1704067200000
+      }
+    },
+    {
+      "id": "blank-e",
+      "group": "required-fields",
+      "notes": "Empty-string e is blank: skip.",
+      "doc": {
+        "_id": "656565656565656565656572",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "",
+        "uid": "u1",
+        "ts": 1704067200000
+      }
+    },
+    {
+      "id": "missing-uid",
+      "group": "required-fields",
+      "notes": "uid is part of row identity and the sharding key: skip.",
+      "doc": {
+        "_id": "656565656565656565656573",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "did": "device-001",
+        "ts": 1704067200000
+      }
+    },
+    {
+      "id": "numeric-uid",
+      "group": "required-fields",
+      "notes": "Numeric uid must be stringified.",
+      "doc": {
+        "_id": "656565656565656565656574",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": 42,
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "missing-id",
+      "group": "required-fields",
+      "notes": "No _id: skip.",
+      "doc": {
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "ts": 1704067200000
+      }
+    },
+    {
+      "id": "migrated-flag-set",
+      "group": "required-fields",
+      "notes": "Doc already marked migrated: skip (idempotent re-runs).",
+      "doc": {
+        "_id": "656565656565656565656575",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "ts": 1704067200000,
+        "migrated": true
+      }
+    },
+    {
+      "id": "ts-missing",
+      "group": "timestamps",
+      "notes": "No ts: skip.",
+      "doc": {
+        "_id": "656565656565656565656576",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1"
+      }
+    },
+    {
+      "id": "ts-zero",
+      "group": "timestamps",
+      "notes": "ts=0: skip.",
+      "doc": {
+        "_id": "656565656565656565656577",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "ts": 0
+      }
+    },
+    {
+      "id": "ts-small-integer",
+      "group": "timestamps",
+      "notes": "ts below the seconds heuristic floor (9.5e8): skip.",
+      "doc": {
+        "_id": "656565656565656565656578",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "ts": 12345
+      }
+    },
+    {
+      "id": "ts-seconds-precision",
+      "group": "timestamps",
+      "notes": "Seconds-precision ts (>=9.5e8, <9.5e11) is multiplied by 1000.",
+      "doc": {
+        "_id": "656565656565656565656579",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "ts-seconds-fractional",
+      "group": "timestamps",
+      "notes": "Fractional seconds ts keeps sub-second precision after the *1000 conversion.",
+      "doc": {
+        "_id": "65656565656565656565657a",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200.5,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "ts-millis-fractional",
+      "group": "timestamps",
+      "notes": "Fractional-millisecond ts is floored.",
+      "doc": {
+        "_id": "65656565656565656565657b",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000.9,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "ts-numeric-string",
+      "group": "timestamps",
+      "notes": "Numeric-string ts is parsed with Number() and then unit-normalized.",
+      "doc": {
+        "_id": "65656565656565656565657c",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": "1704067200000",
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "ts-iso-string",
+      "group": "timestamps",
+      "notes": "ISO-8601 string ts is NOT accepted (Number() parse only, no Date.parse ambiguity): skip.",
+      "doc": {
+        "_id": "65656565656565656565657d",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "ts": "2024-01-01T00:00:00.000Z"
+      }
+    },
+    {
+      "id": "ts-date-object",
+      "group": "timestamps",
+      "notes": "BSON date (JS Date) ts uses getTime().",
+      "doc": {
+        "_id": "65656565656565656565657e",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": { "$$t": "date", "ms": 1704067200123 },
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "ts-extended-json-number",
+      "group": "timestamps",
+      "notes": "Raw Mongo Extended JSON {$date: <ms>} object (from EJSON-dumped data) recurses on the value.",
+      "doc": {
+        "_id": "65656565656565656565657f",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": { "$date": 1704067200000 },
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "ts-extended-json-nested-long",
+      "group": "timestamps",
+      "notes": "Canonical Extended JSON {$date: {$numberLong: ...}} is NOT resolvable (inner object is not a timestamp): skip on both sides, by agreement.",
+      "doc": {
+        "_id": "656565656565656565656580",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "ts": { "$date": { "$numberLong": "1704067200000" } }
+      }
+    },
+    {
+      "id": "ts-below-seconds-floor",
+      "group": "timestamps",
+      "notes": "ts just below 9.5e8: skip.",
+      "doc": {
+        "_id": "656565656565656565656581",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "ts": 949999999
+      }
+    },
+    {
+      "id": "ts-beyond-datetime64-range",
+      "group": "timestamps",
+      "notes": "Countly-owned timestamp clamps to the DateTime64(3) column range (policy). Driver-promoted Int64 1e17 ms lands far beyond 2299 and clamps to 2299-12-31 23:59:59.999.",
+      "doc": {
+        "_id": "656565656565656565656582",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": { "$$t": "driverLong", "v": "100000000000000000" },
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "lu-variants-valid",
+      "group": "timestamps",
+      "notes": "lu as seconds-precision number is unit-normalized like ts.",
+      "doc": {
+        "_id": "656565656565656565656583",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "lu": 1703980800,
+        "c": 1
+      }
+    },
+    {
+      "id": "lu-garbage-string",
+      "group": "timestamps",
+      "notes": "Unparseable lu is dropped (row still emitted, lu=NULL).",
+      "doc": {
+        "_id": "656565656565656565656584",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "lu": "not-a-date",
+        "c": 1
+      }
+    },
+    {
+      "id": "lu-epoch-negative-date",
+      "group": "timestamps",
+      "notes": "A pre-1970 Date in lu (negative epoch) is dropped: only lu > 0 is kept.",
+      "doc": {
+        "_id": "656565656565656565656585",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "lu": { "$$t": "date", "ms": -5000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "cd-missing-falls-back-to-ts",
+      "group": "timestamps",
+      "notes": "Docs predating cd: cd must be emitted deterministically as ts, never left to the now64(3) column default.",
+      "doc": {
+        "_id": "656565656565656565656586",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "c": 1
+      }
+    },
+    {
+      "id": "cd-epoch-zero-date",
+      "group": "timestamps",
+      "notes": "cd at epoch 0 is not a valid creation stamp: falls back to ts.",
+      "doc": {
+        "_id": "656565656565656565656587",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 0 },
+        "c": 1
+      }
+    },
+    {
+      "id": "cd-numeric-millis",
+      "group": "timestamps",
+      "notes": "Numeric cd (legacy oddity) is normalized like any Countly timestamp.",
+      "doc": {
+        "_id": "656565656565656565656588",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": 1704067205123,
+        "c": 1
+      }
+    },
+    {
+      "id": "cd-beyond-datetime64-range",
+      "group": "timestamps",
+      "notes": "cd in year 2500 clamps to the DateTime64(3) maximum.",
+      "doc": {
+        "_id": "656565656565656565656589",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 16725225600000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "c-float",
+      "group": "countly-numerics",
+      "notes": "Fractional count floors to an integer for UInt32.",
+      "doc": {
+        "_id": "65656565656565656565658a",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 2.9
+      }
+    },
+    {
+      "id": "c-negative",
+      "group": "countly-numerics",
+      "notes": "Negative count clamps to 0 (UInt32 lower bound).",
+      "doc": {
+        "_id": "65656565656565656565658b",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": -5
+      }
+    },
+    {
+      "id": "c-beyond-uint32",
+      "group": "countly-numerics",
+      "notes": "Count beyond 2^32-1 clamps to the UInt32 maximum (policy: Countly-owned fields clamp to column ranges).",
+      "doc": {
+        "_id": "65656565656565656565658c",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1000000000000
+      }
+    },
+    {
+      "id": "c-numeric-string",
+      "group": "countly-numerics",
+      "notes": "Numeric-string count parses.",
+      "doc": {
+        "_id": "65656565656565656565658d",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": "7"
+      }
+    },
+    {
+      "id": "c-garbage-string",
+      "group": "countly-numerics",
+      "notes": "Unparseable count becomes 0.",
+      "doc": {
+        "_id": "65656565656565656565658e",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": "abc"
+      }
+    },
+    {
+      "id": "c-nan",
+      "group": "countly-numerics",
+      "notes": "NaN count becomes 0.",
+      "doc": {
+        "_id": "65656565656565656565658f",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": { "$$t": "nan" }
+      }
+    },
+    {
+      "id": "s-dur-numeric-strings",
+      "group": "countly-numerics",
+      "notes": "Numeric-string sum/duration parse to Float64.",
+      "doc": {
+        "_id": "656565656565656565656590",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "s": "99.99",
+        "dur": "30.5"
+      }
+    },
+    {
+      "id": "s-nan-dur-infinity",
+      "group": "countly-numerics",
+      "notes": "Non-finite sum/duration become 0 (Float64 columns are non-nullable; JSON cannot carry NaN/Infinity).",
+      "doc": {
+        "_id": "656565656565656565656591",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "s": { "$$t": "nan" },
+        "dur": { "$$t": "inf" }
+      }
+    },
+    {
+      "id": "s-negative-dur-negative",
+      "group": "countly-numerics",
+      "notes": "Negative sum/duration are within Float64 range and pass through unchanged.",
+      "doc": {
+        "_id": "656565656565656565656592",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "s": -2.5,
+        "dur": -1
+      }
+    },
+    {
+      "id": "c-s-dur-missing",
+      "group": "countly-numerics",
+      "notes": "Missing count/sum/duration default to 0/0/0 in the row (explicit on the wire; SDK-level count defaulting to 1 happens at ingestion, before the doc exists).",
+      "doc": {
+        "_id": "656565656565656565656593",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 }
+      }
+    },
+    {
+      "id": "sg-mixed-types",
+      "group": "customer-json",
+      "notes": "Mixed value types per key including nested structures, unicode and explicit null pass through unchanged.",
+      "doc": {
+        "_id": "656565656565656565656594",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": {
+          "str": "text",
+          "int": 42,
+          "float": 3.14159,
+          "bool": true,
+          "nul": null,
+          "arr": ["a", 1, false],
+          "nested": { "k1": "v1", "k2": { "k3": [1, 2, 3] } },
+          "unicode": "žąčęėįšųū 中文 🎉"
+        }
+      }
+    },
+    {
+      "id": "sg-nan-infinity",
+      "group": "customer-json",
+      "notes": "Policy: customer-owned values that do not fit JSON numeric representation are stringified losslessly (NaN -> \"NaN\", Infinity -> \"Infinity\", -Infinity -> \"-Infinity\"), never silently nulled.",
+      "doc": {
+        "_id": "656565656565656565656595",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "bad1": { "$$t": "nan" }, "bad2": { "$$t": "inf" }, "bad3": { "$$t": "-inf" }, "ok": 1 },
+        "custom": { "score": { "$$t": "nan" } }
+      }
+    },
+    {
+      "id": "sg-decimal128",
+      "group": "customer-json",
+      "notes": "BSON Decimal128 (not promoted by the driver) is stringified losslessly to its decimal representation, not dumped as {$numberDecimal:...}.",
+      "doc": {
+        "_id": "656565656565656565656596",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "price": { "$$t": "decimal128", "v": "19.99999999999999999999999999999999" } }
+      }
+    },
+    {
+      "id": "sg-int64-driver-promoted",
+      "group": "customer-json",
+      "notes": "BSON Int64 beyond 2^53 read with default driver options arrives as an already-lossy double; both sides emit that same double. Residual precision loss is a documented driver-level limitation (fixing it requires useBigInt64 at read time).",
+      "doc": {
+        "_id": "656565656565656565656597",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "big": { "$$t": "driverLong", "v": "9223372036854775807" }, "safe": 9007199254740991 }
+      }
+    },
+    {
+      "id": "sg-date-value",
+      "group": "customer-json",
+      "notes": "Date values inside customer JSON serialize to ISO-8601 strings (JSON.stringify behavior, identical on both wires).",
+      "doc": {
+        "_id": "656565656565656565656598",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "when": { "$$t": "date", "ms": 1703980800500 } }
+      }
+    },
+    {
+      "id": "sg-undefined-value",
+      "group": "customer-json",
+      "notes": "undefined values inside customer JSON are dropped (key disappears).",
+      "doc": {
+        "_id": "656565656565656565656599",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "gone": { "$$t": "undef" }, "kept": "v" }
+      }
+    },
+    {
+      "id": "sg-deep-nesting",
+      "group": "customer-json",
+      "notes": "Six levels of nesting pass through unchanged.",
+      "doc": {
+        "_id": "65656565656565656565659a",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "l1": { "l2": { "l3": { "l4": { "l5": { "l6": "deep", "arr": [{ "x": 1 }] } } } } } }
+      }
+    },
+    {
+      "id": "sg-oversized-string",
+      "group": "customer-json",
+      "notes": "A 32KiB string value passes through untruncated on both sides.",
+      "doc": {
+        "_id": "65656565656565656565659b",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "sg": { "blob": { "$$t": "bigstring", "c": "x", "n": 32768 } }
+      }
+    },
+    {
+      "id": "json-fields-wrong-types",
+      "group": "customer-json",
+      "notes": "Non-object up/custom/cmp/sg (strings, arrays, numbers) cannot land in JSON columns: treated as absent (up/sg -> {}, custom/cmp -> NULL).",
+      "doc": {
+        "_id": "65656565656565656565659c",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1,
+        "up": "not-an-object",
+        "custom": 42,
+        "cmp": [1, 2, 3],
+        "sg": "also-not-an-object"
+      }
+    },
+    {
+      "id": "json-fields-all-absent",
+      "group": "customer-json",
+      "notes": "No up/custom/cmp/sg at all: up={}, sg={}, custom=NULL, cmp=NULL.",
+      "doc": {
+        "_id": "65656565656565656565659d",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "lsid-blank",
+      "group": "identity-fields",
+      "notes": "Blank lsid is treated as absent (NULL), matching the live path.",
+      "doc": {
+        "_id": "65656565656565656565659e",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "did": "device-001",
+        "lsid": "",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "uid-canon-preserved",
+      "group": "identity-fields",
+      "notes": "uid_canon must survive the transform on both sides.",
+      "doc": {
+        "_id": "65656565656565656565659f",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "uid_canon": "canonical-u1",
+        "did": "device-001",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    },
+    {
+      "id": "did-missing-defaults-empty",
+      "group": "identity-fields",
+      "notes": "Missing did defaults to '' (non-nullable String column).",
+      "doc": {
+        "_id": "6565656565656565656565a0",
+        "a": "5f1c8e2a9b3d4c001a2b3c4d",
+        "e": "purchase",
+        "uid": "u1",
+        "ts": 1704067200000,
+        "cd": { "$$t": "date", "ms": 1704067205000 },
+        "c": 1
+      }
+    }
+  ]
+}

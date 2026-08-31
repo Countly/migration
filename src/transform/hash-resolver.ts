@@ -16,6 +16,22 @@ import type { Logger } from "pino";
 // Public types
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * ClickHouse row identity of a collection's rows. The transform maps custom
+ * events to e='[CLY]_custom' with the original name in `n` — so a custom
+ * event's rows are identified by (a, e, n), an internal [CLY]_ event's by
+ * (a, e) (its n is data-dependent: view name, widget id, …).
+ * Caveat: a source doc carrying its own non-blank `n` keeps it (dedup
+ * identity with live ingestion); legacy drill documents never have one.
+ */
+export interface ChScope { a: string; e: string; n?: string }
+
+export function chScopeOf(defaults: CollectionDefaults): ChScope {
+  return defaults.e.startsWith('[CLY]_')
+    ? { a: defaults.a, e: defaults.e }
+    : { a: defaults.a, e: '[CLY]_custom', n: defaults.e };
+}
+
 /** Default `a` (appId) and `e` (eventName) values derived from a collection hash. */
 export interface CollectionDefaults {
   a: string;

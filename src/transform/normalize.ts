@@ -4,6 +4,26 @@
  * Transforms raw MongoDB event documents into ClickHouse-ready rows,
  * applying field validation, event-name derivation, and timestamp
  * normalization.
+ *
+ * This module implements the drill-event normalization spec. The spec was
+ * defined together with a matching rewrite of countly-platform's
+ * api/utils/eventTransformer.ts (branch claude/jovial-shannon-b3dd29) and the
+ * goldens in tests/differential/ were generated from that code — but this
+ * tool does NOT depend on that branch merging. It writes ClickHouse directly;
+ * platform code never runs on the migration path. The differential harness
+ * pins THIS repo's behavior against the frozen goldens.
+ *
+ * What consistency actually requires (and why it holds against platform
+ * main unmerged): row semantics that span history + live queries — custom
+ * events as e='[CLY]_custom' with the name in n (confirmed live behavior),
+ * uid_canon left to the identity machinery (both sides), cd = historical
+ * time for migrated rows vs receive-time for live rows. Everything else in
+ * this spec (NaN/Decimal128/Long stringification, ts heuristics, clamps,
+ * skip rules) concerns BSON-only shapes that live SDK ingestion can never
+ * receive through JSON — divergence there is unobservable.
+ *
+ * If the platform PR merges with behavior changes, regenerate goldens there
+ * and re-sync tests/differential/.
  */
 
 import { SkipReason, SkipCounter } from './skip-reasons.ts';
@@ -12,23 +32,19 @@ import {
   asString,
   toEpochMillis,
   toDouble,
+  clampUInt32,
+  clampDateTime64,
+  isPlainObject,
+  sanitizeJsonValue,
   formatTimestamp,
   firstNonBlank,
 } from './validators.ts';
 import type { CollectionDefaults } from './hash-resolver.ts';
+import type { CoercionCounter } from './coercions.ts';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
 // ────────────────────────────────────────────────────────────────────────────
-
-/**
- * The complete set of fields that may appear in a transformed output row.
- * Anything not in this set is stripped before the row is emitted.
- */
-const KNOWN_FIELDS = new Set<string>([
-  'a', 'e', 'n', 'uid', 'uid_canon', 'did', 'lsid',
-  '_id', 'ts', 'up', 'custom', 'cmp', 'sg', 'c', 's', 'dur', 'lu', 'cd',
-]);
 
 const CLY_PREFIX = '[CLY]_';
 
@@ -52,8 +68,8 @@ export interface SourceDocument {
   ts?: unknown;
   up?: unknown;
   custom?: unknown;
-  cmp?: string;
-  sg?: Record<string, unknown>;
+  cmp?: unknown;
+  sg?: unknown;
   c?: unknown;
   s?: unknown;
   dur?: unknown;
@@ -73,9 +89,9 @@ export interface OutputRow {
   did: string;
   lsid?: string;
   ts: string;
-  up?: unknown;
-  custom?: unknown;
-  cmp?: string;
+  up?: Record<string, unknown>;
+  custom?: Record<string, unknown>;
+  cmp?: Record<string, unknown>;
   sg?: Record<string, unknown>;
   c: number;
   s: number;
@@ -100,9 +116,13 @@ export interface TransformResult {
  *
  * Returns `{ row, skipReason }` where exactly one of the two is non-null.
  */
-export function transformDocument(doc: SourceDocument, defaults?: CollectionDefaults): TransformResult {
+export function transformDocument(
+  doc: SourceDocument,
+  defaults?: CollectionDefaults,
+  coercions?: CoercionCounter,
+): TransformResult {
   try {
-    return doTransform(doc, defaults);
+    return doTransform(doc, defaults, coercions);
   } catch {
     return { row: null, skipReason: SkipReason.TRANSFORM_ERROR };
   }
@@ -124,13 +144,14 @@ export function transformBatch(
   docs: SourceDocument[],
   skipCounter: SkipCounter,
   defaults?: CollectionDefaults,
+  coercions?: CoercionCounter,
 ): { rows: OutputRow[]; skippedSamples: Array<{ _id: string; reason: SkipReason }> } {
   const rows: OutputRow[] = [];
   const skippedSamples: Array<{ _id: string; reason: SkipReason }> = [];
   const MAX_SKIP_SAMPLES = 10;
 
   for (const doc of docs) {
-    const { row, skipReason } = transformDocument(doc, defaults);
+    const { row, skipReason } = transformDocument(doc, defaults, coercions);
 
     if (row !== null) {
       rows.push(row);
@@ -150,7 +171,11 @@ export function transformBatch(
 // Internal helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-function doTransform(doc: SourceDocument, defaults?: CollectionDefaults): TransformResult {
+function doTransform(
+  doc: SourceDocument,
+  defaults?: CollectionDefaults,
+  coercions?: CoercionCounter,
+): TransformResult {
   // ── Skip if already migrated ──────────────────────────────────────────
   if (doc.migrated === true) {
     return { row: null, skipReason: SkipReason.ALREADY_MARKED_MIGRATED };
@@ -185,80 +210,87 @@ function doTransform(doc: SourceDocument, defaults?: CollectionDefaults): Transf
     return { row: null, skipReason: SkipReason.INVALID_TS };
   }
 
-  // ── Build output row ──────────────────────────────────────────────────
-  // We build via a mutable bag and cast at the end since all required
-  // OutputRow fields are guaranteed to be set by the code below.
-  const row: Record<string, unknown> = {};
-
-  // Copy all known fields from the source document
-  for (const key of KNOWN_FIELDS) {
-    if (key in doc) {
-      row[key] = (doc as Record<string, unknown>)[key];
-    }
-  }
-
-  // Overwrite validated / required fields
-  row['a'] = a;
-  row['e'] = e;
-  row['uid'] = uid;
-  row['_id'] = _id;
-
-  // ── Defaults ──────────────────────────────────────────────────────────
-  const did = asString(doc.did);
-  row['did'] = did ?? '';
-
-  row['s'] = toDouble(doc.s, 0.0);
-  row['dur'] = toDouble(doc.dur, 0.0);
-  row['c'] = Math.max(0, Math.floor(toDouble(doc.c, 0)));
-
   // ── Event name derivation ─────────────────────────────────────────────
+  // An existing non-blank doc.n always wins so migrated rows match the rows
+  // live ingestion produced for the same document (dedup identity). Legacy
+  // documents have no `n`, so for them the sg-derived name applies as before.
   let eventName = e;
-  let n: string | null = null;
+  let n: string | null = asString(doc.n);
 
   if (e.startsWith(CLY_PREFIX)) {
-    const sg = (doc.sg ?? {}) as Record<string, unknown>;
+    if (n === null) {
+      const sg = (isPlainObject(doc.sg) ? doc.sg : {}) as Record<string, unknown>;
 
-    switch (e) {
-      case '[CLY]_view':
-        n = asString(sg['name']);
-        break;
-      case '[CLY]_action':
-        n = firstNonBlank(asString(sg['name']), asString(sg['view']));
-        break;
-      case '[CLY]_nps':
-      case '[CLY]_survey':
-      case '[CLY]_star_rating':
-        n = asString(sg['widget_id']);
-        break;
-      case '[CLY]_crash':
-        n = asString(sg['group']);
-        break;
-      default:
-        // Keep existing n from the document, if any
-        n = asString(doc.n) ?? null;
-        break;
+      switch (e) {
+        case '[CLY]_view':
+          n = asString(sg['name']);
+          break;
+        case '[CLY]_action':
+          n = firstNonBlank(asString(sg['name']), asString(sg['view']));
+          break;
+        case '[CLY]_nps':
+        case '[CLY]_survey':
+        case '[CLY]_star_rating':
+          n = asString(sg['widget_id']);
+          break;
+        case '[CLY]_crash':
+          n = asString(sg['group']);
+          break;
+        default:
+          n = null;
+          break;
+      }
     }
   } else {
     // Custom event: n = original event name, e becomes [CLY]_custom
-    n = eventName;
+    if (n === null) {
+      n = eventName;
+    }
     eventName = '[CLY]_custom';
-    row['e'] = eventName;
   }
 
   // Final fallback: if n is still blank, use e
   if (isBlank(n)) {
     n = eventName;
   }
-  row['n'] = n;
+
+  // ── Build output row ──────────────────────────────────────────────────
+  const row: OutputRow = {
+    _id,
+    a,
+    e: eventName,
+    n: n as string,
+    uid,
+    did: asString(doc.did) ?? '',
+    ts: '',
+    c: clampUInt32(doc.c),  // counted below when clamping changed the value
+    s: toDouble(doc.s, 0.0),
+    dur: toDouble(doc.dur, 0.0),
+    cd: '',
+  };
+
+  {
+    const cRaw = Math.floor(toDouble(doc.c, 0));
+    if (row.c !== cRaw) coercions?.record('clamp_uint32', 'c', cRaw, row.c);
+  }
+
+  const uidCanon = asString(doc.uid_canon);
+  if (uidCanon !== null) {
+    row.uid_canon = uidCanon;
+  }
+  const lsid = asString(doc.lsid);
+  if (lsid !== null) {
+    row.lsid = lsid;
+  }
 
   // ── Timestamp normalisation ───────────────────────────────────────────
-  row['ts'] = formatTimestamp(tsMillis);
+  // Countly-owned timestamps clamp to the DateTime64(3) column range.
+  if (clampDateTime64(tsMillis) !== tsMillis) coercions?.record('clamp_datetime', 'ts', tsMillis, clampDateTime64(tsMillis));
+  row.ts = formatTimestamp(clampDateTime64(tsMillis));
 
   const luMillis = toEpochMillis(doc.lu);
-  if (luMillis !== null) {
-    row['lu'] = formatTimestamp(luMillis);
-  } else {
-    delete row['lu'];
+  if (luMillis !== null && luMillis > 0) {
+    row.lu = formatTimestamp(clampDateTime64(luMillis));
   }
 
   // `cd` must always be emitted. The ClickHouse column is declared
@@ -274,7 +306,24 @@ function doTransform(doc: SourceDocument, defaults?: CollectionDefaults): Transf
   // keeps them in a plausible term and, unlike now64(3), is deterministic, so
   // re-running or resuming a migration is idempotent.
   const cdMillis = toEpochMillis(doc.cd);
-  row['cd'] = formatTimestamp(cdMillis !== null && cdMillis > 0 ? cdMillis : tsMillis);
+  row.cd = formatTimestamp(clampDateTime64(cdMillis !== null && cdMillis > 0 ? cdMillis : tsMillis));
 
-  return { row: row as unknown as OutputRow, skipReason: null };
+  // ── JSON columns ──────────────────────────────────────────────────────
+  // Only plain objects are insertable into the JSON columns; customer-owned
+  // values that don't fit JSON numeric representation are stringified
+  // losslessly (NaN/±Infinity, BSON Decimal128/Long, bigint).
+  if (isPlainObject(doc.up)) {
+    row.up = sanitizeJsonValue(doc.up, (k, o, c) => coercions?.record(k, 'up', o, c)) as Record<string, unknown>;
+  }
+  if (isPlainObject(doc.custom)) {
+    row.custom = sanitizeJsonValue(doc.custom, (k, o, c) => coercions?.record(k, 'custom', o, c)) as Record<string, unknown>;
+  }
+  if (isPlainObject(doc.cmp)) {
+    row.cmp = sanitizeJsonValue(doc.cmp, (k, o, c) => coercions?.record(k, 'cmp', o, c)) as Record<string, unknown>;
+  }
+  if (isPlainObject(doc.sg)) {
+    row.sg = sanitizeJsonValue(doc.sg, (k, o, c) => coercions?.record(k, 'sg', o, c)) as Record<string, unknown>;
+  }
+
+  return { row, skipReason: null };
 }

@@ -10,7 +10,6 @@ export interface MongoReaderConfig {
   readConcern: string;
   retryReads: boolean;
   appName: string;
-  batchRowsTarget: number;
   cursorBatchSize: number;
   maxTimeMs: number;
 }
@@ -69,7 +68,10 @@ export class MongoReader {
       readConcern: { level: readConcern as "local" | "majority" | "linearizable" | "available" | "snapshot" },
       serverSelectionTimeoutMS: 30_000,
       connectTimeoutMS: 10_000,
-      socketTimeoutMS: this.config.maxTimeMs + 30_000,
+      // NO socketTimeoutMS: every read op carries its own maxTimeMS, and a
+      // client-wide socket timeout kills legitimately long awaits — a
+      // multi-minute createIndex died at maxTimeMs+30s in the field (the
+      // dry-run crash devops hit), leaving a half-built index behind.
     });
 
     await this.client.connect();
@@ -95,17 +97,20 @@ export class MongoReader {
   }
 
   /**
-   * Start index creation for a collection. This may take a long time for
-   * large collections. The returned promise resolves when the index is built.
+   * Ensure the { cd: 1, _id: 1 } index exists AND is ready. Always calls
+   * createIndex: on a complete index it returns immediately; on an
+   * IN-PROGRESS identical build it JOINS and waits for readiness; otherwise
+   * it builds. This is the only crash-safe gate — listIndexes (and therefore
+   * hasRequiredIndex) lists in-progress builds as present, and hinting an
+   * unfinished index fails with 'hint provided does not correspond to an
+   * existing index' (the second dry-run crash devops hit).
    */
-  async startIndexCreation(collectionName: string): Promise<void> {
+  async ensureIndex(collectionName: string): Promise<void> {
     if (!this.connected || !this.db) {
       throw new Error("MongoReader is not connected. Call connect() first.");
     }
     const coll = this.db.collection(collectionName);
-    this.logger.info({ collection: collectionName }, "Starting index creation { cd: 1, _id: 1 }");
     await coll.createIndex({ cd: 1, _id: 1 });
-    this.logger.info({ collection: collectionName }, "Index creation completed");
   }
 
   /**
@@ -268,58 +273,60 @@ export class MongoReader {
     };
   }
 
-  async readPage(lastCursor: Cursor | null, upperBound: Cursor, limit?: number): Promise<PageResult> {
+  /**
+   * Stream documents between two cursors using ONE long-lived MongoDB cursor
+   * (no fresh find() per page — measured 25-40% faster than paged reads, and
+   * no per-page boundary re-reads). Yields pages of `pageSize` docs.
+   *
+   * NOTE: `start` is INCLUSIVE (min bound). When resuming from a cursor that
+   * points at an already-processed doc, the caller must skip the first doc if
+   * it equals the start cursor. On cursor death, reopen from the last yielded
+   * cursor — the generator itself does not retry.
+   */
+  async *readStream(
+    start: Cursor | null,
+    upperBound: Cursor,
+    pageSize: number,
+  ): AsyncGenerator<PageResult> {
     this.ensureConnected();
-
     const { cursorBatchSize, maxTimeMs } = this.config;
-    const pageLimit = limit ?? this.config.batchRowsTarget;
-
-    const ucd = new Date(upperBound.cd);
-    const startMs = performance.now();
 
     let query = this.collection!
       .find({ cd: { $ne: null } })
       .sort({ cd: 1, _id: 1 })
       .hint({ cd: 1, _id: 1 })
-      .max({ cd: ucd, _id: upperBound.id })
-      .limit(pageLimit)
+      .max({ cd: new Date(upperBound.cd), _id: upperBound.id })
       .batchSize(cursorBatchSize)
       .project(PROJECTION)
       .maxTimeMS(maxTimeMs);
 
-    if (lastCursor !== null) {
-      const lcd = new Date(lastCursor.cd);
-      query = query.min({ cd: lcd, _id: lastCursor.id });
+    if (start !== null) {
+      query = query.min({ cd: new Date(start.cd), _id: start.id });
     }
 
-    const docs = await query.toArray();
-
-    const fetchMs = Math.round(performance.now() - startMs);
-
-    const lastDoc = docs[docs.length - 1];
-    const lastCursorResult: Cursor | null = docs.length > 0
-      ? { cd: cdToEpoch(lastDoc.cd), id: String(lastDoc._id) }
-      : null;
-
-    // Guard: min() is inclusive, so the first doc may equal lastCursor.
-    // If it's the only doc returned, lastCursorResult === lastCursor → infinite loop.
-    // Signal "done" to the caller instead.
-    if (lastCursor !== null && lastCursorResult !== null
-        && lastCursorResult.cd === lastCursor.cd
-        && lastCursorResult.id === lastCursor.id) {
-      return { docs: [], lastCursor: null, fetchMs: Math.round(performance.now() - startMs) };
+    let page: SourceDocument[] = [];
+    let pageStart = performance.now();
+    for await (const doc of query) {
+      page.push(doc as SourceDocument);
+      if (page.length >= pageSize) {
+        const last = page[page.length - 1];
+        yield {
+          docs: page,
+          lastCursor: { cd: cdToEpoch(last.cd), id: String(last._id) },
+          fetchMs: Math.round(performance.now() - pageStart),
+        };
+        page = [];
+        pageStart = performance.now();
+      }
     }
-
-    this.logger.debug(
-      { docsRead: docs.length, lastCursor: lastCursorResult, fetchMs },
-      "Page read complete",
-    );
-
-    return {
-      docs: docs as SourceDocument[],
-      lastCursor: lastCursorResult,
-      fetchMs,
-    };
+    if (page.length > 0) {
+      const last = page[page.length - 1];
+      yield {
+        docs: page,
+        lastCursor: { cd: cdToEpoch(last.cd), id: String(last._id) },
+        fetchMs: Math.round(performance.now() - pageStart),
+      };
+    }
   }
 
   isConnected(): boolean {

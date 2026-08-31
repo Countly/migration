@@ -1,6 +1,18 @@
 /**
  * Field validation and conversion utilities for the migration transform layer.
+ *
+ * These helpers implement the shared drill-event normalization spec that
+ * countly-platform's live ingestion transformer
+ * (api/utils/eventTransformer.ts) also implements. Both sides must produce
+ * IDENTICAL countly_drill.drill_events rows for the same input document; the
+ * differential harness in tests/differential/ enforces this in CI.
  */
+
+const UINT32_MAX = 4294967295;
+
+/** DateTime64(3) representable range: 1900-01-01 00:00:00.000 .. 2299-12-31 23:59:59.999 UTC. */
+export const DATETIME64_MIN_MS = Date.UTC(1900, 0, 1, 0, 0, 0, 0);
+export const DATETIME64_MAX_MS = Date.UTC(2299, 11, 31, 23, 59, 59, 999);
 
 /**
  * Returns true if the value is null, undefined, or an empty/whitespace-only string.
@@ -74,6 +86,14 @@ export function toEpochMillis(ts: unknown): number | null {
 }
 
 /**
+ * Clamps epoch milliseconds to the DateTime64(3) column range
+ * (Countly-owned timestamps clamp to column ranges by policy).
+ */
+export function clampDateTime64(epochMs: number): number {
+  return Math.min(Math.max(epochMs, DATETIME64_MIN_MS), DATETIME64_MAX_MS);
+}
+
+/**
  * Parses a value as a double (floating-point number), returning the default if
  * the value is null, undefined, or not parseable.
  */
@@ -86,6 +106,96 @@ export function toDouble(val: unknown, defaultVal: number): number {
   }
   const parsed = Number(val);
   return (isNaN(parsed) || !isFinite(parsed)) ? defaultVal : parsed;
+}
+
+/**
+ * Clamps a count value to the UInt32 column range: [0, 4294967295], integer.
+ */
+export function clampUInt32(val: unknown): number {
+  const num = Math.floor(toDouble(val, 0));
+  return Math.min(Math.max(num, 0), UINT32_MAX);
+}
+
+/**
+ * Returns true for plain (non-array, non-Date) objects usable as JSON column payloads.
+ */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date);
+}
+
+/**
+ * Deep-sanitizes customer-owned JSON column values (up/custom/cmp/sg).
+ * Values JSON cannot carry numerically are stringified losslessly instead of
+ * degrading to null: NaN/±Infinity become "NaN"/"Infinity"/"-Infinity",
+ * BSON Decimal128/Long become their decimal string, bigint becomes a string.
+ * `undefined` values are dropped from objects and become null inside arrays,
+ * matching JSON serialization.
+ */
+export type OnCoerce = (kind: string, original: unknown, coerced: unknown) => void;
+
+export function sanitizeJsonValue(value: unknown, onCoerce?: OnCoerce): unknown {
+  if (typeof value === 'number') {
+    if (isNaN(value)) {
+      onCoerce?.('stringify_nonfinite', value, 'NaN');
+      return 'NaN';
+    }
+    if (value === Infinity) {
+      onCoerce?.('stringify_nonfinite', value, 'Infinity');
+      return 'Infinity';
+    }
+    if (value === -Infinity) {
+      onCoerce?.('stringify_nonfinite', value, '-Infinity');
+      return '-Infinity';
+    }
+    // Integer-valued doubles in the Int64/UInt64 overflow window serialize
+    // in FIXED notation below 1e21 (e.g. 5.26e19 → "52601586211929000000"),
+    // so ClickHouse's JSON parser infers an integer type and overflows —
+    // the row is unmigratable as a number. Beyond 1e21 JS emits exponent
+    // notation ("9.2e+25") which lands as Float64, so those stay numeric.
+    // Same philosophy as NaN/bigint/Long: values the target cannot carry
+    // numerically are stringified losslessly (as they would have
+    // serialized) and counted. Live ingestion errors on these entirely, so
+    // there is no row-identity divergence to preserve.
+    if (
+      (value >= 18446744073709551616 && value < 1e21) ||       // > UInt64 max
+      (value <= -9223372036854775809 && value > -1e21)         // < Int64 min
+    ) {
+      const str = String(value);
+      onCoerce?.('stringify_int64_overflow', value, str);
+      return str;
+    }
+    return value;
+  }
+  if (typeof value === 'bigint') {
+    onCoerce?.('stringify_bigint', value, value.toString());
+    return value.toString();
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (value instanceof Date) {
+    return value;
+  }
+  const bsonType = (value as Record<string, unknown>)['_bsontype'];
+  if (bsonType === 'Decimal128' || bsonType === 'Long') {
+    const coerced = String(value);
+    onCoerce?.('stringify_bson_' + String(bsonType).toLowerCase(), value, coerced);
+    return coerced;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      const sanitized = sanitizeJsonValue(item, onCoerce);
+      return sanitized === undefined ? null : sanitized;
+    });
+  }
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value as Record<string, unknown>)) {
+    const sanitized = sanitizeJsonValue((value as Record<string, unknown>)[key], onCoerce);
+    if (sanitized !== undefined) {
+      out[key] = sanitized;
+    }
+  }
+  return out;
 }
 
 /**

@@ -12,12 +12,29 @@ import { configSchema, type Config } from "./schema.ts";
  */
 function envToRawConfig(env: NodeJS.ProcessEnv) {
     return {
+        ledger: {
+            runId: env.LEDGER_RUN_ID,
+            chunkDocsTarget: env.LEDGER_CHUNK_DOCS_TARGET,
+            insertInflight: env.LEDGER_INSERT_INFLIGHT,
+            leaseSec: env.LEDGER_LEASE_SEC,
+            breakerPct: env.LEDGER_BREAKER_PCT,
+            dlqPauseThreshold: env.LEDGER_DLQ_PAUSE_THRESHOLD,
+            sourceCountCheck: env.LEDGER_SOURCE_COUNT_CHECK,
+            breakerConsecutive: env.LEDGER_BREAKER_CONSECUTIVE,
+            monitorIntervalMs: env.LEDGER_MONITOR_INTERVAL_MS,
+            maxChunkDays: env.LEDGER_MAX_CHUNK_DAYS,
+            cdUpperBoundMs: env.LEDGER_CD_UPPER_BOUND,
+            captureTransformErrors: env.LEDGER_CAPTURE_TRANSFORM_ERRORS,
+            startPaused: env.LEDGER_START_PAUSED,
+            dryRun: env.DRY_RUN,
+            dryRunSamplePct: env.DRY_RUN_SAMPLE_PCT,
+        },
+
         service: {
             name: env.SERVICE_NAME,
             port: env.SERVICE_PORT,
             host: env.SERVICE_HOST,
             gracefulShutdownTimeoutMs: env.GRACEFUL_SHUTDOWN_TIMEOUT_MS,
-            rerunMode: env.RERUN_MODE,
             exitOnComplete: env.EXIT_ON_COMPLETE,
         },
 
@@ -30,13 +47,9 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             readConcern: env.MONGO_READ_CONCERN,
             retryReads: env.MONGO_RETRY_READS,
             appName: env.MONGO_APP_NAME,
-            batchRowsTarget: env.MONGO_BATCH_ROWS_TARGET,
             mongoPageSize: env.MONGO_PAGE_SIZE,
             cursorBatchSize: env.MONGO_CURSOR_BATCH_SIZE,
             maxTimeMs: env.MONGO_MAX_TIME_MS,
-            rangeParallelThreshold: env.RANGE_PARALLEL_THRESHOLD,
-            rangeCount: env.RANGE_COUNT,
-            rangeLeaseTtlSec: env.RANGE_LEASE_TTL_SEC,
         },
 
         transform: {
@@ -53,7 +66,6 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             maxRetries: env.CLICKHOUSE_MAX_RETRIES,
             retryBaseDelayMs: env.CLICKHOUSE_RETRY_BASE_DELAY_MS,
             retryMaxDelayMs: env.CLICKHOUSE_RETRY_MAX_DELAY_MS,
-            useDedupToken: env.CLICKHOUSE_USE_DEDUP_TOKEN,
         },
 
         backpressure: {
@@ -70,32 +82,11 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
 
         state: {
             manifestDb: env.MANIFEST_DB,
-            redisUrl: env.REDIS_URL,
-            redisKeyPrefix: env.REDIS_KEY_PREFIX,
-            timelineSnapshotInterval: env.TIMELINE_SNAPSHOT_INTERVAL,
-        },
-
-        memory: {
-            gcEnabled: env.GC_ENABLED,
-            gcRssSoftLimitMb: env.GC_RSS_SOFT_LIMIT_MB,
-            gcRssHardLimitMb: env.GC_RSS_HARD_LIMIT_MB,
-            gcHeapUsedRatio: env.GC_HEAP_USED_RATIO,
-            gcEveryNBatches: env.GC_EVERY_N_BATCHES,
-        },
-
-        asyncWrite: {
-            flushIntervalMs: env.ASYNC_WRITE_FLUSH_INTERVAL_MS,
-            flushBatchSize: env.ASYNC_WRITE_FLUSH_BATCH_SIZE,
         },
 
         worker: {
             podId: env.POD_ID,
             enabled: env.MULTI_POD_ENABLED,
-            lockTtlSec: env.LOCK_TTL_SECONDS,
-            lockRenewMs: env.LOCK_RENEW_MS,
-            progressUpdateMs: env.PROGRESS_UPDATE_MS,
-            podHeartbeatMs: env.POD_HEARTBEAT_MS,
-            podDeadAfterSec: env.POD_DEAD_AFTER_SEC,
         },
 
         log: {
@@ -145,15 +136,7 @@ export function loadConfig(): Config {
     }
 
     // Semantic validation
-    const { memory, target } = config;
-
-    const rssSoft = memory.gcRssSoftLimitMb * 1024 * 1024;
-    const rssHard = memory.gcRssHardLimitMb * 1024 * 1024;
-    if (rssSoft > rssHard) {
-        throw new Error(
-            `GC_RSS_SOFT_LIMIT_MB (${memory.gcRssSoftLimitMb}) must be <= GC_RSS_HARD_LIMIT_MB (${memory.gcRssHardLimitMb})`,
-        );
-    }
+    const { target } = config;
 
     if (target.retryBaseDelayMs > target.retryMaxDelayMs) {
         throw new Error(

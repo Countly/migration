@@ -1,0 +1,94 @@
+# Drill migration on Kubernetes — Deployment variant (recommended).
+#
+# Pods coordinate through chunk leases in MongoDB — no shared service, no
+# operator choreography. Each pod claims chunks atomically; a killed pod's
+# lease expires and others reclaim its chunk (drop staging, redo). Abrupt
+# kills, evictions and OOMs are safe by design, so no preStop hook is needed.
+#
+# Pod identity: POD_ID defaults to the hostname, which in Kubernetes is the
+# (unique) pod name — nothing to configure.
+#
+# Scale with `kubectl scale deployment/drill-migrator --replicas=N`.
+# Pods scale across NODES, not on one machine: a single pod saturates ~4
+# cores on BSON decode; more pods on the same node just contend.
+#
+# When the run completes, pods stay up serving the dashboard (progress,
+# verification, sign-off gates). Scale to 0 / delete when signed off.
+# For fire-and-forget automation use k8s/job.yaml instead.
+#
+# Dashboard: kubectl port-forward svc/drill-migrator 8080:8080
+# then open http://localhost:8080 — chunk state lives in MongoDB, so ANY
+# pod's dashboard shows the whole run.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: drill-migrator-config
+data:
+  SERVICE_NAME: "drill-migrator"
+  MONGO_DB: "countly_drill"
+  MONGO_COUNTLY_DB: "countly"
+  MANIFEST_DB: "countly_drill"
+  CLICKHOUSE_DB: "countly_drill"
+  CLICKHOUSE_TABLE: "drill_events"
+  # Stable resume key — keep identical across ALL pods and restarts.
+  LEDGER_RUN_ID: "migration-1"
+  # Deploy now, start later: pods serve the dashboard and wait until Start
+  # is pressed once (the gate lives in the ledger, so it covers every pod).
+  #LEDGER_START_PAUSED: "true"
+  # On a replica set, offload the primary (exact reads — source is frozen):
+  #MONGO_READ_PREFERENCE: "secondaryPreferred"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: drill-migrator-secrets
+type: Opaque
+stringData:
+  MONGO_URI: "mongodb://mongo.example.internal:27017"
+  CLICKHOUSE_URL: "http://clickhouse.example.internal:8123"
+  #CLICKHOUSE_USERNAME: "default"
+  #CLICKHOUSE_PASSWORD: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drill-migrator
+  labels: { app: drill-migrator }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: drill-migrator }
+  template:
+    metadata:
+      labels: { app: drill-migrator }
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: migrator
+          image: your-registry/drill-migrator:latest   # docker build -t … . && push
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef: { name: drill-migrator-config }
+            - secretRef: { name: drill-migrator-secrets }
+          resources:
+            requests: { cpu: "2", memory: 2Gi }
+            limits: { cpu: "4", memory: 6Gi }    # node heap is capped at 4G in the image
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drill-migrator
+spec:
+  selector: { app: drill-migrator }
+  ports:
+    - port: 8080
+      targetPort: 8080

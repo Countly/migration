@@ -1,0 +1,467 @@
+/**
+ * Ledger engine tests: classifier (pure), coercions (pure), LedgerStore
+ * claim/lease/transition semantics, and an end-to-end chunk pipeline run
+ * against real MongoDB + ClickHouse — asserting exact counts, DLQ capture
+ * with raw docs, and coercion accounting. No Redis anywhere.
+ */
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import pino from 'pino';
+import { MongoClient } from 'mongodb';
+import { createClient, type ClickHouseClient } from '@clickhouse/client';
+
+import { classifyError } from '../../src/runtime/error-classifier.ts';
+import { CoercionCounter } from '../../src/transform/coercions.ts';
+import { sanitizeJsonValue } from '../../src/transform/validators.ts';
+import { transformDocument } from '../../src/transform/normalize.ts';
+import { LedgerStore } from '../../src/state/ledger-store.ts';
+import { DlqStore } from '../../src/state/dlq-store.ts';
+import { StagingManager } from '../../src/target/staging-manager.ts';
+import { MongoReader } from '../../src/source/mongo-reader.ts';
+import { RetryPolicy } from '../../src/runtime/retry-policy.ts';
+import { HashResolver } from '../../src/transform/hash-resolver.ts';
+import { ChunkOrchestrator } from '../../src/runtime/chunk-orchestrator.ts';
+import { loadConfig } from '../../src/config/loader.ts';
+
+const MONGO_URI = 'mongodb://localhost:27017/?directConnection=true';
+const CH_URL = process.env.TEST_CLICKHOUSE_URL ?? 'http://localhost:8123';
+const CH_PASSWORD = process.env.TEST_CLICKHOUSE_PASSWORD ?? '';
+const DB = 'test_mig_ledger';
+const logger = pino({ level: 'silent' });
+
+// ---------------------------------------------------------------------------
+// Pure units
+// ---------------------------------------------------------------------------
+
+describe('error-classifier', () => {
+  it('classifies ClickHouse data-error codes as permanent', () => {
+    for (const code of ['41', '53', '72', '117', '6']) {
+      expect(classifyError({ code, message: 'x' })).toBe('permanent');
+    }
+  });
+  it('classifies network errors as transient', () => {
+    expect(classifyError({ code: 'ECONNRESET', message: 'socket hang up' })).toBe('transient');
+    expect(classifyError({ code: 'ETIMEDOUT', message: '' })).toBe('transient');
+  });
+  it('classifies BigInt serialization as permanent', () => {
+    expect(classifyError(new TypeError('Do not know how to serialize a BigInt'))).toBe('permanent');
+  });
+  it('defaults unknown errors to transient', () => {
+    expect(classifyError(new Error('some novel failure'))).toBe('transient');
+    expect(classifyError({ code: '999', message: 'unknown CH code' })).toBe('transient');
+  });
+});
+
+describe('schema shapes: hashed-collection (old) vs base drill_events (new format)', () => {
+  const OLD_SHAPE = { _id: 'o1', uid: 'u1', did: 'd1', ts: 1750000000000, cd: new Date(1750000000000), sg: { v: 1 }, c: 1 };
+
+  it('old shape (no a/e in doc): identity comes from the collection hash defaults', () => {
+    const { row } = transformDocument({ ...OLD_SHAPE } as never, { a: 'app1', e: 'purchase' });
+    expect(row?.a).toBe('app1');
+    expect(row?.e).toBe('[CLY]_custom');   // custom event: e is the bucket
+    expect(row?.n).toBe('purchase');       // original name in n
+  });
+
+  it('old shape with an internal event collection: e stays, n derives from sg', () => {
+    const { row } = transformDocument(
+      { ...OLD_SHAPE, sg: { name: '/cart' } } as never, { a: 'app1', e: '[CLY]_view' },
+    );
+    expect(row?.e).toBe('[CLY]_view');
+    expect(row?.n).toBe('/cart');
+  });
+
+  it('new shape (embedded a/e/n) is used as-is; embedded values win over defaults', () => {
+    const { row } = transformDocument(
+      { ...OLD_SHAPE, a: 'app_embedded', e: '[CLY]_custom', n: 'prenamed' } as never,
+      { a: 'app_from_hash', e: 'other_event' },
+    );
+    expect(row?.a).toBe('app_embedded');
+    expect(row?.n).toBe('prenamed');       // doc.n wins — dedup identity with live rows
+  });
+
+  it('old shape with seconds-unit ts converts to millis', () => {
+    const { row } = transformDocument(
+      { ...OLD_SHAPE, ts: 1750000000 } as never, { a: 'app1', e: 'purchase' },
+    );
+    expect(row?.ts).toBe('2025-06-15 15:06:40.000');
+  });
+
+  it('no identity anywhere (base-collection doc without a, no defaults) → skipped, not garbage', () => {
+    const { row, skipReason } = transformDocument({ ...OLD_SHAPE } as never, undefined);
+    expect(row).toBeNull();
+    expect(skipReason).toBe('missing_a');
+  });
+
+  it('old-only helper fields are dropped like live ingestion drops them', () => {
+    const { row } = transformDocument(
+      { ...OLD_SHAPE, d: 15, w: 24, m: '2025:6', h: 13, _uid: 'objectid' } as never,
+      { a: 'app1', e: 'purchase' },
+    );
+    expect(row && 'd' in row).toBe(false);
+    expect(row && 'm' in row).toBe(false);
+    expect(row && '_uid' in row).toBe(false);
+  });
+});
+
+describe('coercions (shared spec: only non-JSON-carriable values change)', () => {
+  it('stringifies NaN/Infinity/bigint losslessly; finite large doubles STAY numbers (matches live ingestion)', () => {
+    const out = sanitizeJsonValue({ ok: 42, big: 9.2e25, nan: NaN, inf: Infinity, huge: 10n ** 30n, str: 'hello' }) as Record<string, unknown>;
+    expect(out.nan).toBe('NaN');
+    expect(out.inf).toBe('Infinity');
+    expect(out.huge).toBe('1000000000000000000000000000000');
+    expect(out.big).toBe(9.2e25);   // finite double: live keeps it numeric — so do we
+    expect(out.ok).toBe(42);
+  });
+  it('counts coercions per key through the transform', () => {
+    const counter = new CoercionCounter();
+    const { row } = transformDocument(
+      { _id: 'x', a: 'app', e: 'ev', uid: 'u1', ts: 1750000000000, sg: { weird: NaN } },
+      undefined,
+      counter,
+    );
+    expect((row?.sg as Record<string, unknown>).weird).toBe('NaN');
+    expect(counter.getTotal()).toBe(1);
+    expect(counter.getReport()[0].rule_key).toBe('stringify_nonfinite:sg');
+  });
+  it('stringifies integer doubles in the Int64/UInt64 overflow window (the devops DLQ case)', () => {
+    const out = sanitizeJsonValue({
+      overflow_pos: 5.2601586211929e19,   // devops' UserID: fixed notation → UInt64 overflow in CH
+      overflow_neg: -9.3e18,              // below Int64 min
+      ok_uint64: 9.2e18,                  // parses as UInt64/Int64 — stays numeric
+      ok_float: 9.2e25,                   // ≥1e21 → exponent notation → Float64 — stays numeric
+      ok_edge: 1e21,
+    }) as Record<string, unknown>;
+    expect(out.overflow_pos).toBe('52601586211929000000');
+    expect(out.overflow_neg).toBe('-9300000000000000000');
+    expect(out.ok_uint64).toBe(9.2e18);
+    expect(out.ok_float).toBe(9.2e25);
+    expect(out.ok_edge).toBe(1e21);
+  });
+
+  it('caps distinct coercion keys; the overflow bucket keeps totals exact', () => {
+    const counter = new CoercionCounter();
+    for (let i = 0; i < 10_050; i++) counter.record('stringify_nonfinite', `field_${i}`, NaN, 'NaN');
+    expect(counter.getTotal()).toBe(10_050);
+    const report = counter.getReport();
+    expect(report.length).toBe(10_001); // 10k distinct + 1 overflow bucket
+    expect(report.some((r) => r.rule_key === 'other:distinct-key-cap-reached' && r.count === 50)).toBe(true);
+  });
+
+  it('clamps the Countly-owned counter c to UInt32', () => {
+    const counter = new CoercionCounter();
+    const { row } = transformDocument(
+      { _id: 'x', a: 'app', e: 'ev', uid: 'u1', ts: 1750000000000, c: 99_999_999_999 },
+      undefined,
+      counter,
+    );
+    expect(row?.c).toBe(4_294_967_295);
+    expect(counter.getTotal()).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LedgerStore semantics (real MongoDB)
+// ---------------------------------------------------------------------------
+
+describe('LedgerStore', () => {
+  let ledger: LedgerStore;
+
+  beforeAll(async () => {
+    ledger = new LedgerStore(MONGO_URI, DB, logger);
+    await ledger.connect();
+  });
+  afterAll(async () => {
+    const mc = new MongoClient(MONGO_URI);
+    await mc.connect();
+    await mc.db(DB).dropDatabase();
+    await mc.close();
+    await ledger.close();
+  });
+
+  it('initChunks is idempotent and claims are newest-first with a lease', async () => {
+    const bounds = [0, 1, 2].map((i) => ({ lowerCd: i * 1000, upperCd: (i + 1) * 1000 }));
+    expect(await ledger.initChunks('r1', 'coll', bounds, 'v1')).toBe(3);
+    expect(await ledger.initChunks('r1', 'coll', bounds, 'v1')).toBe(0); // no-op
+
+    const first = await ledger.claimNext('r1', 'coll', 'podA', 60);
+    expect(first?.idx).toBe(2); // newest first
+    expect(first?.status).toBe('in_progress');
+    expect(first?.lease_until!.getTime()).toBeGreaterThan(Date.now());
+
+    const second = await ledger.claimNext('r1', 'coll', 'podB', 60);
+    expect(second?.idx).toBe(1); // podA's claim is not re-claimable
+  });
+
+  it('clusterRate sums recent done chunks across ALL pods (per-pod stats undercount N-fold)', async () => {
+    const CR = 'cluster-rate-run';
+    const now = new Date();
+    const old = new Date(Date.now() - 10 * 60_000); // outside the window
+    const mk = (idx: number, pod: string, docs: number, at: Date): Record<string, unknown> => ({
+      _id: `${CR}:collR:${idx}`, run_id: CR, collection: 'collR',
+      scope_a: null, scope_e: null, scope_n: null, idx,
+      lower_cd: idx * 1000, upper_cd: (idx + 1) * 1000,
+      status: 'done', pod_id: pod, lease_until: null, staging_table: null,
+      docs_read: docs, docs_skipped: 0, rows_expected: docs, partitions: [], attached: [],
+      attach_method: 'attach', attempts: 1, last_error: null, transform_version: 'v1', updated_at: at,
+    });
+    const mc2 = new MongoClient(MONGO_URI);
+    await mc2.connect();
+    await mc2.db(DB).collection('mig_ranges').insertMany([
+      mk(0, 'pod-a', 6000, now), mk(1, 'pod-b', 4000, now), mk(2, 'pod-c', 9999, old),
+    ] as never[]);
+    const rate = await ledger.clusterRate(CR, 120);
+    expect(rate.pods).toBe(2); // pod-c's chunk is outside the window
+    expect(rate.docsPerSecond).toBeCloseTo(10_000 / 120, 5);
+    await mc2.db(DB).collection('mig_ranges').deleteMany({ run_id: CR } as never);
+    await mc2.close();
+  });
+
+  it('activeClaims is lease-aware: dead pods\' stale claims do not count, live ones do', async () => {
+    const AC = 'active-claims-run';
+    const mk = (idx: number, pod: string, status: string, leaseMs: number): Record<string, unknown> => ({
+      _id: `${AC}:collA:${idx}`, run_id: AC, collection: 'collA',
+      scope_a: null, scope_e: null, scope_n: null, idx,
+      lower_cd: idx * 1000, upper_cd: (idx + 1) * 1000,
+      status, pod_id: pod, lease_until: new Date(Date.now() + leaseMs), staging_table: null,
+      docs_read: 0, docs_skipped: 0, rows_expected: 0, partitions: [], attached: [],
+      attach_method: null, attempts: 1, last_error: null, transform_version: 'v1', updated_at: new Date(),
+    });
+    const mc3 = new MongoClient(MONGO_URI);
+    await mc3.connect();
+    await mc3.db(DB).collection('mig_ranges').insertMany([
+      mk(0, 'pod-live', 'in_progress', 60_000),    // live lease → counts
+      mk(1, 'pod-live', 'attaching', 60_000),      // live lease → counts
+      mk(2, 'pod-dead', 'in_progress', -60_000),   // expired → crashed pod, ignored
+      mk(3, 'pod-me', 'written', 60_000),          // the asking pod itself, excluded
+      { ...mk(4, 'pod-done', 'done', 60_000) },    // terminal, ignored
+    ] as never[]);
+    const active = await ledger.activeClaims(AC, 'pod-me');
+    expect(active).toEqual([{ pod: 'pod-live', count: 2 }]);
+    // without exclusion the asking pod shows up too
+    const all = await ledger.activeClaims(AC);
+    expect(all.map((r) => r.pod).sort()).toEqual(['pod-live', 'pod-me']);
+    await mc3.db(DB).collection('mig_ranges').deleteMany({ run_id: AC } as never);
+    await mc3.close();
+  });
+
+  it('tape window: frontier, position, and slice follow the global claim order', async () => {
+    const TR = 'tape-run';
+    // claim order = collection asc, idx desc: collA#2, collA#1, collA#0, collB#1, collB#0
+    await ledger.initChunks(TR, 'collA', [0, 1, 2].map((i) => ({ lowerCd: i * 10, upperCd: (i + 1) * 10 })), 'v1');
+    await ledger.initChunks(TR, 'collB', [0, 1].map((i) => ({ lowerCd: i * 10, upperCd: (i + 1) * 10 })), 'v1');
+    const mc4 = new MongoClient(MONGO_URI);
+    await mc4.connect();
+    const mark = (id: string, status: string): Promise<unknown> =>
+      mc4.db(DB).collection('mig_ranges').updateOne({ _id: id } as never, { $set: { status } } as never);
+    // first two tape positions done; a FAILED chunk next must not pin the frontier
+    await mark(`${TR}:collA:2`, 'done');
+    await mark(`${TR}:collA:1`, 'done');
+    await mark(`${TR}:collA:0`, 'failed');
+
+    const frontier = (await ledger.findFrontier(TR))!;
+    expect(frontier._id).toBe(`${TR}:collB:1`); // failed is passed over, tape order holds
+    expect(await ledger.countTapeBefore(TR, frontier)).toBe(3);
+
+    const slice = await ledger.tapeSlice(TR, 1, 3);
+    expect(slice.map((c) => c._id)).toEqual([`${TR}:collA:1`, `${TR}:collA:0`, `${TR}:collB:1`]);
+
+    await mc4.db(DB).collection('mig_ranges').deleteMany({ run_id: TR } as never);
+    await mc4.close();
+  });
+
+  it('guarded transitions reject wrong from-state', async () => {
+    const moved = await ledger.transition('r1:coll:2', 'pending', 'done');
+    expect(moved).toBeNull(); // it's in_progress, not pending
+    const ok = await ledger.transition('r1:coll:2', 'in_progress', 'written', { rows_expected: 10 });
+    expect(ok?.status).toBe('written');
+  });
+
+  it('findRecoverable honors lease expiry for multi-pod reclaim', async () => {
+    // Nothing expired yet
+    expect((await ledger.findRecoverable('r1', 'coll', false)).length).toBe(0);
+    // includeAll (single-pod startup) sees all non-terminal chunks
+    const all = await ledger.findRecoverable('r1', 'coll', true);
+    expect(all.length).toBe(2); // idx2 written + idx1 in_progress
+  });
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end chunk pipeline (real MongoDB + ClickHouse, no Redis)
+// ---------------------------------------------------------------------------
+
+describe('ledger engine end-to-end', () => {
+  const CLEAN_DOCS = 2_000;
+  let ch: ClickHouseClient;
+  let mc: MongoClient;
+  let orchestrator: ChunkOrchestrator;
+  let dlq: DlqStore;
+  const closers: Array<() => Promise<void>> = [];
+
+  beforeAll(async () => {
+    mc = new MongoClient(MONGO_URI);
+    await mc.connect();
+    await mc.db(DB).dropDatabase();
+
+    ch = createClient({ url: CH_URL, password: CH_PASSWORD });
+    await ch.command({ query: `CREATE DATABASE IF NOT EXISTS ${DB}` });
+    await ch.command({ query: `DROP TABLE IF EXISTS ${DB}.drill_events` });
+    await ch.command({
+      query: `CREATE TABLE ${DB}.drill_events (
+        \`a\` LowCardinality(String), \`e\` LowCardinality(String), \`n\` String,
+        \`uid\` String, \`uid_canon\` Nullable(String), \`did\` String, \`lsid\` Nullable(String),
+        \`_id\` String, \`ts\` DateTime64(3), \`up\` JSON(max_dynamic_paths = 32),
+        \`custom\` Nullable(JSON(max_dynamic_paths = 0)), \`cmp\` Nullable(JSON(max_dynamic_paths = 0)),
+        \`sg\` JSON(max_dynamic_paths = 0), \`c\` UInt32, \`s\` Float64, \`dur\` Float64,
+        \`lu\` Nullable(DateTime64(3)), \`cd\` DateTime64(3) DEFAULT now64(3))
+      ENGINE = MergeTree PARTITION BY toYYYYMM(ts, 'UTC') ORDER BY (a, e, n, ts)`,
+    });
+
+    // Seed: clean docs + 3 transform-poisoned docs (bad ts) + 1 coercion doc
+    const coll = mc.db(DB).collection('drill_events');
+    const base = Date.UTC(2026, 0, 1);
+    const docs: Record<string, unknown>[] = [];
+    for (let i = 0; i < CLEAN_DOCS; i++) {
+      const ts = base + i * 60_000;
+      docs.push({
+        _id: `doc_${i}`, a: 'app1', e: i % 3 === 0 ? '[CLY]_view' : 'my_event',
+        uid: String(i % 50), did: `d${i}`, ts, cd: new Date(ts),
+        up: { p: 'iOS' }, sg: i % 3 === 0 ? { name: '/home' } : { price: 9.99 }, c: 1,
+      });
+    }
+    for (let i = 0; i < 3; i++) {
+      docs.push({ _id: `poison_${i}`, a: 'app1', e: 'bad', uid: 'u', ts: 'not-a-ts', cd: new Date(base + i) });
+    }
+    docs.push({
+      _id: 'coerce_me', a: 'app1', e: 'big_int_event', uid: 'u9', did: 'd9',
+      ts: base + 1, cd: new Date(base + 1), sg: { order_id: 9.2e25, weird: Number.POSITIVE_INFINITY, user_ref: 5.2601586211929e19 }, c: 1,
+    });
+    // Docs with no cd value — must be picked up by the null-cd sweep chunk
+    docs.push({ _id: 'nocd_1', a: 'app1', e: 'legacy_event', uid: 'u1', did: 'd', ts: base - 86_400_000 });
+    docs.push({ _id: 'nocd_2', a: 'app1', e: 'legacy_event', uid: 'u2', did: 'd', ts: base - 86_400_000, cd: null });
+    // REGRESSION: null-cd doc whose derived cd (from ts) lands INSIDE the
+    // regular chunks' windows. If the sweep ran before regular chunks, its
+    // row would poison their verify-then-attach check → silently missing
+    // data. The sweep must be ordered strictly last.
+    docs.push({ _id: 'nocd_overlap', a: 'app1', e: 'legacy_event', uid: 'u3', did: 'd', ts: base + 120_000 });
+    await coll.insertMany(docs as never[]);
+    await coll.createIndex({ cd: 1, _id: 1 });
+
+    // Engine wiring (mirrors ledger-engine.ts, minus HTTP)
+    process.env.SERVICE_NAME = 'ledger-e2e';
+    process.env.MONGO_URI = MONGO_URI;
+    process.env.MONGO_DB = DB;
+    process.env.MANIFEST_DB = DB;
+    process.env.CLICKHOUSE_URL = CH_URL;
+    process.env.CLICKHOUSE_PASSWORD = CH_PASSWORD;
+    process.env.CLICKHOUSE_DB = DB;
+    process.env.LEDGER_RUN_ID = 'e2e-1';
+    process.env.LEDGER_CHUNK_DOCS_TARGET = '500';
+    process.env.LEDGER_MONITOR_INTERVAL_MS = '0';
+    process.env.BACKPRESSURE_ENABLED = 'false';
+    const config = loadConfig();
+
+    const mongoReader = new MongoReader({
+      uri: MONGO_URI, database: DB, readPreference: 'primary', readConcern: 'local',
+      retryReads: true, appName: 'e2e', cursorBatchSize: 500, maxTimeMs: 60_000,
+    }, logger);
+    const ledger = new LedgerStore(MONGO_URI, DB, logger);
+    dlq = new DlqStore(MONGO_URI, DB, logger);
+    const staging = new StagingManager({
+      url: CH_URL, database: DB, table: 'drill_events', username: 'default', password: CH_PASSWORD, queryTimeoutMs: 60_000,
+    }, logger);
+    const retryPolicy = new RetryPolicy({ maxRetries: 2, baseDelayMs: 50, maxDelayMs: 200 });
+    const hashResolver = new HashResolver({ uri: MONGO_URI, countlyDb: `${DB}_countly` }, logger);
+
+    await mongoReader.connect();
+    await ledger.connect();
+    await dlq.connect();
+    await staging.connect();
+    await hashResolver.build();
+    closers.push(() => mongoReader.close(), () => ledger.close(), () => dlq.close(), () => staging.close(), () => hashResolver.close());
+
+    orchestrator = new ChunkOrchestrator({
+      config, logger, mongoReader, ledger, dlq, staging, retryPolicy, hashResolver,
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    for (const close of closers) await close().catch(() => {});
+    await ch.command({ query: `DROP DATABASE IF EXISTS ${DB}` }).catch(() => {});
+    await ch.close();
+    await mc.db(DB).dropDatabase().catch(() => {});
+    await mc.close();
+  });
+
+  it('migrates exactly: clean docs land once, poisoned docs go to DLQ with raw docs, coercions counted', async () => {
+    await orchestrator.run();
+
+    const res = await ch.query({
+      query: `SELECT count() AS t, uniqExact(_id) AS u FROM ${DB}.drill_events`,
+      format: 'JSONEachRow',
+    });
+    const [row] = await res.json<{ t: string; u: string }>();
+    // clean docs + coercion doc + 3 null-cd docs land; the 3 poisoned do not
+    expect(Number(row.t)).toBe(CLEAN_DOCS + 4);
+    expect(Number(row.u)).toBe(CLEAN_DOCS + 4); // zero duplicates
+
+    // Null-cd docs arrived via the sweep chunk
+    const nocd = await ch.query({
+      query: `SELECT count() AS c FROM ${DB}.drill_events WHERE _id LIKE 'nocd_%'`,
+      format: 'JSONEachRow',
+    });
+    expect(Number((await nocd.json<{ c: string }>())[0].c)).toBe(3);
+
+    // DLQ carries the poisoned docs WITH their raw source docs
+    const pending = await dlq.listPending('e2e-1');
+    expect(pending.length).toBe(3);
+    expect(pending.every((p) => p.reason === 'skipped' && p.error === 'skip:invalid_ts')).toBe(true);
+    expect(pending.every((p) => typeof p.raw_doc === 'object' && p.raw_doc.ts === 'not-a-ts')).toBe(true);
+
+    // Spec behavior: finite large double stays numeric; Infinity stringified
+    const coerced = await ch.query({
+      query: `SELECT sg.order_id AS v, sg.weird AS w, sg.user_ref AS u FROM ${DB}.drill_events WHERE _id = 'coerce_me'`,
+      format: 'JSONEachRow',
+    });
+    const [c] = await coerced.json<{ v: unknown; w: unknown; u: unknown }>();
+    expect(Number(c.v)).toBe(9.2e25);
+    expect(String(c.w)).toBe('Infinity');
+    // The overflow-window value LANDED (previously insert_rejected → DLQ),
+    // losslessly, as the string it would have serialized to
+    expect(String(c.u)).toBe('52601586211929000000');
+
+    // Platform-compat: countly-platform's WhereClauseConverter queries sg
+    // numerically as toFloat64OrNull(CAST(field,'String')) — through that
+    // pattern the stringified value behaves EXACTLY like the number would,
+    // so product queries (filters, sums) are unaffected by the coercion.
+    const viaPlatformPattern = await ch.query({
+      query: `SELECT toFloat64OrNull(CAST(sg.user_ref, 'String')) AS f
+              FROM ${DB}.drill_events WHERE _id = 'coerce_me'`,
+      format: 'JSONEachRow',
+    });
+    expect(Number((await viaPlatformPattern.json<{ f: number }>())[0].f)).toBe(5.2601586211929e19);
+
+    const stats = orchestrator.getStats();
+    expect(stats.totalCoercions).toBeGreaterThanOrEqual(1);
+    expect(stats.chunksFailed).toBe(0);
+    expect(stats.status).toBe('completed');
+
+    const report = await orchestrator.getReport();
+    expect((report.dlq as { byStatus: Record<string, number> }).byStatus.pending).toBe(3);
+  }, 120_000);
+
+  it('replayDlq keeps still-broken docs pending with an updated error', async () => {
+    const { replayed, stillFailing } = await orchestrator.replayDlq();
+    expect(replayed).toBe(0);       // bad ts still fails transform under same version
+    expect(stillFailing).toBe(3);
+    const pending = await dlq.listPending('e2e-1');
+    expect(pending.length).toBe(3);
+    expect(pending[0].error).toContain('still fails transform');
+  }, 60_000);
+
+  it('waive is the terminal operator decision: pending drains, raw docs retained', async () => {
+    const waived = await dlq.waive('e2e-1');
+    expect(waived).toBe(3);
+    expect((await dlq.listPending('e2e-1')).length).toBe(0);
+    const byStatus = await dlq.countByStatus('e2e-1');
+    expect(byStatus.waived).toBe(3); // still in the DLQ as the record of what was excluded
+  }, 30_000);
+});

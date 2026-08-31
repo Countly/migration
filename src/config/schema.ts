@@ -36,13 +36,64 @@ const positiveIntFromEnv = z
 // ---------------------------------------------------------------------------
 
 export const configSchema = z.object({
+    // ── Ledger engine ────────────────────────────────────────────────────
+    ledger: z
+        .object({
+            runId: z.string().default("ledger-v1"),
+            chunkDocsTarget: positiveIntFromEnv.default(2_000_000),
+            insertInflight: positiveIntFromEnv.default(3),
+            leaseSec: positiveIntFromEnv.default(600),
+            // Circuit breaker: pause when >pct% of a chunk's docs fail, or
+            // after N consecutive failed chunks (systematic-bug detection).
+            breakerPct: numberFromEnv.default(5).pipe(z.number().min(0).max(100)),
+            // Per-chunk breakers miss EVENLY-SPREAD failure (1% of every
+            // chunk never trips 5%-of-one-chunk) — this is the global guard.
+            dlqPauseThreshold: numberFromEnv.default(1_000_000).pipe(z.number().min(0)),
+            // Tally-independent per-commit guard: after each chunk promotes,
+            // ask the SOURCE how many docs its window holds. ~1% overhead.
+            sourceCountCheck: booleanFromEnv.default(true),
+            breakerConsecutive: positiveIntFromEnv.default(3),
+            // Background invariant spot checks (0 disables).
+            monitorIntervalMs: intFromEnv.default(900_000),
+            // Capture full raw docs of transform failures into the DLQ.
+            captureTransformErrors: booleanFromEnv.default(true),
+            // Upper bound on a chunk's time span. Guards chunk sizing against
+            // bad estimatedDocumentCount (e.g. metadata fastcount reset after
+            // an unclean mongod shutdown) — a wrong estimate can never produce
+            // a whole-collection mega-chunk.
+            maxChunkDays: numberFromEnv.default(7).pipe(z.number().positive()),
+            // Mirror-first mode: migrate ONLY cd < this bound (the mirror's
+            // checkpoint T0); the mapper clamps to it and top-up never
+            // crosses it — everything at/after belongs to the live mirror.
+            cdUpperBoundMs: z
+                .union([z.string(), z.number(), z.null(), z.undefined()])
+                .transform((v, ctx) => {
+                    if (v === null || v === undefined || v === "") return null;
+                    const ms = typeof v === "number" ? v : /^\d+$/.test(v) ? Number(v) : Date.parse(v);
+                    if (!Number.isFinite(ms) || ms <= 0) {
+                        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `LEDGER_CD_UPPER_BOUND must be ISO date or epoch ms, got: ${String(v)}` });
+                        return z.NEVER;
+                    }
+                    return ms;
+                }),
+            // Deploy now, start later: hold every pod BEFORE mapping until
+            // an operator opens the run's start gate (dashboard Start button,
+            // or POST /control/resume). The gate lives in the ledger, so one
+            // click starts the whole fleet, pods that join later start
+            // immediately, and a pod that restarts after Start stays started.
+            startPaused: booleanFromEnv.default(false),
+            // Dry run: sampled rehearsal against a Null-engine clone.
+            dryRun: booleanFromEnv.default(false),
+            dryRunSamplePct: numberFromEnv.default(2).pipe(z.number().min(0.1).max(5)),
+        })
+        .default({}),
+
     // ── Service ──────────────────────────────────────────────────────────
     service: z.object({
-        name: z.string().min(1),
+        name: z.string().min(1).default("drill-migrator"),
         port: positiveIntFromEnv.default(8080),
         host: z.string().default("0.0.0.0"),
         gracefulShutdownTimeoutMs: intFromEnv.default(60_000),
-        rerunMode: z.enum(['resume', 'clone-run', 'new-run']).default('resume'),
         exitOnComplete: booleanFromEnv.default(false),
     }),
 
@@ -52,22 +103,19 @@ export const configSchema = z.object({
         db: z.string().default("countly_drill"),
         countlyDb: z.string().default("countly"),
         collectionPrefix: z.string().default("drill_events"),
-        readPreference: z.string().default("primary"),
+        readPreference: z.string().default("auto"),
+        readPreferenceAuto: z.boolean().default(false),
         readConcern: z.string().default("majority"),
         retryReads: booleanFromEnv.default(true),
         appName: z.string().optional(),
-        batchRowsTarget: positiveIntFromEnv.default(10_000),
         mongoPageSize: positiveIntFromEnv.default(10_000),
         cursorBatchSize: positiveIntFromEnv.default(10_000),
         maxTimeMs: positiveIntFromEnv.default(600_000),
-        rangeParallelThreshold: intFromEnv.default(500_000),
-        rangeCount: positiveIntFromEnv.default(100),
-        rangeLeaseTtlSec: positiveIntFromEnv.default(300),
     }),
 
     // ── Transform ────────────────────────────────────────────────────────
     transform: z.object({
-        version: z.string().default("v1"),
+        version: z.string().default("v2"),
     }),
 
     // ── ClickHouse Target ────────────────────────────────────────────────
@@ -81,7 +129,6 @@ export const configSchema = z.object({
         maxRetries: intFromEnv.default(8),
         retryBaseDelayMs: positiveIntFromEnv.default(1_000),
         retryMaxDelayMs: positiveIntFromEnv.default(30_000),
-        useDedupToken: booleanFromEnv.default(true),
     }),
 
     // ── Backpressure ─────────────────────────────────────────────────────
@@ -97,38 +144,15 @@ export const configSchema = z.object({
         maxPauseEpisodeMs: intFromEnv.default(180_000),
     }),
 
-    // ── State ────────────────────────────────────────────────────────────
+    // ── State (chunk ledger + DLQ live here) ─────────────────────────────
     state: z.object({
         manifestDb: z.string().default("countly_drill"),
-        redisUrl: z.string().min(1),
-        redisKeyPrefix: z.string().default("mig"),
-        timelineSnapshotInterval: positiveIntFromEnv.default(10),
-    }),
-
-    // ── Memory / GC ─────────────────────────────────────────────────────
-    memory: z.object({
-        gcEnabled: booleanFromEnv.default(true),
-        gcRssSoftLimitMb: intFromEnv.default(3_072),
-        gcRssHardLimitMb: intFromEnv.default(6_144),
-        gcHeapUsedRatio: numberFromEnv.default(0.70),
-        gcEveryNBatches: intFromEnv.default(50),
     }),
 
     // ── Worker / Multi-Pod ──────────────────────────────────────────────
     worker: z.object({
         podId: z.string().default(""),
         enabled: booleanFromEnv.default(true),
-        lockTtlSec: positiveIntFromEnv.default(300),
-        lockRenewMs: positiveIntFromEnv.default(60_000),
-        progressUpdateMs: positiveIntFromEnv.default(5_000),
-        podHeartbeatMs: positiveIntFromEnv.default(30_000),
-        podDeadAfterSec: positiveIntFromEnv.default(180),
-    }),
-
-    // ── Async Write ──────────────────────────────────────────────────────
-    asyncWrite: z.object({
-        flushIntervalMs: positiveIntFromEnv.default(5_000),
-        flushBatchSize: positiveIntFromEnv.default(10),
     }),
 
     // ── Logging ──────────────────────────────────────────────────────────
