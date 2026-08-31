@@ -32,6 +32,9 @@ data:
   CLICKHOUSE_TABLE: "drill_events"
   # Stable resume key — keep identical across ALL pods and restarts.
   LEDGER_RUN_ID: "migration-1"
+  # Deploy now, start later: pods serve the dashboard and wait until Start
+  # is pressed once (the gate lives in the ledger, so it covers every pod).
+  #LEDGER_START_PAUSED: "true"
   # On a replica set, offload the primary (exact reads — source is frozen):
   #MONGO_READ_PREFERENCE: "secondaryPreferred"
 ---

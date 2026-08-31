@@ -76,6 +76,12 @@ export const configSchema = z.object({
                     }
                     return ms;
                 }),
+            // Deploy now, start later: hold every pod BEFORE mapping until
+            // an operator opens the run's start gate (dashboard Start button,
+            // or POST /control/resume). The gate lives in the ledger, so one
+            // click starts the whole fleet, pods that join later start
+            // immediately, and a pod that restarts after Start stays started.
+            startPaused: booleanFromEnv.default(false),
             // Dry run: sampled rehearsal against a Null-engine clone.
             dryRun: booleanFromEnv.default(false),
             dryRunSamplePct: numberFromEnv.default(2).pipe(z.number().min(0.1).max(5)),
