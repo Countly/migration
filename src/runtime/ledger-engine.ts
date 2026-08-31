@@ -221,7 +221,18 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   });
   app.get('/report', async () => orchestrator.getReport());
   app.post('/control/pause', async () => { orchestrator.pause(); return { status: orchestrator.getStatus() }; });
-  app.post('/control/resume', async () => { orchestrator.resume(); return { status: orchestrator.getStatus() }; });
+  // Resume doubles as Start: opening the gate is what releases every pod
+  // held by LEDGER_START_PAUSED, not just the one serving this request.
+  app.post('/control/resume', async () => {
+    if (config.ledger.startPaused) {
+      const gateRunId = config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId;
+      await ledger.openStartGate(gateRunId, config.worker.podId).catch((err) => {
+        logger.error({ err }, 'Failed to open the start gate — other pods stay held');
+      });
+    }
+    orchestrator.resume();
+    return { status: orchestrator.getStatus() };
+  });
   // Replay runs in the background: a mass DLQ (systematic failure on a
   // 10B-doc run) can hold millions of entries — not one HTTP request's work.
   const replayState: { status: string; result: Record<string, unknown> | null; error: string | null } =

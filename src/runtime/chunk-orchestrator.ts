@@ -138,7 +138,7 @@ export class ChunkOrchestrator {
   private consecutiveFailed = 0;
   private sourceShrankChunks = 0;
   private streakHadPermanent = false;
-  private pauseReason: 'operator' | 'breaker-transient' | 'breaker-data' | null = null;
+  private pauseReason: 'operator' | 'not-started' | 'breaker-transient' | 'breaker-data' | null = null;
   private probeOkStreak = 0;
   private autoResuming = false;
   private resumeProbeTimer: NodeJS.Timeout | null = null;
@@ -172,7 +172,7 @@ export class ChunkOrchestrator {
   // -------------------------------------------------------------------------
 
   stopAfterChunk(): void { this.stopping = true; }
-  pause(reason: 'operator' | 'breaker-transient' | 'breaker-data' = 'operator'): void {
+  pause(reason: 'operator' | 'not-started' | 'breaker-transient' | 'breaker-data' = 'operator'): void {
     this.paused = true;
     this.pauseReason = reason;
     if (this.status === 'running') this.status = 'paused';
@@ -212,6 +212,35 @@ export class ChunkOrchestrator {
     this.startedAt = Date.now();
     this.finishedAt = 0;
     const { config } = this.d;
+
+    // ── START GATE ────────────────────────────────────────────────────────
+    // Deploy now, start later. Held BEFORE mapping deliberately: mapping
+    // builds the {cd:1,_id:1} index on the source and cuts the chunk grid,
+    // neither of which a not-yet-started run should be doing. The HTTP
+    // surface is already listening, so preflight, index builds and the dry
+    // run are all available from the dashboard while the pod waits here.
+    if (config.ledger.startPaused) {
+      // Effective run id: a dry run has its own gate (`<runId>-dry`), so
+      // starting a rehearsal cannot silently pre-authorise the real run.
+      const gateRunId = this.runId;
+      if (!(await this.d.ledger.isStartGateOpen(gateRunId).catch(() => false))) {
+        this.pause('not-started');
+        this.logger.warn(
+          { runId: gateRunId },
+          'LEDGER_START_PAUSED: holding before mapping — press Start on the dashboard (POST /control/resume) to begin',
+        );
+        while (this.paused && !this.stopping) {
+          if (await this.d.ledger.isStartGateOpen(gateRunId).catch(() => false)) {
+            this.logger.info({ runId: gateRunId }, 'Start gate opened — beginning the run');
+            this.resume();
+            break;
+          }
+          await sleep(3_000);
+        }
+        if (this.stopping) { this.status = 'stopped'; return; }
+        this.startedAt = Date.now(); // the run starts when it was started
+      }
+    }
 
     // Transient-outage self-healing: only acts while paused with reason
     // 'breaker-transient' (backend outage tripped the failure breaker) —
@@ -263,6 +292,10 @@ export class ChunkOrchestrator {
 
     let mapPass = 0;
     for (;;) {
+      if (this.stopping) break;
+      // Honour a pause here too: without this, a pause issued during a long
+      // mapping or top-up pass is not observed until claiming begins.
+      while (this.paused && !this.stopping) await sleep(1_000);
       if (this.stopping) break;
       const storedBound = await this.d.ledger.getStoredBound(this.runId).catch(() => null);
       if (storedBound !== null) {

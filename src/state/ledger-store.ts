@@ -475,7 +475,10 @@ export class LedgerStore {
    * wins as the source of truth when present; this store only fills in
    * when env is unset, and pods re-read it at every map pass.
    */
-  private rc(): Collection<{ _id: string; cd_upper_bound_ms: number; set_at: Date; set_by: string }> {
+  private rc(): Collection<{
+    _id: string; cd_upper_bound_ms: number; set_at: Date; set_by: string;
+    start_gate_open?: boolean; start_gate_opened_at?: Date; start_gate_opened_by?: string;
+  }> {
     if (!this.coll) throw new Error('LedgerStore not connected');
     return this.client.db(this.dbName).collection('mig_run_config');
   }
@@ -510,6 +513,29 @@ export class LedgerStore {
       startedAtMs: doc?.run_started_at ? doc.run_started_at.getTime() : null,
       completedAtMs: doc?.run_completed_at ? doc.run_completed_at.getTime() : null,
     };
+  }
+
+  /**
+   * Start gate (mig_run_config): with LEDGER_START_PAUSED set, pods hold
+   * before mapping until this is opened once for the run. It lives with the
+   * run rather than in one pod's memory, so a single Start covers every pod
+   * (including ones that join afterwards) and survives restarts.
+   */
+  async isStartGateOpen(runId: string): Promise<boolean> {
+    const doc = await this.rc().findOne({ _id: runId });
+    return doc?.start_gate_open === true;
+  }
+
+  async openStartGate(runId: string, openedBy: string): Promise<void> {
+    await this.rc().updateOne(
+      { _id: runId },
+      [{ $set: {
+        start_gate_open: true,
+        start_gate_opened_at: { $ifNull: ['$start_gate_opened_at', '$$NOW'] },
+        start_gate_opened_by: { $ifNull: ['$start_gate_opened_by', openedBy] },
+      } }] as never,
+      { upsert: true },
+    );
   }
 
   async getStoredBound(runId: string): Promise<number | null> {

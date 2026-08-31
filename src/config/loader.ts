@@ -25,6 +25,7 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             maxChunkDays: env.LEDGER_MAX_CHUNK_DAYS,
             cdUpperBoundMs: env.LEDGER_CD_UPPER_BOUND,
             captureTransformErrors: env.LEDGER_CAPTURE_TRANSFORM_ERRORS,
+            startPaused: env.LEDGER_START_PAUSED,
             dryRun: env.DRY_RUN,
             dryRunSamplePct: env.DRY_RUN_SAMPLE_PCT,
         },

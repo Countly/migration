@@ -819,7 +819,10 @@ async function tick() {
     var hint = document.getElementById('pause-hint');
     if (isPaused) {
       hint.style.display = '';
-      hint.textContent = '\u23f8 ENGINE PAUSED' +
+      hint.textContent = stats.pauseReason === 'not-started'
+        ? '\u23f8 NOT STARTED \u2014 deployed and waiting. Nothing has been read, mapped or indexed yet; '
+          + 'run preflight, build indexes and rehearse first, then click Start to begin the run (all pods).'
+        : '\u23f8 ENGINE PAUSED' +
         (stats.pauseReason === 'breaker-transient' ? ' (backend outage \u2014 auto-resume armed)' :
          stats.pauseReason === 'breaker-data' ? ' (systematic data problem \u2014 needs you)' : ' (by operator)') +
         ' \u2014 Retry / Replay / Waive only QUEUE work; click Resume to process it.';
@@ -828,7 +831,7 @@ async function tick() {
     if (prBtn) {
       if (isPaused) {
         prBtn.dataset.action = 'resume';
-        prBtn.innerHTML = '\u25b6 Resume';
+        prBtn.innerHTML = stats.pauseReason === 'not-started' ? '\u25b6 Start' : '\u25b6 Resume';
         prBtn.classList.add('primary');
         prBtn.disabled = false;
       } else if (stats.status === 'running') {
