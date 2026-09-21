@@ -578,8 +578,8 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, (r) => restores.push(r));
       // Compare-and-set against the prior bound this call validated: two
       // concurrent applies cannot both win — the loser rolls its prune back.
-      const stored = await ledger.setStoredBoundIf(config.ledger.runId, boundMs, source, priorBound);
-      if (!stored) {
+      const applyToken = await ledger.setStoredBoundIf(config.ledger.runId, boundMs, source, priorBound);
+      if (applyToken === null) {
         // a competing apply won: restore only what ITS bound permits — and
         // if that bound cannot be read, restore NOTHING (fail closed: an
         // unbounded restore could resurrect chunks the winner pruned)
@@ -618,9 +618,9 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         // and its configuration must not be clobbered
         let boundRolledBack = false;
         try {
-          boundRolledBack = priorBound !== null
-            ? await ledger.setStoredBoundIf(config.ledger.runId, priorBound, `${source} rollback`, boundMs)
-            : await ledger.clearStoredBoundIf(config.ledger.runId, boundMs);
+          // token predicate, not value: an identical-value re-apply by a
+          // competing request owns a DIFFERENT token and is never unwound
+          boundRolledBack = await ledger.rollbackStoredBound(config.ledger.runId, applyToken, priorBound);
         } catch (e) { rollbackErrors.push(`bound: ${(e as Error).message}`); }
         // restore chunks under whatever bound now governs the grid
         let governing: number | null = priorBound;

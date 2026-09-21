@@ -126,6 +126,17 @@ export class DlqStore {
    * table is accounted for, not a disagreement. Entries written before the
    * cd_ms field (or with unparseable cd/ts) can't be attributed and count 0.
    */
+  /** The window's unresolved (pending/waived) source ids — for absent-intersection at window level. Capped; ids beyond the cap get NO discount (strict direction). */
+  async listUnresolvedIdsInWindow(runId: string, collection: string, lowerCdMs: number, upperCdMs: number, cap = 200_000): Promise<string[]> {
+    const rows = await this.c()
+      .find(
+        { run_id: runId, collection, status: { $in: ['pending', 'waived'] }, cd_ms: { $gte: lowerCdMs, $lt: upperCdMs } },
+        { projection: { source_id: 1 }, limit: cap },
+      )
+      .toArray();
+    return rows.map((r) => r.source_id);
+  }
+
   /** Unresolved (pending/waived) count among arbitrarily many ids — batched $in, constant memory. */
   async countUnresolvedAmong(runId: string, collection: string, ids: string[]): Promise<number> {
     let total = 0;

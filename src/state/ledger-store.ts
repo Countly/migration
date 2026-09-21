@@ -487,6 +487,7 @@ export class LedgerStore {
    */
   private rc(): Collection<{
     _id: string; cd_upper_bound_ms: number; set_at: Date; set_by: string;
+    bound_token?: string;
     start_gate_open?: boolean; start_gate_opened_at?: Date; start_gate_opened_by?: string;
     unbounded_ok?: boolean; unbounded_ok_by?: string; unbounded_ok_at?: Date;
   }> {
@@ -665,24 +666,45 @@ export class LedgerStore {
     await this.rc().updateOne({ _id: runId }, { $unset: { cd_upper_bound_ms: '', set_at: '', set_by: '' } });
   }
 
-  /** Compare-and-set: store the bound only if the current stored value still equals what the caller validated against. */
-  async setStoredBoundIf(runId: string, boundMs: number, setBy: string, expectedPrior: number | null): Promise<boolean> {
+  /**
+   * Compare-and-set: store the bound only if the current stored value still
+   * equals what the caller validated against. Returns an OWNERSHIP TOKEN:
+   * the rollback predicate matches the token, not the value, so an
+   * identical-value re-apply by someone else (value-ABA) is never unwound
+   * by this caller's rollback.
+   */
+  async setStoredBoundIf(runId: string, boundMs: number, setBy: string, expectedPrior: number | null): Promise<string | null> {
+    const token = `${setBy}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
     if (expectedPrior === null) {
       const res = await this.rc().updateOne(
         { _id: runId, cd_upper_bound_ms: { $exists: false } },
-        { $set: { cd_upper_bound_ms: boundMs, set_at: new Date(), set_by: setBy } },
+        { $set: { cd_upper_bound_ms: boundMs, set_at: new Date(), set_by: setBy, bound_token: token } },
         { upsert: true },
       ).catch((err: unknown) => {
         // duplicate-key on upsert = the doc appeared with a bound mid-flight
         if ((err as { code?: number }).code === 11000) return { matchedCount: 0, upsertedCount: 0 };
         throw err;
       });
-      return res.matchedCount > 0 || (res as { upsertedCount?: number }).upsertedCount === 1;
+      return (res.matchedCount > 0 || (res as { upsertedCount?: number }).upsertedCount === 1) ? token : null;
     }
     const res = await this.rc().updateOne(
       { _id: runId, cd_upper_bound_ms: expectedPrior },
-      { $set: { cd_upper_bound_ms: boundMs, set_at: new Date(), set_by: setBy } },
+      { $set: { cd_upper_bound_ms: boundMs, set_at: new Date(), set_by: setBy, bound_token: token } },
     );
+    return res.matchedCount > 0 ? token : null;
+  }
+
+  /** Unwind ONLY the store identified by the token — restores the prior value or clears. Returns false if someone else's store governs now. */
+  async rollbackStoredBound(runId: string, token: string, priorBound: number | null): Promise<boolean> {
+    const res = priorBound === null
+      ? await this.rc().updateOne(
+        { _id: runId, bound_token: token },
+        { $unset: { cd_upper_bound_ms: '', set_at: '', set_by: '', bound_token: '' } },
+      )
+      : await this.rc().updateOne(
+        { _id: runId, bound_token: token },
+        { $set: { cd_upper_bound_ms: priorBound, set_at: new Date(), set_by: 'rollback', bound_token: `rollback:${token}` } },
+      );
     return res.matchedCount > 0;
   }
 

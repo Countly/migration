@@ -274,9 +274,18 @@ export async function rebuildLedger(opts: {
         const liveSumCd = (((liveAgg.sumCd - (sweptSum % MOD)) % MOD) + MOD) % MOD;
 
         // Docs in this window that are KNOWN unmigrated (pending/waived DLQ)
-        // legitimately explain source > live — without this, a window whose
-        // only shortfall is its own DLQ'd docs gets flagged/redone forever.
-        const unresolved = await dlq.countUnresolvedInWindow(runId, collection, b.lowerCd, b.upperCd);
+        // legitimately explain source > live — but only the ABSENT ones: a
+        // waived id that is nevertheless live (redo, manual repair) counted
+        // once in live and again in the discount could mask a different
+        // missing doc. Ids beyond the listing cap get NO discount (strict).
+        let unresolved = 0;
+        {
+          const dlqIds = await dlq.listUnresolvedIdsInWindow(runId, collection, b.lowerCd, b.upperCd);
+          if (dlqIds.length > 0) {
+            const presentDlq = await staging.countDistinctMatchingIdsInWindow(dlqIds, b.lowerCd, b.upperCd, scope);
+            unresolved = Math.max(0, dlqIds.length - presentDlq);
+          }
+        }
 
         // Unscopable collection (base drill_events with embedded a/e) among
         // OTHERS: an unscoped window count includes sibling rows, so no

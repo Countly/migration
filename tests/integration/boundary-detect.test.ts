@@ -145,11 +145,23 @@ describe('tee-boundary detection + sync parity', () => {
 
   it('stored-bound compare-and-set: only the apply that validated against the current value wins', async () => {
     const RUN2 = 'boundary-cas-1';
-    expect(await ledger.setStoredBoundIf(RUN2, 1_000_000_000_000, 'a', null)).toBe(true);
-    expect(await ledger.setStoredBoundIf(RUN2, 1_100_000_000_000, 'b', null)).toBe(false);
-    expect(await ledger.setStoredBoundIf(RUN2, 1_200_000_000_000, 'c', 1_000_000_000_000)).toBe(true);
-    expect(await ledger.setStoredBoundIf(RUN2, 1_300_000_000_000, 'd', 1_000_000_000_000)).toBe(false);
+    const t1 = await ledger.setStoredBoundIf(RUN2, 1_000_000_000_000, 'a', null);
+    expect(t1).toBeTruthy();
+    expect(await ledger.setStoredBoundIf(RUN2, 1_100_000_000_000, 'b', null)).toBeNull();
+    const t2 = await ledger.setStoredBoundIf(RUN2, 1_200_000_000_000, 'c', 1_000_000_000_000);
+    expect(t2).toBeTruthy();
+    expect(await ledger.setStoredBoundIf(RUN2, 1_300_000_000_000, 'd', 1_000_000_000_000)).toBeNull();
     expect(await ledger.getStoredBound(RUN2)).toBe(1_200_000_000_000);
+
+    // value-ABA: a competing apply re-stores the SAME value under its own
+    // token — the earlier owner's rollback must not unwind it
+    const t3 = await ledger.setStoredBoundIf(RUN2, 1_200_000_000_000, 'e', 1_200_000_000_000);
+    expect(t3).toBeTruthy();
+    expect(await ledger.rollbackStoredBound(RUN2, t2 as string, 1_000_000_000_000)).toBe(false);
+    expect(await ledger.getStoredBound(RUN2)).toBe(1_200_000_000_000);
+    // the CURRENT owner's rollback works
+    expect(await ledger.rollbackStoredBound(RUN2, t3 as string, 1_000_000_000_000)).toBe(true);
+    expect(await ledger.getStoredBound(RUN2)).toBe(1_000_000_000_000);
   });
 
   it('restorePrune under a winning bound never resurrects what that bound pruned', async () => {
