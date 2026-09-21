@@ -212,6 +212,23 @@ export async function runFinalCheck(
       const excluded = audit.excludedBeyondCutover ?? 0;
       out.notes.push(`Source docs after the cutover (${iso(cutoverMs)}) were excluded from the comparison${excluded > 0 ? ` (${fmt(excluded)} docs)` : ''} — after that moment the old side receives mirrored/live traffic that was never meant to be migrated, so divergence there is expected and is NOT data loss.`);
     }
+    // Coverage reconciliation: every collection the ledger migrated must
+    // have been found and audited in the source — a dropped/renamed source
+    // collection would otherwise silently vanish from the recount and the
+    // gate could PASS without examining it.
+    out.phase = 'reconciling audit coverage against the ledger';
+    const audited = new Set(audit.summary.map((s) => s.collection));
+    const ledgerColls = (await ledger.summarize(runId)).perCollection
+      .filter((c) => (c.byStatus.done ?? 0) > 0)
+      .map((c) => c.collection)
+      .filter((name) => {
+        const defaults = hashResolver.resolveCollectionName(name, config.source.collectionPrefix);
+        return !(defaults && (defaults.e === '[CLY]_apm_device' || defaults.e === '[CLY]_apm_network'));
+      });
+    const unaudited = ledgerColls.filter((name) => !audited.has(name));
+    if (unaudited.length > 0) {
+      out.problems.push(`${fmt(unaudited.length)} collection(s) hold completed chunks but were NOT found in the source during the recount (dropped or renamed? e.g. ${unaudited.slice(0, 3).join(', ')}) — their data cannot be re-proven against the source; do NOT decommission until this is explained.`);
+    }
     }
 
     // ── 4. Sampled content comparison ──────────────────────────────────────

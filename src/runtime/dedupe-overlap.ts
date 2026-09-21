@@ -124,7 +124,10 @@ export async function runDedupeOverlap(
     await mongo.connect();
     await staging.connect();
     const db = mongo.db(config.source.db);
-    const fpBefore = deps.ledger ? await deps.ledger.runFingerprint(config.ledger.runId).catch(() => null) : null;
+    // fail closed: without the initial fingerprint the staleness guard is
+    // blind, and execute could be licensed against unreviewed counts
+    let fpBefore: string | null = null;
+    if (deps.ledger) fpBefore = await deps.ledger.runFingerprint(config.ledger.runId);
 
     state.phase = 'discovering collections';
     const collections = await discoverCollections(db, config.source.collectionPrefix, logger);

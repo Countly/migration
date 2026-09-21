@@ -576,14 +576,29 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
       } catch (raceErr) {
         const rollbackErrors: string[] = [];
-        if (priorBound !== null) await ledger.setStoredBound(config.ledger.runId, priorBound, `${source} rollback`).catch((e: Error) => rollbackErrors.push(`bound: ${e.message}`));
-        else await ledger.clearStoredBound(config.ledger.runId).catch((e: Error) => rollbackErrors.push(`bound: ${e.message}`));
-        for (const r of restores.reverse()) await ledger.restorePrune(r, priorBound).catch((e: Error) => rollbackErrors.push(`chunks: ${e.message}`));
+        // conditional rollback: only unwind the bound if it still holds THIS
+        // call's value — another apply may have legitimately won meanwhile,
+        // and its configuration must not be clobbered
+        let boundRolledBack = false;
+        try {
+          boundRolledBack = priorBound !== null
+            ? await ledger.setStoredBoundIf(config.ledger.runId, priorBound, `${source} rollback`, boundMs)
+            : await ledger.clearStoredBoundIf(config.ledger.runId, boundMs);
+        } catch (e) { rollbackErrors.push(`bound: ${(e as Error).message}`); }
+        // restore chunks under whatever bound now governs the grid
+        let governing: number | null = priorBound;
+        if (!boundRolledBack && rollbackErrors.length === 0) {
+          try { governing = await ledger.getStoredBound(config.ledger.runId); }
+          catch (e) { rollbackErrors.push(`winner read: ${(e as Error).message}`); }
+        }
+        if (rollbackErrors.length === 0) {
+          for (const r of restores.reverse()) await ledger.restorePrune(r, governing).catch((e: Error) => rollbackErrors.push(`chunks: ${e.message}`));
+        }
         if (rollbackErrors.length > 0) {
           // an unverified rollback must never claim restoration
           return { applied: false, indeterminate: true, reason: `apply failed (${(raceErr as Error).message}) AND the rollback itself failed (${rollbackErrors.join('; ')}) — bound/grid state is INDETERMINATE: when MongoDB answers, read GET /api/boundary and mig_run_config, then re-apply the intended bound or Rebuild ledger from data` };
         }
-        return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (bound and pruned chunks restored) (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
+        return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (${boundRolledBack ? 'bound and pruned chunks restored' : 'a newer bound governs; chunks restored under it'}) (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
       }
     } catch (err) {
       const rollbackErrors: string[] = [];

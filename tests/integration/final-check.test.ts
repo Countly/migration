@@ -313,4 +313,11 @@ describe('final check: the interpreted sign-off', () => {
     expect(out.verdict).toBe('FAIL');
     expect(out.problems.join(' ')).toContain('ZERO rows');
   });
+
+  it('a source collection that vanished (dropped/renamed) fails coverage reconciliation', async () => {
+    await mc.db(DB).collection(COLL).drop();
+    const out = await check({ cutoverMs: CUTOVER });
+    expect(out.verdict).toBe('FAIL');
+    expect(out.problems.join(' ')).toContain('NOT found in the source');
+  });
 });

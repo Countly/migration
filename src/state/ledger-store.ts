@@ -641,6 +641,15 @@ export class LedgerStore {
     return res.matchedCount > 0;
   }
 
+  /** Clear the bound only if it still holds the value this caller stored — a rollback must never clobber a bound another apply won meanwhile. */
+  async clearStoredBoundIf(runId: string, expected: number): Promise<boolean> {
+    const res = await this.rc().updateOne(
+      { _id: runId, cd_upper_bound_ms: expected },
+      { $unset: { cd_upper_bound_ms: '', set_at: '', set_by: '' } },
+    );
+    return res.matchedCount > 0;
+  }
+
   async setStoredBound(runId: string, boundMs: number, setBy: string): Promise<void> {
     await this.rc().updateOne(
       { _id: runId },
