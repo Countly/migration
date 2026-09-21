@@ -165,6 +165,27 @@ For 2 and 3: use **Detect boundary** + **Apply this bound to the run**
 (one click covers all pods), verify the `bounded · cd < …` badge on every
 pod, and keep re-running sync parity during the validation window.
 
+## Clone-source variant (migrate from a frozen copy)
+
+A deployment may clone the old-arch MongoDB onto the new box and migrate
+from THAT clone while live ingestion moves to the new arch (optionally
+mirroring back to the old stack as the rollback net). Seen in the field;
+properties worth knowing:
+
+- The source is frozen at the clone moment, so no bound is needed and top-up
+  finds nothing — the startup guard will still ask (the target ingests live
+  while the run starts): **Proceed unbounded is correct** here.
+- Parity/audit tables compare against the CLONE: zeros after the clone
+  moment mean "clone taken here", not a dead mirror. The live old-arch Mongo
+  is invisible to the tool.
+- Duplicates exist ONLY if the clone was taken AFTER ingestion switched
+  (its tail then holds mirrored copies of natively-ingested events). Get the
+  two timestamps — T-swap and T-clone. T-clone ≤ T-swap → no duplicates,
+  skip dedupe. T-clone > T-swap → dedupe with exactly [T-swap, T-clone].
+- Any doc-count comparison against the live old-arch Mongo will drift by
+  everything ingested after T-clone — compare against the clone, or scope
+  counts to cd < T-clone.
+
 ## Tee-mirror cutover (customer keeps the old architecture until sign-off)
 
 For customers who require approval before switching: the old arch stays
