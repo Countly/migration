@@ -315,9 +315,15 @@ describe('final check: the interpreted sign-off', () => {
   });
 
   it('a source collection that vanished (dropped/renamed) fails coverage reconciliation', async () => {
+    // another collection remains, so discovery succeeds — the audited set is
+    // simply missing the collection whose completed chunks the ledger holds
+    const cd = START + 5_000;
+    await mc.db(DB).collection('drill_events_other').insertOne({ _id: 'x_0', uid: 'u', did: 'd', ts: cd, cd: new Date(cd), sg: {}, c: 1 } as never);
+    await ch.insert({ table: `${DB}.drill_events`, format: 'JSONEachRow', values: [chRow('x_0', cd)] });
     await mc.db(DB).collection(COLL).drop();
     const out = await check({ cutoverMs: CUTOVER });
     expect(out.verdict).toBe('FAIL');
     expect(out.problems.join(' ')).toContain('NOT found in the source');
+    expect(out.problems.join(' ')).toContain(COLL.slice(0, 20));
   });
 });
