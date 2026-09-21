@@ -262,6 +262,9 @@ export class LedgerStore {
         if ((err as { code?: number }).code !== 11000) throw err;
       }
     }
+    // map-vs-apply race: this pass may have read an older (or no) bound —
+    // re-check the CURRENT one and clean our own delta before anyone claims
+    await this.prunePendingBeyondStoredBound(runId);
     return docs.length;
   }
 
@@ -343,6 +346,9 @@ export class LedgerStore {
         if ((err as { code?: number }).code !== 11000) throw err;
       }
     }
+    // map-vs-apply race: this pass may have read an older (or no) bound —
+    // re-check the CURRENT one and clean our own delta before anyone claims
+    await this.prunePendingBeyondStoredBound(runId);
     return docs.length;
   }
 
@@ -613,6 +619,24 @@ export class LedgerStore {
       } },
     ]).toArray();
     return row ? `${row.n}:${row.done}:${row.maxU ? row.maxU.getTime() : 0}` : '0:0:0';
+  }
+
+  /**
+   * Self-heal for the map-vs-apply race: a map pass that read no bound (or
+   * an older one) may insert chunks a just-applied bound forbids. Called by
+   * the chunk-insert paths AFTER inserting: re-reads the CURRENT stored
+   * bound and prunes/clamps pending chunks beyond it, so a stale pass
+   * cleans up its own delta before the claim loop can drain it.
+   */
+  async prunePendingBeyondStoredBound(runId: string): Promise<number> {
+    const bound = await this.getStoredBound(runId);
+    if (bound === null) return 0;
+    const del = await this.c().deleteMany({ run_id: runId, lower_cd: { $gte: bound }, status: 'pending' });
+    await this.c().updateMany(
+      { run_id: runId, lower_cd: { $gte: 0, $lt: bound }, upper_cd: { $gt: bound }, status: 'pending' },
+      { $set: { upper_cd: bound, updated_at: new Date() } },
+    );
+    return del.deletedCount ?? 0;
   }
 
   /** Roll back a bound whose post-store verification failed — apply must never leave a half-applied bound behind. */

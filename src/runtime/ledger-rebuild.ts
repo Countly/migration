@@ -139,6 +139,29 @@ export async function rebuildLedger(opts: {
     // explains. Presence is an id-set lookup (scoped, windowed), never a
     // count: counts let a waived-but-present id discount twice and a
     // duplicate row vouch for a different id.
+    // Probe-spread sampling: K probes across the window's cd range, a slice
+    // from each — a natural-order LIMIT would be a deterministic prefix that
+    // never makes losses outside it eligible for checking.
+    const sampleWindowIds = async (
+      coll3: ReturnType<typeof db.collection>,
+      lowerCd: number,
+      upperCd: number,
+      n = 5_000,
+    ): Promise<string[]> => {
+      const PROBES = 10;
+      const per = Math.ceil(n / PROBES);
+      const out = new Set<string>();
+      for (let k = 0; k < PROBES; k++) {
+        const at = lowerCd + Math.floor((k / PROBES) * (upperCd - lowerCd));
+        const page = await coll3
+          .find({ cd: { $gte: new Date(at), $lt: new Date(upperCd) } }, { projection: { _id: 1 } })
+          .sort({ cd: 1 }).limit(per).toArray();
+        for (const d of page) out.add(String(d._id));
+        if (out.size >= n) break;
+      }
+      return [...out];
+    };
+
     const missingAfterDlq = async (
       collection2: string,
       sampleIds: string[],
@@ -286,9 +309,7 @@ export async function rebuildLedger(opts: {
             driftChecks++;
             progress.driftWindowsChecked = (progress.driftWindowsChecked ?? 0) + 1;
             if (mongoCount > 5_000) progress.driftWindowsPartial = (progress.driftWindowsPartial ?? 0) + 1;
-            const sampleIds = (await coll
-              .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
-              .limit(5_000).toArray()).map((d) => String(d._id));
+            const sampleIds = await sampleWindowIds(coll, b.lowerCd, b.upperCd);
             const missing = await missingAfterDlq(collection, sampleIds, b.lowerCd, b.upperCd, scope);
             if (missing > 0 && (progress.driftSubsetMissing ?? []).length < 200) {
               (progress.driftSubsetMissing ?? (progress.driftSubsetMissing = [])).push({
@@ -303,9 +324,7 @@ export async function rebuildLedger(opts: {
         // the same stride (unscoped lookup; _ids are effectively unique).
         if (checkOnly && unscopableInMulti && mongoCount > 0 && idChecks < 300 && idx % 25 === 0) {
           idChecks++;
-          const uSample = (await coll
-            .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
-            .limit(5_000).toArray()).map((d) => String(d._id));
+          const uSample = await sampleWindowIds(coll, b.lowerCd, b.upperCd);
           const uMissing = await missingAfterDlq(collection, uSample, b.lowerCd, b.upperCd, null);
           if (uMissing > 0 && (progress.idCoverageMissing ?? []).length < 200) {
             (progress.idCoverageMissing ?? (progress.idCoverageMissing = [])).push({
@@ -322,9 +341,7 @@ export async function rebuildLedger(opts: {
         if (checkOnly && !unscopableInMulti && live + unresolved === mongoCount && live > 0
             && idChecks < 300 && idx % 25 === 0) {
           idChecks++;
-          const idSample = (await coll
-            .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
-            .limit(5_000).toArray()).map((d) => String(d._id));
+          const idSample = await sampleWindowIds(coll, b.lowerCd, b.upperCd);
           const idMissing = await missingAfterDlq(collection, idSample, b.lowerCd, b.upperCd, scope);
           if (idMissing > 0 && (progress.idCoverageMissing ?? []).length < 200) {
             (progress.idCoverageMissing ?? (progress.idCoverageMissing = [])).push({
@@ -369,19 +386,23 @@ export async function rebuildLedger(opts: {
       // Sentinel sweep chunk for the null-cd outliers
       if (nullCdIds.length > 0) {
         const swept = liveNullCd.size;
-        // waived/pending null-cd docs are DELIBERATELY absent — the sweep
-        // expectation discounts them, exactly as regular windows discount
-        // their unresolved DLQ docs
-        const unresolvedNull = await dlq.countUnresolvedAmong(runId, collection, nullCdIds);
+        // absent-first: only ABSENT ids may be discounted by the DLQ — a
+        // waived id that is nevertheless live (manual repair, same-id native
+        // retry) must not count twice and cancel a different missing doc
+        const absentNull = nullCdIds.filter((id) => !liveNullCd.has(id));
+        const unresolvedAbsent = absentNull.length > 0
+          ? await dlq.countUnresolvedAmong(runId, collection, absentNull)
+          : 0;
+        const missingNull = absentNull.length - unresolvedAbsent;
         const status: ChunkDoc['status'] =
-          swept + unresolvedNull >= nullCdIds.length ? 'done' : swept === 0 ? 'pending' : 'failed';
+          missingNull === 0 ? 'done' : swept === 0 ? 'pending' : 'failed';
         summary[status === 'done' ? 'done' : status === 'pending' ? 'pending' : 'failed']++;
         // a PARTIALLY swept sentinel means rows are missing from the target —
         // it must surface as a mismatch, not hide in a summary counter
         if (checkOnly && status === 'failed' && progress.mismatchedWindows.length < 200) {
           progress.mismatchedWindows.push({
             collection, lowerCd: 'null-cd sweep', upperCd: 'null-cd sweep',
-            source: nullCdIds.length - unresolvedNull, live: swept,
+            source: swept + missingNull, live: swept,
           });
         }
         allDocs.push({
