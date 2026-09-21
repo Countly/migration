@@ -187,6 +187,10 @@ export async function runFinalCheck(
     if (audit.mismatchedWindows.length > 0) {
       out.problems.push(`${fmt(audit.mismatchedWindows.length)} window(s) hold FEWER docs in ClickHouse than the source — data is missing from the target. Click "Retry failed chunks" after a rebuild, or escalate; do NOT decommission the old cluster.`);
     }
+    if ((audit.idCoverageMissing ?? []).length > 0) {
+      const idMissingN = (audit.idCoverageMissing ?? []).reduce((a, w) => a + w.missing, 0);
+      out.problems.push(`${fmt((audit.idCoverageMissing ?? []).length)} window(s) hold the right COUNT and checksum but ${fmt(idMissingN)} sampled document identit${idMissingN === 1 ? 'y is' : 'ies are'} MISSING live — documents were swapped for others; escalate; do NOT decommission the old cluster.`);
+    }
     if (audit.checksumMismatchWindows.length > 0) {
       out.problems.push(`${fmt(audit.checksumMismatchWindows.length)} window(s) hold the right COUNT of the WRONG documents (checksum fingerprint differs) — escalate; do NOT decommission the old cluster.`);
     }
@@ -197,8 +201,8 @@ export async function runFinalCheck(
     if (audit.deletionDriftWindows.length > 0 && (audit.driftSubsetMissing ?? []).length === 0) {
       out.notes.push(`${fmt(audit.deletionDriftWindows.length)} window(s) now hold MORE docs in ClickHouse than the source — the source shrank after migration (retention TTL / deletions). Sampled source ids in those windows were all found live, so the surplus is retained history, not masked gaps.`);
     }
-    if (audit.mismatchedWindows.length === 0 && audit.checksumMismatchWindows.length === 0 && scopedPendingWindows === 0) {
-      out.passes.push(`Recounted ${fmt(windows)} window(s) directly against the source: every count matches, every checksum fingerprint matches.`);
+    if (audit.mismatchedWindows.length === 0 && audit.checksumMismatchWindows.length === 0 && scopedPendingWindows === 0 && (audit.idCoverageMissing ?? []).length === 0) {
+      out.passes.push(`Recounted ${fmt(windows)} window(s) directly against the source: every count matches, every checksum fingerprint matches, and sampled identity coverage is complete.`);
     }
     if (cutoverMs !== null) {
       const excluded = audit.excludedBeyondCutover ?? 0;

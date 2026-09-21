@@ -2172,9 +2172,11 @@ export class ChunkOrchestrator {
     //   2+ copies below → migration defect; verification fails.
     const boundaryMs = all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
     const dup = await staging.duplicateStats(boundaryMs);
-    let migrationDuplicates = 0;
+    // the verdict uses the EXACT per-partition count — the display sample is
+    // capped and early partitions full of benign live dups could crowd a
+    // real migration duplicate out of it
+    const migrationDuplicates = dup.migrationDuplicateGroups;
     const duplicateSample = dup.sample.map((d) => {
-      if (d.migratedCopies >= 2) migrationDuplicates++;
       return {
         _id: d._id,
         copies: d.copies,

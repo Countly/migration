@@ -493,11 +493,25 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       return { applied: false, reason: `bound already pinned via LEDGER_CD_UPPER_BOUND=${envBoundAtBoot} — change it in the deployment config, not here` };
     }
     if (boundMs >= Date.now() - 60_000) return { applied: false, reason: 'bound must be safely in the past (>60s ago)' };
+    // Claim fence: prune deletes/clamps PENDING chunks only, so a pod
+    // claiming a post-bound chunk between the check and the delete would
+    // slip past it and migrate mirror territory. No active claims = no
+    // claiming in flight (pods hold at most their current chunk, and a
+    // paused/held fleet holds none).
+    const claims = await ledger.activeClaims(config.ledger.runId).catch(() => null);
+    if (claims === null) return { applied: false, reason: 'could not read active claims — retry when MongoDB answers' };
+    if (claims.length > 0) {
+      return { applied: false, reason: `pods hold active chunk claims (${claims.map((c) => `${c.pod}×${c.count}`).join(', ')}) — pause the pods, let in-flight chunks finish, then apply the bound` };
+    }
     try {
       const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
       await ledger.setStoredBound(config.ledger.runId, boundMs, source);
-      logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), source, ...pruned }, 'Run bound applied — pods adopt it on their next map pass');
-      return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...pruned };
+      // belt: a claim raced in anyway → a second prune either cleans the
+      // still-pending stragglers or names the claimed chunk and fails loudly
+      const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
+      const total = { deleted: (pruned.deleted + pruned2.deleted), clamped: (pruned.clamped + pruned2.clamped) };
+      logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), source, ...total }, 'Run bound applied — pods adopt it on their next map pass');
+      return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
     } catch (err) {
       return { applied: false, reason: (err as Error).message };
     }

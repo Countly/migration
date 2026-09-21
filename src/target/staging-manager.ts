@@ -440,6 +440,8 @@ export class StagingManager {
    */
   async duplicateStats(boundaryMs: number, sampleLimit = 20): Promise<{
     rows: number; duplicates: number;
+    /** EXACT count of ids with ≥2 pre-boundary copies — never derived from the display sample. */
+    migrationDuplicateGroups: number;
     sample: Array<{ _id: string; copies: number; migratedCopies: number; min_cd_ms: number; max_cd_ms: number }>;
   }> {
     const parts = await this.ch().query({
@@ -450,14 +452,15 @@ export class StagingManager {
       format: 'JSONEachRow',
     });
     const partitions = await parts.json<{ partition: string; r: string }>();
-    let rows = 0, duplicates = 0;
+    let rows = 0, duplicates = 0, migrationDuplicateGroups = 0;
     const sample: Array<{ _id: string; copies: number; migratedCopies: number; min_cd_ms: number; max_cd_ms: number }> = [];
     for (const p of partitions) {
       rows += Number(p.r);
       const res = await this.ch().query({
         query: `SELECT _id, count() AS c, countIf(cd < fromUnixTimestamp64Milli({b:Int64})) AS mc,
                        toUnixTimestamp64Milli(min(cd)) AS lo, toUnixTimestamp64Milli(max(cd)) AS hi,
-                       sum(c - 1) OVER () AS excess
+                       sum(c - 1) OVER () AS excess,
+                       sum(mc >= 2) OVER () AS mg
                 FROM (SELECT _id, cd FROM ${this.fq(this.config.table)} WHERE _partition_id = {p:String})
                 GROUP BY _id HAVING c > 1
                 ORDER BY mc DESC, c DESC LIMIT {lim:UInt32}`,
@@ -465,14 +468,14 @@ export class StagingManager {
         format: 'JSONEachRow',
         clickhouse_settings: { max_bytes_before_external_group_by: '4000000000' },
       });
-      const groups = await res.json<{ _id: string; c: string; mc: string; lo: string; hi: string; excess: string }>();
-      if (groups.length > 0) duplicates += Number(groups[0].excess);
+      const groups = await res.json<{ _id: string; c: string; mc: string; lo: string; hi: string; excess: string; mg: string }>();
+      if (groups.length > 0) { duplicates += Number(groups[0].excess); migrationDuplicateGroups += Number(groups[0].mg); }
       for (const g of groups) {
         if (sample.length >= sampleLimit) break;
         sample.push({ _id: g._id, copies: Number(g.c), migratedCopies: Number(g.mc), min_cd_ms: Number(g.lo), max_cd_ms: Number(g.hi) });
       }
     }
-    return { rows, duplicates, sample };
+    return { rows, duplicates, migrationDuplicateGroups, sample };
   }
 
 
@@ -536,7 +539,7 @@ export class StagingManager {
    */
   async countAndSumLiveCdRange(lowerCdMs: number, upperCdMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<{ n: number; sumCd: number }> {
     const res = await this.ch().query({
-      query: `SELECT count() AS c, sum(toUnixTimestamp64Milli(cd) % 4294967296) AS s FROM ${this.fq(this.config.table)}
+      query: `SELECT count() AS c, toUInt64(sum(toUnixTimestamp64Milli(cd) % 4294967296)) % 4294967296 AS s FROM ${this.fq(this.config.table)}
               WHERE cd >= fromUnixTimestamp64Milli({lo:Int64})
                 AND cd <  fromUnixTimestamp64Milli({hi:Int64})
                 ${this.scopeSql(scope)}`,

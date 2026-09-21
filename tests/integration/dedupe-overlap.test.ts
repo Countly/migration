@@ -16,6 +16,7 @@ import { MongoClient } from 'mongodb';
 import { createClient, type ClickHouseClient } from '@clickhouse/client';
 
 import { runDedupeOverlap, newDedupeOverlapState } from '../../src/runtime/dedupe-overlap.ts';
+import { StagingManager } from '../../src/target/staging-manager.ts';
 import { HashResolver } from '../../src/transform/hash-resolver.ts';
 import { loadConfig } from '../../src/config/loader.ts';
 import type { Config } from '../../src/config/schema.ts';
@@ -187,5 +188,27 @@ describe('tee-overlap dedupe', () => {
     // the sibling collection's same-_id row survives the scoped delete
     expect(await chCount("_id = 'mirror_10' AND a = 'sibling_app'")).toBe(1);
     expect(await chCount("_id = 'mirror_10'")).toBe(1);
+  });
+
+  it('duplicateStats counts migration-duplicate groups exactly, beyond the display-sample cap', async () => {
+    // 25 duplicated ids below the boundary — more than the 20-group sample
+    const rows: Record<string, unknown>[] = [];
+    for (let i = 0; i < 25; i++) {
+      const cd = FLIP - 7_200_000 + i * 1_000;
+      rows.push(chRow(`dupg_${i}`, cd), chRow(`dupg_${i}`, cd + 1));
+    }
+    await ch.insert({ table: `${DB}.drill_events`, values: rows, format: 'JSONEachRow' });
+    const staging = new StagingManager(
+      { url: CH_URL, database: DB, table: 'drill_events', username: 'default', password: CH_PASSWORD, queryTimeoutMs: 30_000 },
+      logger,
+    );
+    await staging.connect();
+    try {
+      const stats = await staging.duplicateStats(Date.now());
+      expect(stats.migrationDuplicateGroups).toBe(25);
+      expect(stats.sample.length).toBeLessThanOrEqual(20);
+    } finally {
+      await staging.close();
+    }
   });
 });

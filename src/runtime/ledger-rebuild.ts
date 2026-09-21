@@ -67,6 +67,8 @@ export interface RebuildProgress {
   excludedBeyondCutover?: number;
   /** Drift windows (live > source) whose sampled source ids were NOT all found in the target — surplus rows were masking missing ones. */
   driftSubsetMissing?: Array<{ collection: string; lowerCd: string; upperCd: string; sampled: number; missing: number }>;
+  /** Count-exact, checksum-clean windows where sampled source ids are missing live — documents swapped for others. */
+  idCoverageMissing?: Array<{ collection: string; lowerCd: string; upperCd: string; sampled: number; missing: number }>;
   error: string | null;
   startedAt: number | null;
   finishedAt: number | null;
@@ -129,6 +131,7 @@ export async function rebuildLedger(opts: {
     const db = mongo.db(config.source.db);
 
     let driftChecks = 0;
+    let idChecks = 0;
     progress.phase = 'discovering collections';
     let collections = await discoverCollections(db, config.source.collectionPrefix, logger);
     const skipEventNames = new Set(['[CLY]_apm_device', '[CLY]_apm_network']);
@@ -205,9 +208,13 @@ export async function rebuildLedger(opts: {
         progress.phase = `counting ${collection} chunk ${idx + 1}/${bounds.length}`;
         // count + cd-sum in one index-covered pass: the sum is an order-free
         // fingerprint of WHICH docs the window holds, not just how many
+        // the SUM is reduced mod 2^32 server-side on BOTH stores: raw sums
+        // of 32-bit residues pass 2^53 near ~2M rows/window and would round
+        // in JS — mod-space comparison stays exact at any window size
         const [mongoAgg] = await coll.aggregate<{ n: number; sumCd: number }>([
           { $match: { cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } } },
           { $group: { _id: null, n: { $sum: 1 }, sumCd: { $sum: { $mod: [{ $toLong: '$cd' }, 4294967296] } } } },
+          { $project: { n: 1, sumCd: { $mod: ['$sumCd', 4294967296] } } },
         ]).toArray();
         const mongoCount = mongoAgg?.n ?? 0;
         const mongoSumCd = mongoAgg?.sumCd ?? 0;
@@ -220,7 +227,8 @@ export async function rebuildLedger(opts: {
         let sweptSum = 0;
         for (let i = lo; i < sweptCds.length && sweptCds[i] < b.upperCd; i++) { sweptIn++; sweptSum += sweptCds[i] % 4294967296; } // same mod as both fingerprints
         const live = liveRaw - sweptIn;
-        const liveSumCd = liveAgg.sumCd - sweptSum;
+        const MOD = 4294967296;
+        const liveSumCd = (((liveAgg.sumCd - (sweptSum % MOD)) % MOD) + MOD) % MOD;
 
         // Docs in this window that are KNOWN unmigrated (pending/waived DLQ)
         // legitimately explain source > live — without this, a window whose
@@ -271,6 +279,30 @@ export async function rebuildLedger(opts: {
                 sampled: sampleIds.length, missing,
               });
             }
+          }
+        }
+        // Identity coverage: a doc swapped for ANOTHER doc with the same cd
+        // keeps the count AND the cd-sum — sampled distinct-id presence is
+        // the axis that sees WHICH documents exist. Strided (every 25th
+        // clean window, capped) so big audits stay affordable; drift windows
+        // are always id-checked above.
+        if (checkOnly && !unscopableInMulti && live + unresolved === mongoCount && live > 0
+            && idChecks < 300 && idx % 25 === 0) {
+          idChecks++;
+          const idSample = (await coll
+            .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
+            .limit(5_000).toArray()).map((d) => String(d._id));
+          const idPresent = await staging.countDistinctMatchingIdsInWindow(idSample, b.lowerCd, b.upperCd, scope);
+          // sampled ids that are themselves DLQ'd are legitimately absent
+          const idUnresolved = unresolved > 0
+            ? await dlq.countUnresolvedMatchingIds(runId, collection, idSample, b.lowerCd, b.upperCd)
+            : 0;
+          const idMissing = idSample.length - idPresent - idUnresolved;
+          if (idMissing > 0 && (progress.idCoverageMissing ?? []).length < 200) {
+            (progress.idCoverageMissing ?? (progress.idCoverageMissing = [])).push({
+              collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
+              sampled: idSample.length, missing: idMissing,
+            });
           }
         }
         // Checksum: only meaningful on windows that are count-exact with no

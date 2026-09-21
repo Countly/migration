@@ -275,6 +275,24 @@ describe('final check: the interpreted sign-off', () => {
     await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'n_0'` });
   });
 
+  it('a same-cd identity swap (count AND checksum survive) is caught by id coverage', async () => {
+    // restore the docs the drift test removed so the window is clean again
+    await mc.db(DB).collection(COLL).insertMany(
+      [50, 51, 52, 53, 54, 55, 56, 57].map((i) => ({
+        _id: `m_${i}`, uid: 'u', did: 'd', ts: START + i * 12_000, cd: new Date(START + i * 12_000), sg: {}, c: 1,
+      })) as never[],
+    );
+    const cd = START + 80 * 12_000;
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'm_80'` });
+    await ch.insert({ table: `${DB}.drill_events`, format: 'JSONEachRow', values: [chRow('ghost_80', cd)] });
+    const out = await check({ cutoverMs: CUTOVER });
+    expect(out.verdict).toBe('FAIL');
+    expect(out.problems.join(' ')).toContain('swapped');
+    expect(out.audit?.checksumMismatchWindows).toEqual([]); // the swap is invisible to the checksum by design
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'ghost_80'` });
+    await ch.insert({ table: `${DB}.drill_events`, format: 'JSONEachRow', values: [chRow('m_80', cd)] });
+  });
+
   it('a WHOLE window missing from the target → FAIL (the audit calls it pending, the check must not)', async () => {
     // stale ledger says done, but every row of the window is gone from CH
     await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id LIKE 'm\\_%'` });
