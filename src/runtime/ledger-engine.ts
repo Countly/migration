@@ -574,12 +574,17 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       }
     }
     const restores: Array<{ deletedChunks: import('../state/ledger-store.ts').ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }> = [];
+    // minted BEFORE any write: even a lost store acknowledgement leaves the
+    // caller knowing exactly which token to roll back by
+    const applyToken = `apply:${config.worker.podId}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+    let storeAttempted = false;
     try {
       const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, (r) => restores.push(r));
       // Compare-and-set against the prior bound this call validated: two
       // concurrent applies cannot both win — the loser rolls its prune back.
-      const applyToken = await ledger.setStoredBoundIf(config.ledger.runId, boundMs, source, priorBound);
-      if (applyToken === null) {
+      storeAttempted = true;
+      const storedToken = await ledger.setStoredBoundIf(config.ledger.runId, boundMs, source, priorBound, applyToken);
+      if (storedToken === null) {
         // a competing apply won: restore only what ITS bound permits — and
         // if that bound cannot be read, restore NOTHING (fail closed: an
         // unbounded restore could resurrect chunks the winner pruned)
@@ -622,6 +627,8 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
           // competing request owns a DIFFERENT token and is never unwound
           boundRolledBack = await ledger.rollbackStoredBound(config.ledger.runId, applyToken, priorBound);
         } catch (e) { rollbackErrors.push(`bound: ${(e as Error).message}`); }
+        // fence casualties of THIS bound come back too — no bound governs them
+        await ledger.restoreSuperseded(config.ledger.runId, applyToken).catch((e: Error) => rollbackErrors.push(`superseded: ${e.message}`));
         // restore chunks under whatever bound now governs the grid
         let governing: number | null = priorBound;
         if (!boundRolledBack && rollbackErrors.length === 0) {
@@ -638,6 +645,13 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (${boundRolledBack ? 'bound and pruned chunks restored' : 'a newer bound governs; chunks restored under it'}) (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
       }
     } catch (err) {
+      // lost-ack store: the token was minted BEFORE the write, so a store
+      // whose acknowledgement was lost can still be unwound by token — and
+      // its fence casualties restored — best-effort before anything else
+      if (storeAttempted) {
+        await ledger.rollbackStoredBound(config.ledger.runId, applyToken, priorBound).catch(() => {});
+        await ledger.restoreSuperseded(config.ledger.runId, applyToken).catch(() => {});
+      }
       // restore ONLY under the bound that actually governs — a lost CAS ack
       // may have persisted the new bound, so an assumed prior would restore
       // chunks that bound intentionally pruned. Unreadable = untouched.

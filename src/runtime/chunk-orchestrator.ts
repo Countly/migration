@@ -228,11 +228,18 @@ export class ChunkOrchestrator {
   private async supersedeIfBeyondBound(chunk: ChunkDoc): Promise<boolean> {
     if (chunk.lower_cd < 0) return false; // sentinel sweep — no cd semantics
     let bound: number | null = null;
+    let boundToken: string | null = null;
     try {
       // env bound is immutable; the config value is NOT (adoption overwrites
       // it with the stored bound, which the dashboard may have LOWERED since)
       // — so absent an env pin, the CURRENT stored value is always re-read
-      bound = this.envBoundMs ?? await this.d.ledger.getStoredBound(this.runId);
+      if (this.envBoundMs !== null) {
+        bound = this.envBoundMs; // immutable — never rolls back, no token
+      } else {
+        const info = await this.d.ledger.getStoredBoundInfo(this.runId);
+        bound = info?.boundMs ?? null;
+        boundToken = info?.token ?? null;
+      }
     } catch {
       // cannot read the bound — do not process on unknown configuration
       await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
@@ -241,7 +248,7 @@ export class ChunkOrchestrator {
     if (bound === null) return false;
     if (chunk.lower_cd >= bound) {
       try {
-        await this.d.ledger.supersede(chunk._id, this.podId);
+        await this.d.ledger.supersede(chunk._id, this.podId, boundToken);
       } catch {
         // failing to persist the supersede must not process the chunk:
         // release (or let the lease expire) — the next claimer re-runs

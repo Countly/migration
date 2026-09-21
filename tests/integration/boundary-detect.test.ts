@@ -159,6 +159,23 @@ describe('tee-boundary detection + sync parity', () => {
     expect(t3).toBeTruthy();
     expect(await ledger.rollbackStoredBound(RUN2, t2 as string, 1_000_000_000_000)).toBe(false);
     expect(await ledger.getStoredBound(RUN2)).toBe(1_200_000_000_000);
+    // fence casualties are token-scoped: only the rolled-back bound's
+    // superseded chunks come back
+    const RUN3b = 'boundary-fence-1';
+    const mkc = (idx: number) => ({
+      _id: `${RUN3b}:c:${idx}`, run_id: RUN3b, collection: 'c',
+      scope_a: 'a', scope_e: 'e', scope_n: null, idx, lower_cd: idx * 100, upper_cd: idx * 100 + 100,
+      status: 'in_progress' as const, pod_id: 'p1', lease_until: new Date(Date.now() + 60_000), staging_table: null,
+      docs_read: 0, docs_skipped: 0, rows_expected: 0, partitions: [], attached: [],
+      attach_method: null, attempts: 0, last_error: null, transform_version: 'v', updated_at: new Date(),
+    });
+    await ledger.replaceAllForRun(RUN3b, [mkc(1), mkc(2)] as never[]);
+    await ledger.supersede(`${RUN3b}:c:1`, 'p1', 'tokenA');
+    await ledger.supersede(`${RUN3b}:c:2`, 'p1', 'tokenB');
+    expect(await ledger.restoreSuperseded(RUN3b, 'tokenA')).toBe(1);
+    const rows3 = await mc.db(DB).collection('mig_ranges').find({ run_id: RUN3b } as never).sort({ idx: 1 }).toArray();
+    expect(rows3.map((r) => [r.idx, r.status])).toEqual([[1, 'pending'], [2, 'superseded']]);
+
     // the CURRENT owner's rollback works
     expect(await ledger.rollbackStoredBound(RUN2, t3 as string, 1_000_000_000_000)).toBe(true);
     expect(await ledger.getStoredBound(RUN2)).toBe(1_000_000_000_000);

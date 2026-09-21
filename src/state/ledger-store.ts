@@ -591,6 +591,13 @@ export class LedgerStore {
     return doc?.cd_upper_bound_ms ?? null;
   }
 
+  /** Bound plus its ownership token — fence mutations record the token so a rolled-back apply can restore exactly what its bound caused. */
+  async getStoredBoundInfo(runId: string): Promise<{ boundMs: number; token: string | null } | null> {
+    const doc = await this.rc().findOne({ _id: runId });
+    if (doc?.cd_upper_bound_ms === undefined) return null;
+    return { boundMs: doc.cd_upper_bound_ms, token: doc.bound_token ?? null };
+  }
+
   /** Cluster-wide operator answer to the startup guard: "nothing mirrors traffic — run unbounded". */
   async getUnboundedAck(runId: string): Promise<boolean> {
     const doc = await this.rc().findOne({ _id: runId });
@@ -622,12 +629,21 @@ export class LedgerStore {
     return row ? `${row.n}:${row.done}:${row.maxU ? row.maxU.getTime() : 0}` : '0:0:0';
   }
 
-  /** Supersede a chunk this pod holds — the bound says it must never be read. */
-  async supersede(chunkId: string, podId: string): Promise<void> {
+  /** Supersede a chunk this pod holds — the bound says it must never be read. The bound's token is recorded so a rolled-back apply can restore exactly its own casualties. */
+  async supersede(chunkId: string, podId: string, boundToken?: string | null): Promise<void> {
     await this.c().updateOne(
       { _id: chunkId, pod_id: podId },
-      { $set: { status: 'superseded', pod_id: null, lease_until: null, updated_at: new Date() } },
+      { $set: { status: 'superseded', pod_id: null, lease_until: null, updated_at: new Date(), ...(boundToken ? { superseded_by_token: boundToken } : {}) } as never },
     );
+  }
+
+  /** Bring back the chunks a specific bound's fence superseded — its apply rolled back, so no bound governs them any more. */
+  async restoreSuperseded(runId: string, boundToken: string): Promise<number> {
+    const res = await this.c().updateMany(
+      { run_id: runId, status: 'superseded', superseded_by_token: boundToken } as never,
+      { $set: { status: 'pending', pod_id: null, lease_until: null, updated_at: new Date() }, $unset: { superseded_by_token: '' } } as never,
+    );
+    return res.modifiedCount ?? 0;
   }
 
   /** Release a claim untouched (status back to pending) — used when configuration cannot be read. */
@@ -673,8 +689,10 @@ export class LedgerStore {
    * identical-value re-apply by someone else (value-ABA) is never unwound
    * by this caller's rollback.
    */
-  async setStoredBoundIf(runId: string, boundMs: number, setBy: string, expectedPrior: number | null): Promise<string | null> {
-    const token = `${setBy}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+  async setStoredBoundIf(runId: string, boundMs: number, setBy: string, expectedPrior: number | null, mintedToken?: string): Promise<string | null> {
+    // the caller may mint the token BEFORE the write: on a lost
+    // acknowledgement it still knows what to roll back by
+    const token = mintedToken ?? `${setBy}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
     if (expectedPrior === null) {
       const res = await this.rc().updateOne(
         { _id: runId, cd_upper_bound_ms: { $exists: false } },
