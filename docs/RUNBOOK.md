@@ -187,7 +187,11 @@ curl -s -X POST localhost:PORT/control/dedupe-overlap -H 'content-type: applicat
 ## Verification cheat sheet
 
 ```sql
--- exactness (instant, exact):
+-- quick orientation only — on a LIVE target this total moves with ingestion
+-- and proves nothing about the migration. Sign-off relies on the windowed,
+-- scoped checks (Final check / verify): migrated rows keep historical cd,
+-- live rows are insert-stamped, so every audited window excludes live data
+-- by construction.
 SELECT count() AS total, uniqExact(_id) AS distinct_ids FROM countly_drill.drill_events;
 -- full re-verification of the whole migration in minutes:
 --   grouped count per chunk window vs the ledger's rows_expected (mig_ranges)
