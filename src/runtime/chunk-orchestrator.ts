@@ -144,7 +144,6 @@ export class ChunkOrchestrator {
   private probeOkStreak = 0;
   private autoResuming = false;
   private resumeProbeTimer: NodeJS.Timeout | null = null;
-  private guardProbeTimer: NodeJS.Timeout | null = null;
   private lastReclaimAt = 0;
   private monitorTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -317,26 +316,14 @@ export class ChunkOrchestrator {
     }, 15_000);
     this.resumeProbeTimer.unref?.();
 
-    // The boundary question does not expire at startup: a mirror that comes
-    // online MID-RUN (target liveness appearing later) re-raises it — the
-    // startup probe passing once is not a permanent license to run unbounded.
-    if (!this.dryRun) {
-      this.guardProbeTimer = setInterval(() => {
-        void (async () => {
-          try {
-            if (this.status !== 'running' || this.paused) return;
-            if (this.d.config.ledger.cdUpperBoundMs != null || this.d.config.ledger.unboundedOk) return;
-            if ((await this.d.ledger.getStoredBound(this.runId)) !== null) return;
-            if (await this.d.ledger.getUnboundedAck(this.runId)) return;
-            if (await this.d.staging.hasLiveCdSince(Date.now() - GUARD_LIVE_LOOKBACK_MS)) {
-              this.pause('boundary-unset');
-              this.logger.warn('GUARD: the target began receiving live data mid-run with no bound set — answer the mirror question (set-boundary or allow-unbounded) to continue');
-            }
-          } catch { /* transient — next tick re-checks */ }
-        })();
-      }, 300_000);
-      this.guardProbeTimer.unref?.();
-    }
+    // NOTE deliberately NO mid-run liveness probe: once this run attaches
+    // rows, recent cds in the target are indistinguishable from live
+    // ingestion — an unbounded run migrating recent data would satisfy such
+    // a probe with its own output and false-pause every long scenario-1/4
+    // run. The boundary question is asked where the evidence is clean: at
+    // every pod start (before this run writes) — a mirror enabled mid-run
+    // is caught at the next restart and by the sync-parity card, which the
+    // runbook prescribes when enabling any mirror.
 
     if (this.dryRun) {
       await this.d.staging.createDryRunTable();
@@ -493,7 +480,6 @@ export class ChunkOrchestrator {
 
     if (this.monitorTimer) clearInterval(this.monitorTimer);
     if (this.resumeProbeTimer) clearInterval(this.resumeProbeTimer);
-    if (this.guardProbeTimer) clearInterval(this.guardProbeTimer);
     this.status = this.stopping ? 'stopped' : 'completed';
     this.finishedAt = Date.now();
     if (this.status === 'completed' && !this.dryRun) {
@@ -2252,7 +2238,11 @@ export class ChunkOrchestrator {
     //   0 copies below → live at-least-once artifact (nightly job cleans)
     //   1 copy below   → cross-cutover SDK retry (benign, reported)
     //   2+ copies below → migration defect; verification fails.
-    const boundaryMs = all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
+    // duplicate attribution stops at the requested cutover when one is
+    // given: native retry copies PAST it are the live path's business, not
+    // migration defects (post-dedupe sign-off false-failed on them)
+    const ledgerMax = all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
+    const boundaryMs = upToMs !== null ? Math.min(ledgerMax, upToMs) : ledgerMax;
     const dup = await staging.duplicateStats(boundaryMs);
     // the verdict uses the EXACT per-partition count — the display sample is
     // capped and early partitions full of benign live dups could crowd a

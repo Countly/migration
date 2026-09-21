@@ -316,8 +316,13 @@ cannot tell those apart from data alone, so it asks — once:
   `curl -X POST localhost:PORT/control/allow-unbounded` (cluster-wide,
   releases every held pod), or deploy with `LEDGER_UNBOUNDED_OK=1`.
 
-A plain Resume is deliberately ignored while the question is open. Resumed
-runs and runs whose target holds no recent data never trip the guard.
+A plain Resume is deliberately ignored while the question is open — only a
+bound or the no-mirror answer releases the hold. The question is asked at
+EVERY pod start (the one moment the target's recent data cannot be this
+run's own output); once the run writes, recent rows are indistinguishable
+from live ingestion, so a mirror enabled MID-RUN is caught at the next pod
+restart and by the sync-parity card — run parity whenever a mirror is
+switched on.
 
 ### Bound is opt-in — pick the mode deliberately
 

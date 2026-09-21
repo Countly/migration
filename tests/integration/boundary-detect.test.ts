@@ -318,6 +318,16 @@ describe('set-boundary auto-apply decision', () => {
       .toEqual({ apply: true, boundMs: 123 });
   });
 
+  it('old-side traffic resuming between the gap and the anchor disqualifies the gap', () => {
+    // quiet 20–22, mongo resumes at 22, first new-side data at 24: within
+    // the 2-min allowance, but those minute-22/23 docs would be orphaned
+    const g = gapMinutes(5, 4, 24 * M);
+    g.minutes.push({ minuteMs: 22 * M, mongo: 3, ch: 0 }, { minuteMs: 23 * M, mongo: 3, ch: 0 });
+    const d = decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), false);
+    expect(d.apply).toBe(false);
+    expect(d.reason).toContain('resumed');
+  });
+
   it('a lull that does not abut the ClickHouse anchor is never auto-applied', () => {
     // gap at minutes 20–22 but the first new-side data lands at minute 30:
     // a quiet spell BEFORE the real tee start — applying it would exclude

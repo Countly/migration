@@ -415,8 +415,8 @@ export class StagingManager {
       ? 'AND cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})'
       : '';
     const out = new Map<string, Record<string, unknown>>();
-    for (let i = 0; i < ids.length; i += 5_000) {
-      const page = ids.slice(i, i + 5_000);
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
       const res = await this.ch().query({
         query: `SELECT _id, a, e, n, uid, uid_canon, did, lsid,
                        toString(ts) AS ts_txt, toString(cd) AS cd_txt,

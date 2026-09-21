@@ -86,10 +86,16 @@ export function decideAutoApply(
     // the true tee start can otherwise pass the flank check and exclude
     // every old-side doc between the false gap and the anchor.
     const anchor = d.anchorMs;
-    if (typeof anchor !== 'number' || anchor < gap.fromMs || anchor > gap.toMs + 2 * 60_000) {
+    // the 2-min allowance is for ingest latency, not for RESUMED old-side
+    // traffic: any Mongo docs between the gap end and the anchor would land
+    // beyond the bound and never migrate
+    const resumedBetween = mins
+      .filter((m) => m.minuteMs >= gap.toMs && typeof anchor === 'number' && m.minuteMs < anchor)
+      .reduce((a, m) => a + m.mongo, 0);
+    if (typeof anchor !== 'number' || anchor < gap.fromMs || anchor > gap.toMs + 2 * 60_000 || resumedBetween > 0) {
       return {
         apply: false,
-        reason: `the gap (${new Date(gap.fromMs).toISOString()}–${new Date(gap.toMs).toISOString()}) does not abut the first new-side data (anchor ${typeof anchor === 'number' ? new Date(anchor).toISOString() : 'unknown'}) — likely a lull BEFORE the real tee start; applying it would exclude the old-side docs in between. Review GET /api/boundary, then re-call with {"acceptAnchor": true} or pass an explicit {"boundMs": ...}.`,
+        reason: `the gap (${new Date(gap.fromMs).toISOString()}–${new Date(gap.toMs).toISOString()}) does not cleanly abut the first new-side data (anchor ${typeof anchor === 'number' ? new Date(anchor).toISOString() : 'unknown'}${resumedBetween > 0 ? `; ${resumedBetween} old-side docs resumed in between` : ''}) — likely a lull BEFORE the real tee start; applying it would exclude the old-side docs in between. Review GET /api/boundary, then re-call with {"acceptAnchor": true} or pass an explicit {"boundMs": ...}.`,
       };
     }
   }
