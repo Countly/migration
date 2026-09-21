@@ -584,6 +584,24 @@ export class StagingManager {
     return (await res.json<{ x: number }>()).length > 0;
   }
 
+  /** DISTINCT given ids present live in [fromMs, toMs) — duplicate rows of one id never vouch for another id's absence. */
+  async countDistinctMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number): Promise<number> {
+    let total = 0;
+    for (let i = 0; i < ids.length; i += 50_000) {
+      const page = ids.slice(i, i + 50_000);
+      const res = await this.ch().query({
+        query: `SELECT uniqExact(_id) AS n FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
+                  AND _id IN {ids:Array(String)}`,
+        query_params: { ids: page, lo: fromMs, hi: toMs },
+        format: 'JSONEachRow',
+      });
+      const rows = await res.json<{ n: string }>();
+      total += Number(rows[0]?.n ?? 0);
+    }
+    return total;
+  }
+
   /** Live rows in [fromMs, toMs) whose _id is one of the given ids. */
   async countMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number): Promise<number> {
     let total = 0;

@@ -126,6 +126,17 @@ export class DlqStore {
    * table is accounted for, not a disagreement. Entries written before the
    * cd_ms field (or with unparseable cd/ts) can't be attributed and count 0.
    */
+  /** How many of the GIVEN source ids sit unresolved (pending/waived) in the window — exact per-sample DLQ discount. */
+  async countUnresolvedMatchingIds(runId: string, collection: string, ids: string[], lowerCdMs: number, upperCdMs: number): Promise<number> {
+    if (ids.length === 0) return 0;
+    return this.c().countDocuments({
+      run_id: runId, collection,
+      source_id: { $in: ids },
+      status: { $in: ['pending', 'waived'] },
+      cd_ms: { $gte: lowerCdMs, $lt: upperCdMs },
+    });
+  }
+
   async countUnresolvedInWindow(runId: string, collection: string, lowerCdMs: number, upperCdMs: number): Promise<number> {
     return this.c().countDocuments({
       run_id: runId, collection,

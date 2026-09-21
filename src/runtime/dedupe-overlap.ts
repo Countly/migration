@@ -48,6 +48,8 @@ export interface DedupeUnsafeBucket {
   toMs: number;
   matched: number;
   native: number;
+  /** Why the bucket was skipped: missing native counterpart evidence, or a collection whose live counts cannot be scoped. */
+  reason: 'no-native-evidence' | 'no-scope';
 }
 
 export interface DedupeCollectionRow {
@@ -139,6 +141,14 @@ export async function runDedupeOverlap(
         row.chMatched += matched;
         state.totals.chMatched += matched;
         if (matched === 0) return;
+        // No (a,e,n) scope → live counts are TABLE-WIDE and sibling
+        // collections' native traffic would vouch for this one's outage
+        // buckets. No usable evidence — never delete, always report.
+        if (!scope) {
+          row.unsafe.push({ fromMs: loMs, toMs: hiMs, matched, native: -1, reason: 'no-scope' });
+          state.totals.unsafeMatched += matched;
+          return;
+        }
         // Count evidence of native counterparts: what remains in this bucket
         // after the matched rows is the native side. Falling short means some
         // migrated rows are the ONLY copy of their event — never delete those.
@@ -150,7 +160,7 @@ export async function runDedupeOverlap(
         // signature outright and no slack ever waves it through
         const slack = Math.ceil(matched * (Math.min(5, Math.max(0, opts.slackPct ?? 0)) / 100));
         if (native < matched - slack || native <= 0) {
-          row.unsafe.push({ fromMs: loMs, toMs: hiMs, matched, native });
+          row.unsafe.push({ fromMs: loMs, toMs: hiMs, matched, native, reason: 'no-native-evidence' });
           state.totals.unsafeMatched += matched;
           return;
         }

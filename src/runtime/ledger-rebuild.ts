@@ -257,10 +257,14 @@ export async function rebuildLedger(opts: {
             const sampleIds = (await coll
               .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
               .limit(5_000).toArray()).map((d) => String(d._id));
-            const present = await staging.countMatchingIdsInWindow(sampleIds, b.lowerCd, b.upperCd);
-            // DLQ'd docs are legitimately absent — only a shortfall beyond
-            // the window's unresolved count is a real coverage gap
-            const missing = Math.max(0, sampleIds.length - present - unresolved);
+            // DISTINCT coverage: a duplicate row of one sampled id must not
+            // vouch for another sampled id being absent
+            const present = await staging.countDistinctMatchingIdsInWindow(sampleIds, b.lowerCd, b.upperCd);
+            // DLQ'd docs are legitimately absent — but only the SAMPLED ids
+            // that are themselves in the DLQ may be discounted; unrelated
+            // unresolved docs elsewhere in the window explain nothing
+            const unresolvedInSample = await dlq.countUnresolvedMatchingIds(runId, collection, sampleIds, b.lowerCd, b.upperCd);
+            const missing = Math.max(0, sampleIds.length - present - unresolvedInSample);
             if (missing > 0 && (progress.driftSubsetMissing ?? []).length < 200) {
               (progress.driftSubsetMissing ?? (progress.driftSubsetMissing = [])).push({
                 collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),

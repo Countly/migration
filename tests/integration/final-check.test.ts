@@ -231,6 +231,16 @@ describe('final check: the interpreted sign-off', () => {
     const out2 = await check({ cutoverMs: CUTOVER });
     expect(out2.verdict).toBe('PASS_WITH_NOTES');
     expect(out2.notes.join(' ')).toContain('retained history');
+
+    // a DUPLICATE row of one id must not vouch for another id's absence:
+    // same total row count, one id missing — distinct coverage catches it
+    await ch.insert({ table: `${DB}.drill_events`, format: 'JSONEachRow', values: [chRow('m_70', START + 70 * 12_000)] });
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'm_71'` });
+    const out3 = await check({ cutoverMs: CUTOVER });
+    expect(out3.verdict).toBe('FAIL');
+    expect(out3.problems.join(' ')).toContain('masking');
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'm_70'` });
+    await ch.insert({ table: `${DB}.drill_events`, format: 'JSONEachRow', values: [chRow('m_70', START + 70 * 12_000), chRow('m_71', START + 71 * 12_000)] });
   });
 
   it('a WHOLE window missing from the target → FAIL (the audit calls it pending, the check must not)', async () => {

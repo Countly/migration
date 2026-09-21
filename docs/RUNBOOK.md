@@ -128,7 +128,10 @@ that event. Every hour bucket therefore needs count-evidence of native
 counterparts — `native = live − matched` must roughly cover `matched` —
 before anything in it is deleted. Buckets that fall short are skipped and
 reported (`unsafe` in the result); review those hours (tee outage? wrong
-start time?) instead of forcing them. The check is strict (zero slack) by
+start time?) instead of forcing them. Collections without their own
+(a,e,n) scope (e.g. a base `drill_events` collection) have no usable
+native-counterpart evidence — their matches are always reported as unsafe
+and never deleted. The check is strict (zero slack) by
 default; `slackPct` (≤5) may be passed consciously to absorb ingest-timing
 straddle at bucket edges. Known limit: a loss exactly offset by
 mirror-dropped natives in the same hour is invisible to count evidence —

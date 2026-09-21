@@ -33,6 +33,9 @@ const COLL = `drill_events${createHash('sha1').update('views' + APP).digest('hex
 const APP2 = 'app_dd_outage';
 const COLL2 = `drill_events${createHash('sha1').update('views' + APP2).digest('hex')}`;
 const OUTAGE = 40;
+// base collection: no per-collection (a,e,n) scope resolvable — its matches
+// must never be deleted, even though sibling native traffic fills the table
+const BASE = 20;
 
 const FLIP = Math.floor(Date.now() / 60_000) * 60_000 - 2 * 3_600_000; // tee flip 2h ago
 const DONE = FLIP + 3_600_000;                                          // migration completed 1h later
@@ -116,6 +119,19 @@ describe('tee-overlap dedupe', () => {
     await mc.db(DB).collection(COLL2).createIndex({ cd: 1, _id: 1 });
     await ch.insert({ table: `${DB}.drill_events`, values: outageRows, format: 'JSONEachRow' });
 
+    // unscoped base collection: migrated copies whose only "native cover" is
+    // SIBLING collections' traffic — no usable evidence, never deletable
+    const baseDocs: Record<string, unknown>[] = [];
+    const baseRows: Record<string, unknown>[] = [];
+    for (let i = 0; i < BASE; i++) {
+      const cd = FLIP + i * 15_000;
+      baseDocs.push({ _id: `base_${i}`, a: APP, e: '[CLY]_custom', n: 'views', uid: 'u', did: 'd', ts: cd, cd: new Date(cd), sg: {}, c: 1 });
+      baseRows.push(chRow(`base_${i}`, cd));
+    }
+    await mc.db(DB).collection('drill_events').insertMany(baseDocs as never[]);
+    await mc.db(DB).collection('drill_events').createIndex({ cd: 1, _id: 1 });
+    await ch.insert({ table: `${DB}.drill_events`, values: baseRows, format: 'JSONEachRow' });
+
     Object.assign(process.env, {
       SERVICE_NAME: 'dedupe-test',
       MONGO_URI, MONGO_DB: DB, MONGO_COUNTLY_DB: `${DB}_countly`, MANIFEST_DB: DB,
@@ -140,23 +156,30 @@ describe('tee-overlap dedupe', () => {
     const state = newDedupeOverlapState();
     await runDedupeOverlap({ config, logger, hashResolver }, state, { fromMs: FLIP, toMs: DONE, execute: false });
     expect(state.status).toBe('completed');
-    expect(state.totals).toEqual({ mongoDocsInWindow: 150 + OUTAGE, chMatched: 150 + OUTAGE, deleted: 0, unsafeMatched: OUTAGE });
-    expect(state.lastDryRun).toMatchObject({ fromMs: FLIP, toMs: DONE, chMatched: 150 + OUTAGE });
+    expect(state.totals).toEqual({ mongoDocsInWindow: 150 + OUTAGE + BASE, chMatched: 150 + OUTAGE + BASE, deleted: 0, unsafeMatched: OUTAGE + BASE });
+    expect(state.lastDryRun).toMatchObject({ fromMs: FLIP, toMs: DONE, chMatched: 150 + OUTAGE + BASE });
     const outageRow = state.collections.find((c) => c.collection === COLL2);
     expect(outageRow?.unsafe.length).toBeGreaterThan(0);
     expect(outageRow?.unsafe.reduce((a, u) => a + u.matched, 0)).toBe(OUTAGE);
-    expect(await chCount()).toBe(200 + 150 + 150 + 10 + OUTAGE);
+    expect(outageRow?.unsafe.every((u) => u.reason === 'no-native-evidence')).toBe(true);
+    const baseRow = state.collections.find((c) => c.collection === 'drill_events');
+    expect(baseRow?.scoped).toBe(false);
+    expect(baseRow?.unsafe.every((u) => u.reason === 'no-scope')).toBe(true);
+    expect(baseRow?.unsafe.reduce((a, u) => a + u.matched, 0)).toBe(BASE);
+    expect(await chCount()).toBe(200 + 150 + 150 + 10 + OUTAGE + BASE);
   });
 
   it('execute deletes exactly the evidenced duplicates; unsafe buckets, native and pre-flip rows survive', async () => {
     const state = newDedupeOverlapState();
     await runDedupeOverlap({ config, logger, hashResolver }, state, { fromMs: FLIP, toMs: DONE, execute: true });
     expect(state.status).toBe('completed');
-    expect(state.totals).toEqual({ mongoDocsInWindow: 150 + OUTAGE, chMatched: 150 + OUTAGE, deleted: 150, unsafeMatched: OUTAGE });
+    expect(state.totals).toEqual({ mongoDocsInWindow: 150 + OUTAGE + BASE, chMatched: 150 + OUTAGE + BASE, deleted: 150, unsafeMatched: OUTAGE + BASE });
     expect(await chCount("_id LIKE 'mirror_%'")).toBe(0);
     expect(await chCount("_id LIKE 'native_%'")).toBe(160);
     expect(await chCount("_id LIKE 'hist_%'")).toBe(200);
     // the only-copy rows are untouched — the safety check protected them
     expect(await chCount("_id LIKE 'only_%'")).toBe(OUTAGE);
+    // unscoped base-collection rows: sibling traffic is not evidence
+    expect(await chCount("_id LIKE 'base_%'")).toBe(BASE);
   });
 });

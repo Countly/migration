@@ -806,7 +806,7 @@ function renderDedupe(dd) {
     ? '\u2705 Deleted ' + fmt(t.deleted) + ' duplicate row(s).'
     : 'Dry run: ' + fmt(t.chMatched) + ' migrated row(s) match old-cluster ids in the window (' + fmt(t.mongoDocsInWindow) + ' old-side docs scanned). Nothing deleted.') + '</p>';
   if (t.unsafeMatched > 0) {
-    html += '<p style="color:#B3261E;font-weight:600">\u26a0 ' + fmt(t.unsafeMatched) + ' matched row(s) in ' + unsafeN + ' hour bucket(s) lack count-evidence of a native counterpart \u2014 there the migrated row may be the ONLY copy. They were ' + (dd.execute ? 'NOT deleted' : 'excluded') + '; review those hours (tee outage / wrong start time?) before touching them.</p>';
+    html += '<p style="color:#B3261E;font-weight:600">\u26a0 ' + fmt(t.unsafeMatched) + ' matched row(s) in ' + unsafeN + ' bucket(s) were NOT ' + (dd.execute ? 'deleted' : 'counted as deletable') + ': they lack count-evidence of a native counterpart, or belong to a collection without its own (a,e,n) scope \u2014 there the migrated row may be the ONLY copy. Review those buckets (tee outage / wrong start time / base collection?) before touching them.</p>';
   }
   if (!dd.execute && dd.lastDryRun) {
     html += '<p class="hint">Window measured \u2014 the Delete button is now enabled for this exact window.</p>';

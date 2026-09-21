@@ -83,7 +83,9 @@ export async function runFinalCheck(
   Object.assign(out, newFinalCheckResult(), { status: 'running', startedAt: Date.now(), phase: 'starting' });
   try {
     // ── Cutover: explicit param > stored bound > env bound > none ─────────
-    const stored = await ledger.getStoredBound(runId).catch(() => null);
+    // fail CLOSED: if the bound cannot be read, the check errors out rather
+    // than silently auditing a different range
+    const stored = await ledger.getStoredBound(runId);
     const cutoverMs = opts.cutoverMs ?? stored ?? config.ledger.cdUpperBoundMs ?? null;
     out.cutoverMs = cutoverMs;
 
@@ -110,7 +112,10 @@ export async function runFinalCheck(
 
     // ── 2. DLQ ─────────────────────────────────────────────────────────────
     out.phase = 'checking dead-letter queue';
-    const dlqCounts = await dlq.countByStatus(runId).catch(() => ({} as Record<string, number>));
+    // fail CLOSED: an unreadable DLQ is indistinguishable from an empty one —
+    // a thrown error here fails the whole check as a tooling error instead of
+    // authorizing teardown without DLQ evidence
+    const dlqCounts = await dlq.countByStatus(runId);
     const dlqPending = dlqCounts.pending ?? 0;
     const dlqWaived = dlqCounts.waived ?? 0;
     if (dlqPending > 0) {

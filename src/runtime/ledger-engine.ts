@@ -405,8 +405,9 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       if (err) return { started: false, reason: err };
       cutoverMs = req.body.cutoverMs as number;
       const storedFc = await ledger.getStoredBound(config.ledger.runId).catch(() => null);
-      if (storedFc !== null && cutoverMs < storedFc) {
-        return { started: false, reason: `cutoverMs is EARLIER than the run's stored bound (${new Date(storedFc).toISOString()}) — that would silently exclude migrated data from the audit; pass the bound or later` };
+      const effectiveBound = storedFc ?? config.ledger.cdUpperBoundMs ?? null;
+      if (effectiveBound !== null && cutoverMs < effectiveBound) {
+        return { started: false, reason: `cutoverMs is EARLIER than the run's effective bound (${new Date(effectiveBound).toISOString()}) — that would silently exclude migrated data from the audit; pass the bound or later` };
       }
     }
     const samples = Math.min(10_000, Math.max(50, req.body?.samples ?? 500));
