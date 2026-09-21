@@ -193,6 +193,25 @@ Caveats:
 - Retention TTL keeps deleting on the old side throughout — the source
   audit reports that as deletion drift, not as a defect.
 
+### One-call boundary setting (SSH / API)
+
+The whole detect-and-apply flow is a single endpoint:
+
+```bash
+# detect, and apply automatically when the seam is an exact ingestion-pause gap
+curl -s -X POST localhost:PORT/control/set-boundary -H 'content-type: application/json' -d '{}'
+# read the outcome — the apply receipt lands in .applied
+curl -s localhost:PORT/api/boundary
+# no exact gap? review the report, then accept the anchor explicitly…
+curl -s -X POST localhost:PORT/control/set-boundary -H 'content-type: application/json' -d '{"acceptAnchor": true}'
+# …or set the bound to a known timestamp directly (applies immediately)
+curl -s -X POST localhost:PORT/control/set-boundary -H 'content-type: application/json' -d '{"boundMs": 1789966140000}'
+```
+
+An exact gap applies unattended; an anchor (quantified ambiguity) is never
+auto-applied without `acceptAnchor`. The dashboard flow and the separate
+`/control/detect-boundary` + `/control/apply-bound` endpoints keep working.
+
 ### Bound is opt-in — pick the mode deliberately
 
 | Situation | LEDGER_CD_UPPER_BOUND | Behavior |

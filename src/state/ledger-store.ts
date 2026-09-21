@@ -90,10 +90,12 @@ export class LedgerStore {
     total: number;
     byStatus: Record<string, number>;
     docsDone: number;
+    /** Cluster truth — each pod's in-memory skip counter only knows its own share. */
+    docsSkipped: number;
     perCollection: Array<{ collection: string; byStatus: Record<string, number>; docsDone: number; doneDocsRead: number; nonDoneRowsExpected: number }>;
   }> {
     const rows = await this.c().aggregate<{
-      _id: { c: string; s: string }; n: number; docsDone: number; docsRead: number; nonDoneExpected: number;
+      _id: { c: string; s: string }; n: number; docsDone: number; docsRead: number; nonDoneExpected: number; docsSkipped: number;
     }>([
       { $match: { run_id: runId } },
       { $group: {
@@ -102,11 +104,12 @@ export class LedgerStore {
         docsDone: { $sum: { $cond: [{ $eq: ['$status', 'done'] }, '$rows_expected', 0] } },
         docsRead: { $sum: { $cond: [{ $eq: ['$status', 'done'] }, '$docs_read', 0] } },
         nonDoneExpected: { $sum: { $cond: [{ $in: ['$status', ['pending', 'in_progress', 'written', 'attaching', 'failed']] }, '$rows_expected', 0] } },
+        docsSkipped: { $sum: '$docs_skipped' },
       } },
     ]).toArray();
     const perColl = new Map<string, { collection: string; byStatus: Record<string, number>; docsDone: number; doneDocsRead: number; nonDoneRowsExpected: number }>();
     const byStatus: Record<string, number> = {};
-    let total = 0, docsDone = 0;
+    let total = 0, docsDone = 0, docsSkipped = 0;
     for (const r of rows) {
       const e = perColl.get(r._id.c) ?? { collection: r._id.c, byStatus: {}, docsDone: 0, doneDocsRead: 0, nonDoneRowsExpected: 0 };
       e.byStatus[r._id.s] = (e.byStatus[r._id.s] ?? 0) + r.n;
@@ -117,8 +120,9 @@ export class LedgerStore {
       byStatus[r._id.s] = (byStatus[r._id.s] ?? 0) + r.n;
       total += r.n;
       docsDone += r.docsDone;
+      docsSkipped += r.docsSkipped;
     }
-    return { total, byStatus, docsDone, perCollection: [...perColl.values()].sort((a, b) => a.collection.localeCompare(b.collection)) };
+    return { total, byStatus, docsDone, docsSkipped, perCollection: [...perColl.values()].sort((a, b) => a.collection.localeCompare(b.collection)) };
   }
 
   /** Non-terminal + failed chunk details, capped — the interesting ones on huge runs. */

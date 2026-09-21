@@ -455,36 +455,41 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // the ConfigMap — two sources of truth with duplication at stake is how
   // operators get hurt.
   const envBoundAtBoot = config.ledger.cdUpperBoundMs;
+  let boundaryApplied: Record<string, unknown> | null = null;
+  const applyBoundNow = async (boundMs: number, source: string): Promise<Record<string, unknown>> => {
+    if (!Number.isFinite(boundMs) || boundMs <= 0) return { applied: false, reason: 'boundMs (epoch ms) required' };
+    if (config.ledger.dryRun) return { applied: false, reason: 'dry run — apply on the real run' };
+    if (envBoundAtBoot !== null) {
+      return { applied: false, reason: `bound already pinned via LEDGER_CD_UPPER_BOUND=${envBoundAtBoot} — change it in the deployment config, not here` };
+    }
+    if (boundMs >= Date.now() - 60_000) return { applied: false, reason: 'bound must be safely in the past (>60s ago)' };
+    try {
+      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
+      await ledger.setStoredBound(config.ledger.runId, boundMs, source);
+      logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), source, ...pruned }, 'Run bound applied — pods adopt it on their next map pass');
+      return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...pruned };
+    } catch (err) {
+      return { applied: false, reason: (err as Error).message };
+    }
+  };
   app.post<{ Body: { boundMs?: number } }>('/control/apply-bound', async (req, reply) => {
     const boundMs = Number(req.body?.boundMs);
     if (!Number.isFinite(boundMs) || boundMs <= 0) {
       reply.code(400);
       return { applied: false, reason: 'boundMs (epoch ms) required' };
     }
-    if (config.ledger.dryRun) return { applied: false, reason: 'dry run — apply on the real run' };
-    if (envBoundAtBoot !== null) {
-      return { applied: false, reason: `bound already pinned via LEDGER_CD_UPPER_BOUND=${envBoundAtBoot} — change it in the deployment config, not here` };
-    }
-    if (boundMs >= Date.now() - 60_000) {
-      return { applied: false, reason: 'bound must be safely in the past (>60s ago)' };
-    }
-    try {
-      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
-      await ledger.setStoredBound(config.ledger.runId, boundMs, 'dashboard');
-      logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), ...pruned }, 'Run bound applied from dashboard — pods adopt it on their next map pass');
-      return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...pruned };
-    } catch (err) {
-      reply.code(409);
-      return { applied: false, reason: (err as Error).message };
-    }
+    const res = await applyBoundNow(boundMs, 'dashboard');
+    if (!res.applied) reply.code(409);
+    return res;
   });
 
   // Tee-boundary detection + sync parity (background task — the Mongo
   // scan across thousands of collections is minutes of work).
-  const { detectBoundary, newBoundaryProgress } = await import('./boundary-detector.ts');
+  const { detectBoundary, newBoundaryProgress, decideAutoApply } = await import('./boundary-detector.ts');
   const boundaryState = newBoundaryProgress();
   app.post<{ Body: { bandMinutes?: number } }>('/control/detect-boundary', async (req) => {
     if (boundaryState.status === 'running') return { started: false, reason: 'detection already running' };
+    boundaryApplied = null;
     Object.assign(boundaryState, newBoundaryProgress(), { status: 'running', startedAt: Date.now() });
     void detectBoundary({
       config, logger, db: mongoReader.getDatabase(), staging, ledger,
@@ -494,7 +499,36 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       .catch((e) => { boundaryState.status = 'failed'; boundaryState.error = (e as Error).message; boundaryState.finishedAt = Date.now(); });
     return { started: true };
   });
-  app.get('/api/boundary', async () => boundaryState);
+  app.get('/api/boundary', async () => ({ ...boundaryState, applied: boundaryApplied }));
+
+  // ── ONE endpoint for the whole boundary flow ────────────────────────────
+  // {} → detect, and auto-apply when the seam is an exact ingestion-pause
+  // gap; {"acceptAnchor":true} → also take an anchor suggestion; {"boundMs"}
+  // → apply that value directly. The result (incl. the apply receipt) lands
+  // in GET /api/boundary under .applied.
+  app.post<{ Body: { boundMs?: number; acceptAnchor?: boolean; bandMinutes?: number } }>('/control/set-boundary', async (req) => {
+    if (typeof req.body?.boundMs === 'number') {
+      boundaryApplied = await applyBoundNow(req.body.boundMs, 'set-boundary explicit');
+      return boundaryApplied;
+    }
+    if (boundaryState.status === 'running') return { started: false, reason: 'detection already running — poll GET /api/boundary' };
+    const acceptAnchor = req.body?.acceptAnchor === true;
+    boundaryApplied = null;
+    Object.assign(boundaryState, newBoundaryProgress(), { status: 'running', startedAt: Date.now() });
+    void detectBoundary({
+      config, logger, db: mongoReader.getDatabase(), staging, ledger,
+      progress: boundaryState, bandMinutes: req.body?.bandMinutes,
+    })
+      .then(async (report) => {
+        boundaryState.report = report; boundaryState.status = 'completed'; boundaryState.finishedAt = Date.now();
+        const decision = decideAutoApply(report, acceptAnchor);
+        boundaryApplied = decision.apply
+          ? await applyBoundNow(decision.boundMs as number, acceptAnchor ? 'set-boundary anchor accepted' : 'set-boundary exact gap')
+          : { applied: false, reason: decision.reason };
+      })
+      .catch((e) => { boundaryState.status = 'failed'; boundaryState.error = (e as Error).message; boundaryState.finishedAt = Date.now(); });
+    return { started: true, mode: acceptAnchor ? 'detect + apply (anchor accepted)' : 'detect + apply only if the seam is exact', result: 'poll GET /api/boundary — the receipt lands in .applied' };
+  });
 
   app.get('/api/pods', async () => ({
     pods: await ledger.podActivity(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId),

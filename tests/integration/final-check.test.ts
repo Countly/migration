@@ -197,6 +197,11 @@ describe('final check: the interpreted sign-off', () => {
     });
   });
 
+  it('summarize reports cluster-truth docsSkipped from the ledger', async () => {
+    await mc.db(DB).collection('mig_ranges').updateOne({ _id: `${RUN}:${COLL}:0` } as never, { $set: { docs_skipped: 7 } });
+    expect((await ledger.summarize(RUN)).docsSkipped).toBe(7);
+  });
+
   it('content mismatch and failed chunks each FAIL with their own action line', async () => {
     const badContent = {
       contentAudit: async (samples = 500) => ({ sampled: samples, matched: samples - 2, missing: 1, different: 1, mismatches: [] }),

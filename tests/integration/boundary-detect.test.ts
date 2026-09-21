@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { MongoClient } from 'mongodb';
 import { createClient, type ClickHouseClient } from '@clickhouse/client';
 
-import { detectBoundary, newBoundaryProgress } from '../../src/runtime/boundary-detector.ts';
+import { detectBoundary, newBoundaryProgress, decideAutoApply } from '../../src/runtime/boundary-detector.ts';
 import { LedgerStore } from '../../src/state/ledger-store.ts';
 import { StagingManager } from '../../src/target/staging-manager.ts';
 import { loadConfig } from '../../src/config/loader.ts';
@@ -280,4 +280,27 @@ describe('tee-boundary detection + sync parity', () => {
     expect(report.sync.status).toBe('ok'); // parity is migration-agnostic
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: RUN } as never);
   }, 60_000);
+});
+
+describe('set-boundary auto-apply decision', () => {
+  const report = (detection: Record<string, unknown>) => ({ detection, sync: { status: 'ok' } }) as never;
+
+  it('an exact gap applies unattended', () => {
+    expect(decideAutoApply(report({ status: 'ok', method: 'gap', suggestedBoundMs: 123 }), false))
+      .toEqual({ apply: true, boundMs: 123 });
+  });
+
+  it('an anchor needs the explicit acceptAnchor', () => {
+    const d = decideAutoApply(report({ status: 'ok', method: 'anchor', suggestedBoundMs: 123, ambiguousMongoDocs: 42 }), false);
+    expect(d.apply).toBe(false);
+    expect(d.reason).toContain('acceptAnchor');
+    expect(d.reason).toContain('42');
+    expect(decideAutoApply(report({ status: 'ok', method: 'anchor', suggestedBoundMs: 123 }), true))
+      .toEqual({ apply: true, boundMs: 123 });
+  });
+
+  it('refused or empty detections never apply', () => {
+    expect(decideAutoApply(report({ status: 'refused', reason: 'run already mapped' }), true).apply).toBe(false);
+    expect(decideAutoApply(null, true).apply).toBe(false);
+  });
 });

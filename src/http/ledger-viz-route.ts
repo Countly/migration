@@ -830,9 +830,10 @@ async function tick() {
     var liveRate = clientReady ? Math.max(0, (last.d - windowStart.d) / rspan)
                  : slowRate !== null ? slowRate
                  : null;
-    var multiPod = stats.cluster && stats.cluster.pods > 1;
+    var podsSeen = Math.max(stats.cluster ? stats.cluster.pods : 0, stats.clusterSlow ? stats.clusterSlow.pods : 0);
+    var multiPod = podsSeen > 1;
     var effRate = liveRate !== null ? liveRate
-                : multiPod && stats.status === 'running' ? stats.cluster.docsPerSecond
+                : multiPod && stats.status === 'running' ? (stats.cluster ? stats.cluster.docsPerSecond : 0)
                 : stats.docsPerSecond;
     if (stats.status === 'completed') {
       // whole-RUN average from ledger docs + run timeline; the pod's own
@@ -844,13 +845,16 @@ async function tick() {
       var runAvg = runSec > 0 && sum.docsDone > 0 ? sum.docsDone / runSec : stats.docsPerSecond;
       dpsEl.textContent = runAvg >= 1 ? fmt(Math.round(runAvg)) + ' avg' : '\u2013';
     } else if (liveRate !== null) {
-      dpsEl.textContent = fmt(Math.round(liveRate)) + (multiPod ? ' \u00b7 ' + stats.cluster.pods + ' pods' : '');
+      dpsEl.textContent = fmt(Math.round(liveRate)) + (multiPod ? ' \u00b7 ' + podsSeen + ' pods' : '');
     } else if (stats.status === 'running') {
       dpsEl.textContent = 'measuring\u2026';
     } else {
       dpsEl.textContent = '\u2013';
     }
-    document.getElementById('s-skipped').textContent = fmt(stats.totalDocsSkipped);
+    // ledger truth — each pod's in-memory counter only knows its own share
+    // (field: a 3-pod run showed 100,623 while the DLQ held 314,125)
+    document.getElementById('s-skipped').textContent =
+      fmt(Math.max(sum.docsSkipped || 0, stats.totalDocsSkipped || 0));
     // ledger truth, not this pod's counter — in multi-pod each pod only
     // counts its own failures, so the card under-reported cluster-wide
     document.getElementById('s-failed').textContent = fmt((sum.byStatus || {}).failed || 0);

@@ -45,6 +45,28 @@ export interface BoundaryProgress {
   report: BoundaryReport | null;
 }
 
+/**
+ * One-call boundary setting: decide whether a detection is safe to apply
+ * unattended. An exact ingestion-pause GAP is; an ANCHOR carries quantified
+ * ambiguity and needs a human (or an explicit acceptAnchor).
+ */
+export function decideAutoApply(
+  report: BoundaryReport | null | undefined,
+  acceptAnchor: boolean,
+): { apply: boolean; boundMs?: number; reason?: string } {
+  const d = report?.detection;
+  if (!d || d.status !== 'ok' || !d.suggestedBoundMs) {
+    return { apply: false, reason: `no boundary detected${d?.reason ? ` — ${d.reason}` : d?.status ? ` (${d.status})` : ''}` };
+  }
+  if (d.method !== 'gap' && !acceptAnchor) {
+    return {
+      apply: false,
+      reason: `detected an ANCHOR, not an exact gap — ${d.ambiguousMongoDocs ?? '?'} old-side docs sit inside the ambiguity band. Review GET /api/boundary, then re-call with {"acceptAnchor": true} to take it, or pass an explicit {"boundMs": ...}.`,
+    };
+  }
+  return { apply: true, boundMs: d.suggestedBoundMs };
+}
+
 export interface BoundaryReport {
   detection: {
     status: 'ok' | 'refused' | 'no_data';
