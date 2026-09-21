@@ -144,6 +144,7 @@ export class ChunkOrchestrator {
   private probeOkStreak = 0;
   private autoResuming = false;
   private resumeProbeTimer: NodeJS.Timeout | null = null;
+  private guardProbeTimer: NodeJS.Timeout | null = null;
   private lastReclaimAt = 0;
   private monitorTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -222,8 +223,9 @@ export class ChunkOrchestrator {
       try {
         if ((await this.d.ledger.getStoredBound(this.runId)) !== null) return 'proceed';
         if (await this.d.ledger.getUnboundedAck(this.runId)) return 'proceed';
-        const counts = await this.d.ledger.statusCounts(this.runId);
-        if (Object.values(counts).reduce((a, b) => a + b, 0) > 0) return 'proceed'; // resumed run: decided already
+        // no shortcut for runs with mapped state: only a bound or an explicit
+        // no-mirror answer settles the question — restarts re-ask it when
+        // the target is live (one click; the ack persists cluster-wide)
         const live = await this.d.staging.hasLiveCdSince(Date.now() - GUARD_LIVE_LOOKBACK_MS);
         return live ? 'hold' : 'proceed';
       } catch (err) {
@@ -307,6 +309,27 @@ export class ChunkOrchestrator {
       void this.autoResumeProbe();
     }, 15_000);
     this.resumeProbeTimer.unref?.();
+
+    // The boundary question does not expire at startup: a mirror that comes
+    // online MID-RUN (target liveness appearing later) re-raises it — the
+    // startup probe passing once is not a permanent license to run unbounded.
+    if (!this.dryRun) {
+      this.guardProbeTimer = setInterval(() => {
+        void (async () => {
+          try {
+            if (this.status !== 'running' || this.paused) return;
+            if (this.d.config.ledger.cdUpperBoundMs != null || this.d.config.ledger.unboundedOk) return;
+            if ((await this.d.ledger.getStoredBound(this.runId)) !== null) return;
+            if (await this.d.ledger.getUnboundedAck(this.runId)) return;
+            if (await this.d.staging.hasLiveCdSince(Date.now() - GUARD_LIVE_LOOKBACK_MS)) {
+              this.pause('boundary-unset');
+              this.logger.warn('GUARD: the target began receiving live data mid-run with no bound set — answer the mirror question (set-boundary or allow-unbounded) to continue');
+            }
+          } catch { /* transient — next tick re-checks */ }
+        })();
+      }, 300_000);
+      this.guardProbeTimer.unref?.();
+    }
 
     if (this.dryRun) {
       await this.d.staging.createDryRunTable();
@@ -463,6 +486,7 @@ export class ChunkOrchestrator {
 
     if (this.monitorTimer) clearInterval(this.monitorTimer);
     if (this.resumeProbeTimer) clearInterval(this.resumeProbeTimer);
+    if (this.guardProbeTimer) clearInterval(this.guardProbeTimer);
     this.status = this.stopping ? 'stopped' : 'completed';
     this.finishedAt = Date.now();
     if (this.status === 'completed' && !this.dryRun) {
@@ -2122,7 +2146,7 @@ export class ChunkOrchestrator {
    * against its verified expectation, plus table totals. Exact, minutes at
    * most — run before sign-off or any time trust is in question.
    */
-  async verifyMigration(): Promise<Record<string, unknown>> {
+  async verifyMigration(upToMs: number | null = null): Promise<Record<string, unknown>> {
     const { ledger, staging } = this.d;
     const all = await ledger.listAll(this.runId);
     const byCollection = new Map<string, boolean>();
@@ -2132,6 +2156,7 @@ export class ChunkOrchestrator {
 
     let checked = 0;
     let unscopedSkipped = 0;
+    let pastCutoverSkipped = 0;
     const collectionCount = new Set(all.map((c) => c.collection)).size;
     const mismatches: Array<{ chunk: string; expected: number; live: number }> = [];
     const targets = all.filter((chunk) => chunk.status === 'done' && !this.isNullCdChunk(chunk as ChunkDoc));
@@ -2152,6 +2177,12 @@ export class ChunkOrchestrator {
           const chunk = targets[i];
           const scope = this.scopeOf(chunk as ChunkDoc);
           if (!scope && collectionCount > 1) { unscopedSkipped++; continue; }
+          // Chunks past the cutover cannot be count-compared at all: their
+          // windows mix natively-ingested rows into the same (a,e,n) scope,
+          // and after a tee-overlap dedupe their migrated rows were deleted
+          // on purpose. Skip and report them — the cutover-scoped region is
+          // what this verification vouches for.
+          if (upToMs !== null && chunk.upper_cd > upToMs) { pastCutoverSkipped++; continue; }
           const live = await staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd, scope);
           const relaxed = byCollection.get(chunk.collection) === true;
           const bad = relaxed ? live < chunk.rows_expected : live !== chunk.rows_expected;
@@ -2160,6 +2191,36 @@ export class ChunkOrchestrator {
           if (bad) mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live });
         }
       }));
+
+      // Null-cd sweep rows live INSIDE regular windows at ts-derived cds, so
+      // the window comparison above deliberately tolerates them — which also
+      // means their loss would be invisible. Verify them directly: the
+      // source's cd:null ids must still exist live (scoped when possible).
+      this.verifyProgress.phase = 'verifying null-cd sweep rows';
+      const db = this.d.mongoReader.getDatabase();
+      for (const chunk of all) {
+        if (!this.isNullCdChunk(chunk as ChunkDoc) || chunk.status !== 'done' || chunk.rows_expected <= 0) continue;
+        const idDocs = await db.collection(chunk.collection)
+          .find({ cd: null }, { projection: { _id: 1, ts: 1 } }).limit(1_000_000).toArray();
+        if (idDocs.length === 0) continue;
+        let lo = Infinity, hi = -Infinity;
+        const sweepIds: string[] = [];
+        for (const d of idDocs) {
+          sweepIds.push(String(d._id));
+          const tsMs = toEpochMillis(d.ts);
+          if (tsMs !== null && tsMs > 0) {
+            const c = clampDateTime64(tsMs);
+            if (c < lo) lo = c;
+            if (c > hi) hi = c;
+          }
+        }
+        const scope = this.scopeOf(chunk as ChunkDoc);
+        const liveSweep = await this.d.staging.fetchLiveCdByIds(sweepIds, lo <= hi ? { loMs: lo, hiMs: hi } : undefined, scope);
+        checked++;
+        if (liveSweep.size < chunk.rows_expected) {
+          mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live: liveSweep.size });
+        }
+      }
 
       this.verifyProgress.phase = 'scanning for duplicates (per partition)';
 
@@ -2196,6 +2257,7 @@ export class ChunkOrchestrator {
       ok: mismatches.length === 0 && migrationDuplicates === 0,
       checkedChunks: checked,
       unscopedSkipped,
+      pastCutoverSkipped,
       mismatches,
       table: { rows: dup.rows, distinctIds: dup.rows - dup.duplicates, duplicates: dup.duplicates },
       duplicateSample,

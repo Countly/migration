@@ -180,7 +180,7 @@ export async function rebuildLedger(opts: {
       }
       summary.nullCdDocs = nullCdIds.length;
       const liveNullCd = nullCdIds.length > 0
-        ? await staging.fetchLiveCdByIds(nullCdIds, derivedLo <= derivedHi ? { loMs: derivedLo, hiMs: derivedHi } : undefined)
+        ? await staging.fetchLiveCdByIds(nullCdIds, derivedLo <= derivedHi ? { loMs: derivedLo, hiMs: derivedHi } : undefined, scope)
         : new Map<string, number>();
       summary.nullCdSwept = liveNullCd.size;
       const sweptCds = [...liveNullCd.values()].sort((a, b) => a - b);
@@ -279,6 +279,26 @@ export async function rebuildLedger(opts: {
                 sampled: sampleIds.length, missing,
               });
             }
+          }
+        }
+        // Unscopable collection among others: no per-window recount exists,
+        // so sampled id coverage is the ONLY per-window evidence — run it on
+        // the same stride (unscoped lookup; _ids are effectively unique).
+        if (checkOnly && unscopableInMulti && mongoCount > 0 && idChecks < 300 && idx % 25 === 0) {
+          idChecks++;
+          const uSample = (await coll
+            .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
+            .limit(5_000).toArray()).map((d) => String(d._id));
+          const uPresent = await staging.countDistinctMatchingIdsInWindow(uSample, b.lowerCd, b.upperCd, null);
+          const uUnresolved = unresolved > 0
+            ? await dlq.countUnresolvedMatchingIds(runId, collection, uSample, b.lowerCd, b.upperCd)
+            : 0;
+          const uMissing = uSample.length - uPresent - uUnresolved;
+          if (uMissing > 0 && (progress.idCoverageMissing ?? []).length < 200) {
+            (progress.idCoverageMissing ?? (progress.idCoverageMissing = [])).push({
+              collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
+              sampled: uSample.length, missing: uMissing,
+            });
           }
         }
         // Identity coverage: a doc swapped for ANOTHER doc with the same cd

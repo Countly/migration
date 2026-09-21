@@ -509,12 +509,25 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     try {
       const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
       await ledger.setStoredBound(config.ledger.runId, boundMs, source);
-      // belt: a claim raced in anyway → a second prune either cleans the
-      // still-pending stragglers or names the claimed chunk and fails loudly
-      const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
-      const total = { deleted: (pruned.deleted + pruned2.deleted), clamped: (pruned.clamped + pruned2.clamped) };
-      logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), source, ...total }, 'Run bound applied — pods adopt it on their next map pass');
-      return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
+      // Post-store verification: a claim that raced the fence shows up as a
+      // non-pending beyond-bound chunk (second prune throws) or a fresh
+      // active claim. Either way the stored bound is ROLLED BACK — apply
+      // never leaves a half-applied bound behind a racing worker.
+      try {
+        const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
+        const claimsAfter = await ledger.activeClaims(config.ledger.runId);
+        if (claimsAfter.length > 0) {
+          throw new Error(`pods claimed chunks during apply (${claimsAfter.map((c) => `${c.pod}×${c.count}`).join(', ')})`);
+        }
+        const total = { deleted: (pruned.deleted + pruned2.deleted), clamped: (pruned.clamped + pruned2.clamped) };
+        logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), source, ...total }, 'Run bound applied — pods adopt it on their next map pass');
+        // a guard-held engine has its answer now
+        if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume();
+        return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
+      } catch (raceErr) {
+        await ledger.clearStoredBound(config.ledger.runId).catch(() => {});
+        return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
+      }
     } catch (err) {
       return { applied: false, reason: (err as Error).message };
     }
@@ -552,6 +565,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // cluster-wide (stored in run config), releases every held pod.
   app.post('/control/allow-unbounded', async () => {
     await ledger.setUnboundedAck(config.ledger.runId, config.worker.podId);
+    if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume();
     logger.warn('Operator declared no-mirror: unbounded run allowed — held pods release within seconds');
     return { allowed: true, note: 'held pods release within ~3s; the decision is stored cluster-wide in mig_run_config' };
   });

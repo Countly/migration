@@ -564,9 +564,11 @@ export class StagingManager {
    * queries; used by ledger rebuild to attribute null-cd sweep rows (their
    * cd is ts-derived and lands inside regular chunks' windows).
    */
-  async fetchLiveCdByIds(ids: string[], cdBounds?: { loMs: number; hiMs: number }): Promise<Map<string, number>> {
+  async fetchLiveCdByIds(ids: string[], cdBounds?: { loMs: number; hiMs: number }, scope?: { a: string; e: string; n?: string } | null): Promise<Map<string, number>> {
     // _id is not in the ORDER BY — without cd bounds this is a full-column
     // scan on a 10B-row table. Callers know their rows' cd values; pass them.
+    // Scope (when the collection resolves one) keeps a SIBLING collection's
+    // row with the same _id from answering for this one.
     const bound = cdBounds
       ? 'AND cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})'
       : '';
@@ -575,8 +577,8 @@ export class StagingManager {
       const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
       const res = await this.ch().query({
         query: `SELECT _id, toUnixTimestamp64Milli(cd) AS cd_ms FROM ${this.fq(this.config.table)}
-                WHERE _id IN {ids:Array(String)} ${bound}`,
-        query_params: { ids: page, ...(cdBounds ? { blo: cdBounds.loMs, bhi: cdBounds.hiMs } : {}) },
+                WHERE _id IN {ids:Array(String)} ${bound} ${this.scopeSql(scope)}`,
+        query_params: { ids: page, ...(cdBounds ? { blo: cdBounds.loMs, bhi: cdBounds.hiMs } : {}), ...this.scopeParams(scope) },
         format: 'JSONEachRow',
       });
       const rows = await res.json<{ _id: string; cd_ms: string }>();

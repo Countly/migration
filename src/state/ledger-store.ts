@@ -598,6 +598,11 @@ export class LedgerStore {
     );
   }
 
+  /** Roll back a bound whose post-store verification failed — apply must never leave a half-applied bound behind. */
+  async clearStoredBound(runId: string): Promise<void> {
+    await this.rc().updateOne({ _id: runId }, { $unset: { cd_upper_bound_ms: '', set_at: '', set_by: '' } });
+  }
+
   async setStoredBound(runId: string, boundMs: number, setBy: string): Promise<void> {
     await this.rc().updateOne(
       { _id: runId },

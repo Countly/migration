@@ -224,6 +224,7 @@ describe('final check: the interpreted sign-off', () => {
 
   it('content mismatch and failed chunks each FAIL with their own action line', async () => {
     const badContent = {
+      ...contentClean,
       contentAudit: async (samples = 500) => ({ sampled: samples, matched: samples - 2, missing: 1, different: 1, mismatches: [] }),
     };
     const out = await check({ cutoverMs: CUTOVER, orchestrator: badContent });

@@ -64,7 +64,7 @@ interface ContentAuditRunner {
     sampled: number; matched: number; missing: number; different: number;
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }>;
-  verifyMigration(): Promise<Record<string, unknown>>;
+  verifyMigration(upToMs?: number | null): Promise<Record<string, unknown>>;
 }
 
 export async function runFinalCheck(
@@ -135,16 +135,14 @@ export async function runFinalCheck(
     }
     if (dlqPending === 0 && dlqWaived === 0) out.passes.push('Dead-letter queue is empty — no document was skipped.');
 
-    // ── 3a. QUICK tier: target vs the run's own ledger (minutes) ──────────
+    // ── 3a. Target vs the run's own ledger — BOTH tiers ────────────────────
     // Catches everything that happened AFTER reading: lost partitions, rows
-    // deleted from the live table, duplicate attribution. What it cannot see
-    // is a self-consistently under-reading reader — the ledger agreeing with
-    // itself while the source held more. That class is covered
-    // probabilistically by the content samples below, and exactly by the
-    // deep recount — which is why quick mode never returns a plain PASS.
-    if (!deep) {
+    // deleted from the live table, and exact duplicate attribution (which
+    // the deep recount alone would misread as retention drift). Cutover-
+    // aware: post-cutover windows mix native rows and are skipped here.
+    {
       out.phase = 'verifying the target against the run ledger';
-      const verify = await deps.orchestrator.verifyMigration();
+      const verify = await deps.orchestrator.verifyMigration(cutoverMs);
       const vMism = (verify.mismatches as Array<Record<string, unknown>> | undefined) ?? [];
       const vDup = Number((verify as Record<string, unknown>).migrationDuplicates ?? 0);
       if (verify.ok !== true) {
@@ -160,7 +158,9 @@ export async function runFinalCheck(
       } else {
         out.passes.push('Target verified against the run ledger: every migrated chunk window holds exactly the recorded row count, with no migration-side duplicates.');
       }
-      out.notes.push(`Quick mode: the ledger itself was not re-proven against the source. Per-chunk verification at attach time plus the random content samples below cover that class probabilistically — run the DEEP check ({"deep": true}, or the checkbox in the dashboard) before deleting the source if you want the full recount + checksum fingerprints.`);
+      if (!deep) {
+        out.notes.push(`Quick mode: the ledger itself was not re-proven against the source. Per-chunk verification at attach time plus the random content samples below cover that class probabilistically — run the DEEP check ({"deep": true}, or the checkbox in the dashboard) before deleting the source if you want the full recount + checksum fingerprints.`);
+      }
     }
 
     // ── 3b. DEEP tier: full source recount + cd-checksum fingerprint ──────
