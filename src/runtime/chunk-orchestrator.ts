@@ -161,12 +161,16 @@ export class ChunkOrchestrator {
 
   private lastPressure: { state: PressureState; at: number } | null = null;
 
+  /** The env-pinned bound as of process start — immutable, unlike config.ledger.cdUpperBoundMs which map-pass ADOPTION overwrites with the (mutable) stored bound. */
+  private readonly envBoundMs: number | null;
+
   constructor(deps: ChunkOrchestratorDeps) {
     this.d = deps;
     this.logger = deps.logger.child({ component: 'ChunkOrchestrator' });
     this.dryRun = deps.config.ledger.dryRun;
     this.runId = this.dryRun ? `${deps.config.ledger.runId}-dry` : deps.config.ledger.runId;
     this.podId = deps.config.worker.podId;
+    this.envBoundMs = deps.config.ledger.cdUpperBoundMs ?? null;
   }
 
   // -------------------------------------------------------------------------
@@ -225,7 +229,10 @@ export class ChunkOrchestrator {
     if (chunk.lower_cd < 0) return false; // sentinel sweep — no cd semantics
     let bound: number | null = null;
     try {
-      bound = this.d.config.ledger.cdUpperBoundMs ?? await this.d.ledger.getStoredBound(this.runId);
+      // env bound is immutable; the config value is NOT (adoption overwrites
+      // it with the stored bound, which the dashboard may have LOWERED since)
+      // — so absent an env pin, the CURRENT stored value is always re-read
+      bound = this.envBoundMs ?? await this.d.ledger.getStoredBound(this.runId);
     } catch {
       // cannot read the bound — do not process on unknown configuration
       await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});

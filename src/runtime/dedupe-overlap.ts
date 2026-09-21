@@ -176,6 +176,16 @@ export async function runDedupeOverlap(
           return;
         }
         if (opts.execute) {
+          // durable fence at the last moment: rows attached between this
+          // bucket's matched snapshot and its live count would be
+          // misclassified as native cover — if the run state moved AT ALL,
+          // abort before deleting under changed evidence
+          if (deps.ledger && fpBefore !== null) {
+            const fpNow = await deps.ledger.runFingerprint(config.ledger.runId);
+            if (fpNow !== fpBefore) {
+              throw new Error('run chunk state changed during execute — aborted before deleting under changed evidence; re-run the dry run with all pods idle');
+            }
+          }
           for (let i = 0; i < ids.length; i += ID_BATCH) {
             await staging.deleteMatchingIdsInWindow(ids.slice(i, i + ID_BATCH), loMs, hiMs, scope);
           }
