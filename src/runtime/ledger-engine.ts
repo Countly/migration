@@ -542,7 +542,9 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       // concurrent applies cannot both win — the loser rolls its prune back.
       const stored = await ledger.setStoredBoundIf(config.ledger.runId, boundMs, source, priorBound);
       if (!stored) {
-        for (const r of restores.reverse()) await ledger.restorePrune(r).catch(() => {});
+        // a competing apply won: restore only what ITS bound permits
+        const winner = await ledger.getStoredBound(config.ledger.runId).catch(() => null);
+        for (const r of restores.reverse()) await ledger.restorePrune(r, winner).catch(() => {});
         return { applied: false, reason: 'another bound application raced this one (the stored bound changed mid-apply) — this call was rolled back; re-read the current bound and retry deliberately' };
       }
       // Post-store verification: a claim that raced the fence shows up as a
@@ -562,13 +564,14 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume(true);
         return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
       } catch (raceErr) {
-        for (const r of restores.reverse()) await ledger.restorePrune(r).catch(() => {});
         if (priorBound !== null) await ledger.setStoredBound(config.ledger.runId, priorBound, `${source} rollback`).catch(() => {});
         else await ledger.clearStoredBound(config.ledger.runId).catch(() => {});
+        for (const r of restores.reverse()) await ledger.restorePrune(r, priorBound).catch(() => {});
         return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (bound and pruned chunks restored) (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
       }
     } catch (err) {
-      for (const r of restores.reverse()) await ledger.restorePrune(r).catch(() => {});
+      const current = await ledger.getStoredBound(config.ledger.runId).catch(() => priorBound);
+      for (const r of restores.reverse()) await ledger.restorePrune(r, current).catch(() => {});
       return { applied: false, reason: (err as Error).message };
     }
   };
@@ -629,11 +632,14 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       progress: boundaryState, bandMinutes: req.body?.bandMinutes,
     })
       .then(async (report) => {
-        boundaryState.report = report; boundaryState.status = 'completed'; boundaryState.finishedAt = Date.now();
+        boundaryState.report = report;
         const decision = decideAutoApply(report, acceptAnchor);
         boundaryApplied = decision.apply
           ? await applyBoundNow(decision.boundMs as number, acceptAnchor ? 'set-boundary anchor accepted' : 'set-boundary exact gap')
           : { applied: false, reason: decision.reason };
+        // completed only once .applied is decided — a poller leaving at
+        // 'completed' must never see the apply still in flight
+        boundaryState.status = 'completed'; boundaryState.finishedAt = Date.now();
       })
       .catch((e) => { boundaryState.status = 'failed'; boundaryState.error = (e as Error).message; boundaryState.finishedAt = Date.now(); });
     return { started: true, mode: acceptAnchor ? 'detect + apply (anchor accepted)' : 'detect + apply only if the seam is exact', result: 'poll GET /api/boundary — the receipt lands in .applied' };

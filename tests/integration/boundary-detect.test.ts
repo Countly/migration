@@ -152,6 +152,27 @@ describe('tee-boundary detection + sync parity', () => {
     expect(await ledger.getStoredBound(RUN2)).toBe(1_200_000_000_000);
   });
 
+  it('restorePrune under a winning bound never resurrects what that bound pruned', async () => {
+    const RUN3 = 'boundary-restore-1';
+    const mk = (idx: number, lo: number, hi: number) => ({
+      _id: `${RUN3}:c:${idx}`, run_id: RUN3, collection: 'c',
+      scope_a: 'a', scope_e: 'e', scope_n: null, idx, lower_cd: lo, upper_cd: hi,
+      status: 'pending' as const, pod_id: null, lease_until: null, staging_table: null,
+      docs_read: 0, docs_skipped: 0, rows_expected: 0, partitions: [], attached: [],
+      attach_method: null, attempts: 0, last_error: null, transform_version: 'v', updated_at: new Date(),
+    });
+    // loser's receipt holds chunks at 100–200 and 200–300, straddler originally ending 150
+    const receipt = {
+      deletedChunks: [mk(1, 100, 200), mk(2, 200, 300)] as never[],
+      clampedChunks: [{ _id: `${RUN3}:c:0`, upper_cd: 150 }],
+    };
+    await ledger.replaceAllForRun(RUN3, [{ ...mk(0, 0, 100), upper_cd: 120 }] as never[]);
+    // the winner's bound is 150: chunk 200–300 stays gone, 100–200 comes back clamped to 150
+    await ledger.restorePrune(receipt as never, 150);
+    const rows = await mc.db(DB).collection('mig_ranges').find({ run_id: RUN3 } as never).sort({ idx: 1 }).toArray();
+    expect(rows.map((r) => [r.idx, r.lower_cd, r.upper_cd])).toEqual([[0, 0, 150], [1, 100, 150]]);
+  });
+
   it('finds the ingestion-pause gap and suggests a bound inside it; parity flags the dead hour', async () => {
     const report = (await run())!;
     const d = report.detection;

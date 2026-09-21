@@ -687,13 +687,28 @@ export class LedgerStore {
     return { deleted: del.deletedCount ?? 0, clamped: clamp.modifiedCount ?? 0, restore: { deletedChunks, clampedChunks } };
   }
 
-  /** Undo a prune whose apply raced — re-insert deleted pending chunks, un-clamp straddlers (only while still pending). */
-  async restorePrune(restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }): Promise<void> {
-    if (restore.deletedChunks.length > 0) {
-      await this.c().insertMany(restore.deletedChunks, { ordered: false }).catch(() => {});
+  /**
+   * Undo a prune whose apply raced — re-insert deleted pending chunks,
+   * un-clamp straddlers (only while still pending). When another apply WON
+   * meanwhile, its bound governs: chunks at/beyond it stay pruned and
+   * straddlers stay clamped to it, so a losing rollback can never resurrect
+   * what the winning bound removed.
+   */
+  async restorePrune(
+    restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> },
+    currentBoundMs: number | null = null,
+  ): Promise<void> {
+    const insertable = currentBoundMs === null
+      ? restore.deletedChunks
+      : restore.deletedChunks.filter((c) => c.lower_cd < currentBoundMs).map((c) => (
+        c.upper_cd > currentBoundMs ? { ...c, upper_cd: currentBoundMs } : c
+      ));
+    if (insertable.length > 0) {
+      await this.c().insertMany(insertable, { ordered: false }).catch(() => {});
     }
     for (const c of restore.clampedChunks) {
-      await this.c().updateOne({ _id: c._id, status: 'pending' }, { $set: { upper_cd: c.upper_cd, updated_at: new Date() } });
+      const upper = currentBoundMs !== null ? Math.min(c.upper_cd, currentBoundMs) : c.upper_cd;
+      await this.c().updateOne({ _id: c._id, status: 'pending' }, { $set: { upper_cd: upper, updated_at: new Date() } });
     }
   }
 

@@ -233,7 +233,15 @@ export class ChunkOrchestrator {
         // no-mirror answer settles the question — restarts re-ask it when
         // the target is live (one click; the ack persists cluster-wide)
         const live = await this.d.staging.hasLiveCdSince(Date.now() - GUARD_LIVE_LOOKBACK_MS);
-        return live ? 'hold' : 'proceed';
+        if (!live) {
+          // The target being empty of recent data is only provable BEFORE
+          // this run writes — persist the verdict cluster-wide so a pod
+          // starting later (or a restart) does not mistake THIS run's
+          // attached rows for live ingestion and demand a spurious ack.
+          await this.d.ledger.setUnboundedAck(this.runId, `${this.podId} auto:empty-target-at-start`);
+          return 'proceed';
+        }
+        return 'hold';
       } catch (err) {
         this.logger.warn({ err: (err as Error).message }, 'Boundary guard: evidence probe failed — holding until the stores answer');
         return 'hold';
