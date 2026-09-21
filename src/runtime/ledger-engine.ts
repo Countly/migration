@@ -387,9 +387,18 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // declared here so final-check and dedupe can mutually exclude: dedupe
   // deletes target rows the ledger fingerprint cannot see
   const dedupeState: DedupeOverlapState = newDedupeOverlapState();
+  // SYNCHRONOUS maintenance lock: the status checks alone leave an async
+  // gap (both requests can pass them, then yield in activeClaims before
+  // either marks itself running) — taken before the first await, released
+  // on refusal or completion
+  let maintenanceOp: string | null = null;
   app.post<{ Body: { cutoverMs?: number; samples?: number; deep?: boolean; acceptUnscoped?: boolean } }>('/control/final-check', async (req) => {
     if (finalCheckState.status === 'running') return { started: false, reason: 'final check already running' };
     if (dedupeState.status === 'running') return { started: false, reason: 'a dedupe is running — it changes the target under the check; wait for it to finish' };
+    if (maintenanceOp !== null) return { started: false, reason: `${maintenanceOp} is starting — retry in a moment` };
+    maintenanceOp = 'final-check'; // synchronous acquire — released in the finally below unless the run launched
+    let launchedFc = false;
+    try {
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — run the final check after completion (or while paused)' };
     // no exclusion: the SERVING pod's own live claims block the check too —
     // a paused pod mid-chunk still owns half-written state
@@ -414,8 +423,13 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     const samples = Math.min(10_000, Math.max(50, typeof req.body?.samples === 'number' && Number.isFinite(req.body.samples) ? req.body.samples : 500));
     const deep = req.body?.deep === true;
     const acceptUnscoped = req.body?.acceptUnscoped === true;
-    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep, acceptUnscoped });
+    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep, acceptUnscoped })
+      .finally(() => { maintenanceOp = null; });
+    launchedFc = true;
     return { started: true, cutoverMs, samples, deep, acceptUnscoped };
+    } finally {
+      if (!launchedFc) maintenanceOp = null;
+    }
   });
   app.get('/api/final-check', async () => finalCheckState);
   app.get('/final-check.txt', async (_req, reply) => {
@@ -428,6 +442,10 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.post<{ Body: { fromMs?: number; toMs?: number; execute?: boolean; slackPct?: number } }>('/control/dedupe-overlap', async (req) => {
     if (dedupeState.status === 'running') return { started: false, reason: 'dedupe already running' };
     if (finalCheckState.status === 'running') return { started: false, reason: 'a final check is running — dedupe would delete rows it already audited; wait for the verdict' };
+    if (maintenanceOp !== null) return { started: false, reason: `${maintenanceOp} is starting — retry in a moment` };
+    maintenanceOp = 'dedupe'; // synchronous acquire — released in the finally below unless the run launched
+    let launchedDd = false;
+    try {
     // destructive against the live table: the migration must be fully
     // stopped — no pod (this one included) may hold an active chunk claim,
     // dry run included, so the counts it licenses execute with are stable
@@ -464,8 +482,13 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         return { started: false, reason: 'execute refused: the run state changed since the dry run — its counts no longer describe the grid; re-run the dry run with all pods idle' };
       }
     }
-    void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct });
+    void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct })
+      .finally(() => { maintenanceOp = null; });
+    launchedDd = true;
     return { started: true, execute, fromMs, toMs };
+    } finally {
+      if (!launchedDd) maintenanceOp = null;
+    }
   });
   app.get('/api/dedupe-overlap', async () => dedupeState);
   app.get('/api/dryrun', async () => dryState);
@@ -552,8 +575,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     }
     const restores: Array<{ deletedChunks: import('../state/ledger-store.ts').ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }> = [];
     try {
-      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
-      restores.push(pruned.restore);
+      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, (r) => restores.push(r));
       // Compare-and-set against the prior bound this call validated: two
       // concurrent applies cannot both win — the loser rolls its prune back.
       const stored = await ledger.setStoredBoundIf(config.ledger.runId, boundMs, source, priorBound);
@@ -579,8 +601,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       // active claim. EVERY receipt collected so far rolls back on failure —
       // no half-applied state and no grid gaps, whichever step failed.
       try {
-        const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
-        restores.push(pruned2.restore);
+        const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, (r) => restores.push(r));
         const claimsAfter = await ledger.activeClaims(config.ledger.runId);
         if (claimsAfter.length > 0) {
           throw new Error(`pods claimed chunks during apply (${claimsAfter.map((c) => `${c.pod}×${c.count}`).join(', ')})`);

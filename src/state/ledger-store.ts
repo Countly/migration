@@ -710,7 +710,7 @@ export class LedgerStore {
    * Refuses when any non-pending chunk reaches past the bound — that data
    * (possibly) already moved and needs purge tooling, not a config flip.
    */
-  async pruneBeyondBound(runId: string, boundMs: number): Promise<{
+  async pruneBeyondBound(runId: string, boundMs: number, receiptSink?: (r: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }) => void): Promise<{
     deleted: number; clamped: number;
     /** What the prune changed, verbatim — a raced apply restores it. */
     restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> };
@@ -722,18 +722,22 @@ export class LedgerStore {
     if (busy > 0) {
       throw new Error(`${busy} non-pending chunk(s) already reach past the bound — their windows may hold migrated post-bound data; purge/retry them first`);
     }
+    // snapshot EVERYTHING first, hand the receipt to the caller, and only
+    // then write: a destructive write whose acknowledgement is lost must
+    // still be restorable by the caller
     const deletedChunks = await this.c()
       .find({ run_id: runId, lower_cd: { $gte: boundMs }, status: 'pending' })
       .toArray();
-    const del = await this.c().deleteMany({
-      _id: { $in: deletedChunks.map((c) => c._id) }, status: 'pending',
-    });
     const clampedChunks = (await this.c()
       .find(
         { run_id: runId, lower_cd: { $gte: 0, $lt: boundMs }, upper_cd: { $gt: boundMs }, status: 'pending' },
         { projection: { _id: 1, upper_cd: 1 } },
       )
       .toArray()).map((c) => ({ _id: String(c._id), upper_cd: c.upper_cd }));
+    receiptSink?.({ deletedChunks, clampedChunks });
+    const del = await this.c().deleteMany({
+      _id: { $in: deletedChunks.map((c) => c._id) }, status: 'pending',
+    });
     // clamp ONLY the snapshotted ids: a straddler inserted after the
     // snapshot must not be modified outside the receipt (a rollback would
     // leave it truncated under a rejected bound) — the insert-path
