@@ -284,20 +284,13 @@ export class ChunkOrchestrator {
         // no shortcut for runs with mapped state: only a bound or an explicit
         // no-mirror answer settles the question — restarts re-ask it when
         // the target is live (one click; the ack persists cluster-wide)
-        const live = await this.d.staging.hasLiveCdSince(Date.now() - GUARD_LIVE_LOOKBACK_MS);
-        if (live) return 'hold';
-        // No RECENT rows is inconclusive on its own — a mirrored target that
-        // has been idle for a day still holds mirror history that unbounded
-        // migration would duplicate. Only an AUTHORITATIVE zero-row (or
-        // absent-table) answer proves no-mirror; an operational failure of
-        // the count throws in liveRowCountStrict and is caught by the outer
-        // evaluate() handler, which HOLDS. The verdict is persisted
-        // cluster-wide (only provable BEFORE this run writes).
-        const totalRows = await this.d.staging.liveRowCountStrict();
-        if (totalRows === null || totalRows === 0) {
-          await this.d.ledger.setUnboundedAck(this.runId, `${this.podId} auto:empty-target-at-start`);
-          return 'proceed';
-        }
+        // NO automatic verdict exists: even an authoritative zero-row count
+        // proves only CURRENT emptiness — a tee that is enabled but has not
+        // carried its first request yet looks identical to no-mirror, and
+        // mirroring status is simply not observable from data. The question
+        // is answered exactly once per run, by the operator (Proceed
+        // unbounded / a bound) or declaratively (LEDGER_UNBOUNDED_OK for
+        // topologies known to have no mirror, e.g. fire-and-forget Jobs).
         return 'hold';
       } catch (err) {
         this.logger.warn({ err: (err as Error).message }, 'Boundary guard: evidence probe failed — holding until the stores answer');
@@ -307,9 +300,16 @@ export class ChunkOrchestrator {
 
     if ((await evaluate()) === 'proceed') return;
     this.pause('boundary-unset');
+    // best-effort target description for the log — the DECISION never
+    // depends on it (mirroring status is not observable from data)
+    let targetDesc = 'state unknown';
+    try {
+      const rows = await this.d.staging.liveRowCountStrict();
+      targetDesc = rows === null ? 'table absent' : rows === 0 ? 'currently empty' : `${rows} rows`;
+    } catch { /* description only */ }
     this.logger.warn(
-      { runId: this.runId },
-      'GUARD: target ClickHouse holds recent live data and no cd upper bound is set — if a mirror re-ingests the same requests on both sides, running unbounded WILL duplicate the overlap window. Apply a bound (POST /control/set-boundary) or declare no-mirror (POST /control/allow-unbounded).',
+      { runId: this.runId, target: targetDesc },
+      'GUARD: no cd upper bound is set and no no-mirror declaration exists — if a mirror re-ingests the same requests on both sides, running unbounded WILL duplicate the overlap. Apply a bound (POST /control/set-boundary), declare no-mirror (POST /control/allow-unbounded), or deploy with LEDGER_UNBOUNDED_OK=1 for topologies known to have no mirror.',
     );
     while (!this.stopping) {
       await sleep(3_000);

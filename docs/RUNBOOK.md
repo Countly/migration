@@ -228,8 +228,8 @@ old ingestion, clone the source MongoDB, resume ingestion on the NEW stack
 from the clone. SDK offline queues absorb the pause. Properties:
 
 - The source is frozen at the clone moment, so no bound is needed and top-up
-  finds nothing — the startup guard will still ask (the target ingests live
-  while the run starts): **Proceed unbounded is correct** here.
+  finds nothing — the startup guard asks its one question at start:
+  **Proceed unbounded is correct** here.
 - Parity/audit tables compare against the CLONE: zeros after the clone
   moment mean "clone taken here", not a dead mirror. The live old-side
   MongoDB is invisible to the tool.
@@ -322,15 +322,16 @@ cannot tell those apart from data alone, so it asks — once:
   releases every held pod), or deploy with `LEDGER_UNBOUNDED_OK=1`.
 
 A plain Resume is deliberately ignored while the question is open — only a
-bound or the no-mirror answer releases the hold. The question is answered
-EXACTLY ONCE, at the only moment the evidence is clean — before the run's
-first write: a target provably empty of recent data records the verdict
-automatically (ack stamped `auto:empty-target-at-start`); a live target
-holds until the operator answers. The verdict is stored cluster-wide, so
-later pods and restarts never mistake this run's own rows for live
-ingestion. The corollary: a mirror enabled AFTER the run started is
-invisible to the guard by construction — enabling any mirror is exactly
-when to run the sync-parity card.
+bound or the no-mirror answer releases the hold. There is NO automatic
+verdict: even a provably empty target proves only current emptiness (a tee
+that has not carried its first request yet looks identical to no-mirror),
+so the question is answered exactly once per run, explicitly — the
+dashboard's Proceed unbounded, `POST /control/allow-unbounded`, a bound, or
+`LEDGER_UNBOUNDED_OK=1` in the deployment for topologies known to have no
+mirror (required for fire-and-forget Jobs). The answer is stored
+cluster-wide, releasing every held pod. The corollary: a mirror enabled
+AFTER the answer is invisible to the guard by construction — enabling any
+mirror is exactly when to run the sync-parity card.
 
 ### Bound is opt-in — pick the mode deliberately
 
