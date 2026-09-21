@@ -217,7 +217,11 @@ export async function runFinalCheck(
     if (content.missing > 0 || content.different > 0) {
       out.problems.push(`Content sampling found ${fmt(content.missing)} missing and ${fmt(content.different)} differing doc(s) out of ${fmt(content.sampled)} sampled — the migrated content does not match the source; escalate before decommissioning.`);
     } else if (content.sampled > 0) {
-      out.passes.push(`Sampled ${fmt(content.sampled)} random docs field-by-field — all identical between source and ClickHouse.`);
+      // say exactly what was compared: scalar columns exactly, JSON columns
+      // by key set (ClickHouse's JSON type normalizes value encodings —
+      // value-level fidelity is pinned by the transform's differential
+      // harness, not by this sampler)
+      out.passes.push(`Sampled ${fmt(content.sampled)} random docs against the source — every scalar field exact, every JSON field's key set matched.`);
     }
 
     // ── Verdict ────────────────────────────────────────────────────────────

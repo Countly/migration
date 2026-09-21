@@ -143,6 +143,15 @@ describe('tee-boundary detection + sync parity', () => {
     return report;
   };
 
+  it('stored-bound compare-and-set: only the apply that validated against the current value wins', async () => {
+    const RUN2 = 'boundary-cas-1';
+    expect(await ledger.setStoredBoundIf(RUN2, 1_000_000_000_000, 'a', null)).toBe(true);
+    expect(await ledger.setStoredBoundIf(RUN2, 1_100_000_000_000, 'b', null)).toBe(false);
+    expect(await ledger.setStoredBoundIf(RUN2, 1_200_000_000_000, 'c', 1_000_000_000_000)).toBe(true);
+    expect(await ledger.setStoredBoundIf(RUN2, 1_300_000_000_000, 'd', 1_000_000_000_000)).toBe(false);
+    expect(await ledger.getStoredBound(RUN2)).toBe(1_200_000_000_000);
+  });
+
   it('finds the ingestion-pause gap and suggests a bound inside it; parity flags the dead hour', async () => {
     const report = (await run())!;
     const d = report.detection;

@@ -524,24 +524,36 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     // pruned, and mapping never tops up while a bound is set — the interval
     // between the two values would silently never migrate.
     if (priorBound !== null && boundMs > priorBound) {
-      const gridSize = Object.values(await ledger.statusCounts(config.ledger.runId).catch(() => ({} as Record<string, number>))).reduce((a, b) => a + b, 0);
+      let gridSize: number;
+      try {
+        gridSize = Object.values(await ledger.statusCounts(config.ledger.runId)).reduce((a, b) => a + b, 0);
+      } catch {
+        return { applied: false, reason: 'could not read the chunk grid to validate raising the bound — retry when MongoDB answers' };
+      }
       if (gridSize > 0) {
         return { applied: false, reason: `raising an applied bound (${new Date(priorBound).toISOString()} → ${new Date(boundMs).toISOString()}) would leave the interval between them unmigrated — the earlier apply already pruned its chunks. Lowering is safe; to extend the range, restart the run's mapping under the new bound with the ledger rebuilt.` };
       }
     }
+    const restores: Array<{ deletedChunks: import('../state/ledger-store.ts').ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }> = [];
     try {
       const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
-      await ledger.setStoredBound(config.ledger.runId, boundMs, source);
+      restores.push(pruned.restore);
+      // Compare-and-set against the prior bound this call validated: two
+      // concurrent applies cannot both win — the loser rolls its prune back.
+      const stored = await ledger.setStoredBoundIf(config.ledger.runId, boundMs, source, priorBound);
+      if (!stored) {
+        for (const r of restores.reverse()) await ledger.restorePrune(r).catch(() => {});
+        return { applied: false, reason: 'another bound application raced this one (the stored bound changed mid-apply) — this call was rolled back; re-read the current bound and retry deliberately' };
+      }
       // Post-store verification: a claim that raced the fence shows up as a
       // non-pending beyond-bound chunk (second prune throws) or a fresh
-      // active claim. Either way EVERYTHING rolls back — the stored bound to
-      // its prior value, and the pruned/clamped chunks to their originals —
-      // so a raced apply leaves no half-applied state and no grid gaps.
+      // active claim. EVERY receipt collected so far rolls back on failure —
+      // no half-applied state and no grid gaps, whichever step failed.
       try {
         const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
+        restores.push(pruned2.restore);
         const claimsAfter = await ledger.activeClaims(config.ledger.runId);
         if (claimsAfter.length > 0) {
-          await ledger.restorePrune(pruned2.restore).catch(() => {});
           throw new Error(`pods claimed chunks during apply (${claimsAfter.map((c) => `${c.pod}×${c.count}`).join(', ')})`);
         }
         const total = { deleted: (pruned.deleted + pruned2.deleted), clamped: (pruned.clamped + pruned2.clamped) };
@@ -550,12 +562,13 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume(true);
         return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
       } catch (raceErr) {
-        await ledger.restorePrune(pruned.restore).catch(() => {});
+        for (const r of restores.reverse()) await ledger.restorePrune(r).catch(() => {});
         if (priorBound !== null) await ledger.setStoredBound(config.ledger.runId, priorBound, `${source} rollback`).catch(() => {});
         else await ledger.clearStoredBound(config.ledger.runId).catch(() => {});
         return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (bound and pruned chunks restored) (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
       }
     } catch (err) {
+      for (const r of restores.reverse()) await ledger.restorePrune(r).catch(() => {});
       return { applied: false, reason: (err as Error).message };
     }
   };

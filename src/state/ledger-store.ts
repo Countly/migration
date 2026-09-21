@@ -620,6 +620,27 @@ export class LedgerStore {
     await this.rc().updateOne({ _id: runId }, { $unset: { cd_upper_bound_ms: '', set_at: '', set_by: '' } });
   }
 
+  /** Compare-and-set: store the bound only if the current stored value still equals what the caller validated against. */
+  async setStoredBoundIf(runId: string, boundMs: number, setBy: string, expectedPrior: number | null): Promise<boolean> {
+    if (expectedPrior === null) {
+      const res = await this.rc().updateOne(
+        { _id: runId, cd_upper_bound_ms: { $exists: false } },
+        { $set: { cd_upper_bound_ms: boundMs, set_at: new Date(), set_by: setBy } },
+        { upsert: true },
+      ).catch((err: unknown) => {
+        // duplicate-key on upsert = the doc appeared with a bound mid-flight
+        if ((err as { code?: number }).code === 11000) return { matchedCount: 0, upsertedCount: 0 };
+        throw err;
+      });
+      return res.matchedCount > 0 || (res as { upsertedCount?: number }).upsertedCount === 1;
+    }
+    const res = await this.rc().updateOne(
+      { _id: runId, cd_upper_bound_ms: expectedPrior },
+      { $set: { cd_upper_bound_ms: boundMs, set_at: new Date(), set_by: setBy } },
+    );
+    return res.matchedCount > 0;
+  }
+
   async setStoredBound(runId: string, boundMs: number, setBy: string): Promise<void> {
     await this.rc().updateOne(
       { _id: runId },
