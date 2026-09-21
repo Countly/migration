@@ -105,10 +105,24 @@ Two tiers:
   source. Catches everything that can happen AFTER reading. Capped at
   PASS WITH NOTES — the note names what it did not re-prove.
 - **Deep** (opt-in — hours on large runs): additionally recounts EVERY
-  window against the source with cd-checksum fingerprints. This is the one
-  check that would catch a self-consistently under-reading reader, so run
-  it once before the source is deleted; while the source still exists,
-  quick is enough for routine confidence.
+  window against the source with cd-checksum fingerprints and sampled
+  identity coverage. It is not distrust of the ledger — chunk reads are
+  already recounted against the source at migration time — it is the only
+  check that derives everything from the two databases alone, with zero
+  reliance on the tool's own records. Run it once, as the gate before the
+  source is deleted; while the source exists, quick is enough.
+
+What each layer can and cannot see:
+
+| Failure class | Caught by |
+|---|---|
+| Under-read at read time (source count ≠ read tally) | the migration itself, per chunk (source-count guard) |
+| Rows lost or duplicated in ClickHouse after attach | quick — ledger-vs-target verify |
+| Skipped documents | DLQ accounting (both tiers; unresolved = FAIL) |
+| Wrong content in migrated rows | quick — random content samples vs source |
+| Docs written into already-done windows later (imports, restores, backdated cds) | deep only — the ledger is blind to them by design |
+| Count-preserving identity swaps (same count, same cd-sum, different docs) | deep only — checksum + sampled id coverage |
+| Routine retention deleting source docs (drift) | deep classifies it exactly (spot-checked, never assumed benign) |
 
 - Dashboard: the **Final check** card → *Run final check* (tick *deep source
   recount* for the pre-teardown gate). On tee/mirror runs without a stored
