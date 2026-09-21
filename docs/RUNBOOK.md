@@ -1,17 +1,32 @@
 # Migration Runbook
 
-Operational procedure for migrating a customer's `drill_events` from MongoDB
-to ClickHouse with this service. The guiding property: **after cutover, no
+Operational procedure for migrating a deployment's `drill_events` data from
+MongoDB to ClickHouse with this service. It assumes no prior knowledge of the
+tool — terms are defined below, and every action is available both in the
+dashboard and as a `curl` command. The guiding property: **after cutover, no
 failure anywhere in this flow can touch live data** — every incident response
 is *restart or resume*, never clean up or restore. Ingestion pauses exactly
 once, for minutes, at cutover — never for the migration.
 
+## Terms used throughout
+
+| Term | Meaning |
+|---|---|
+| **Old cluster / source** | The MongoDB holding the `drill_events*` collections being migrated (sometimes a frozen clone of it — see the clone-source variant). |
+| **New stack / target** | The new Countly architecture whose ClickHouse holds the `drill_events` table this service fills. |
+| **cd** | Each document's server-side creation timestamp. The migration chunks, verifies and audits by cd; migrated rows keep their historical cd, live-ingested rows get post-cutover cds. |
+| **Chunk** | One cd range of one collection — the unit of work, retry and verification. Chunk state lives in `mig_ranges` (the *ledger*) in `MANIFEST_DB`. |
+| **DLQ** | Dead-letter queue (`mig_dlq_docs`): documents that could not or should not be migrated, stored with their full raw source so nothing is silently dropped. |
+| **Tee / mirror** | A reverse-proxy (e.g. nginx) duplicating incoming SDK requests to both stacks; each side re-ingests independently, so the same event gets DIFFERENT `_id`/`cd` on each side. |
+| **Bound** | `LEDGER_CD_UPPER_BOUND`: a cd ceiling — documents at/after it are never migrated. Required exactly when a tee is active (see the scenario table). |
+| **Pod** | One instance of this service. Pods coordinate through chunk leases in MongoDB; any pod's dashboard shows the whole run. |
+
 ## The flow
 
-1. **Prepare** (old cluster still live, no customer impact)
+1. **Prepare** (old cluster still live, no user-facing impact)
    - Deploy the new stack alongside the old.
    - Set Kafka `drill-events` retention to cover the migration window
-     (14 days default). Replication factor is the customer's redundancy
+     (14 days default). Replication factor is a redundancy
      choice — RF≥2 recommended for large instances; if RF=1, record the
      accepted risk (one broker disk loss forfeits the replay guarantee).
    - Bulk pre-copy the stateful set: apps & app keys, `app_users`, event
@@ -25,7 +40,7 @@ once, for minutes, at cutover — never for the migration.
 
 3. **Rehearse** — dry run with `DRY_RUN=1` (≤5% stratified sample against a
    Null-engine clone; full ClickHouse validation, nothing stored). Review
-   `GET /report` (skips, coercions per key, DLQ) with the customer, sign off.
+   `GET /report` (skips, coercions per key, DLQ) with whoever owns sign-off.
 
 4. **Cutover** — stop old ingestion → sync the stateful-set delta since the
    pre-copy (changed users via last-seen; aggregated data must land BEFORE
@@ -41,7 +56,7 @@ once, for minutes, at cutover — never for the migration.
    live ingestion. Watch `/viz`; the invariant monitor spot-checks
    continuously.
 
-6. **Finish** — all chunks done → final `GET /report` → customer sign-off →
+6. **Finish** — all chunks done → Final check green → sign-off →
    revert Kafka retention → decommission old cluster.
 
 ## Incident responses
@@ -141,7 +156,7 @@ old per-event collections only after their chunks are done and signed off),
 and hard memory limits on the new components — an OOM there is a production
 incident.
 
-## Validation before a customer run
+## Validation before a production run
 
 `bench/README.md`: seed → straight run (counts must be exact) → SIGKILL crash
 drill → optionally `bench/seed-failures.ts` for a full failure-scenario drill
@@ -155,7 +170,7 @@ the same requests into both stacks. Everything else is shared machinery.
 | # | Topology | LEDGER_CD_UPPER_BOUND | Ingestion switch | New data arriving in old Mongo | Sign-off |
 |---|---|---|---|---|---|
 | 1 | Two clusters, **no mirroring** (plain switch) | **UNSET** | Before the migration (cutover-first) or after the bulk (bulk-before-cutover + final drain) | **Migrated** — top-up passes chase it until the drain finds nothing | Verify + audits, DLQ = 0 |
-| 2 | Two clusters, **mirror old → new** (old primary) | **SET** = tee flip | At customer sign-off | **Never migrated past the bound** — it is the tee's copy (different _id/cd; duplicates would be undetectable) | Verify + audits for pre-bound; dashboard comparison + sync parity for post-bound |
+| 2 | Two clusters, **mirror old → new** (old primary) | **SET** = tee flip | At sign-off | **Never migrated past the bound** — it is the tee's copy (different _id/cd; duplicates would be undetectable) | Verify + audits for pre-bound; dashboard comparison + sync parity for post-bound |
 | 3 | Two clusters, **mirror new → old** (new primary, old = rollback net) | **SET** = the moment new became primary | Already happened at the flip | Same as 2 — post-flip old-side docs are mirror copies | Same as 2 |
 | 4 | **Single cluster, in-place upgrade** (drill mongo → ClickHouse in background) | **UNSET** | The upgrade itself is the switch; old drill collections freeze | Transition tail drained by top-up; no tee → nothing to duplicate | Verify + audits, DLQ = 0 (live-parallel path; backpressure protects prod CH) |
 
@@ -167,28 +182,29 @@ pod, and keep re-running sync parity during the validation window.
 
 ## Clone-source variant (migrate from a frozen copy)
 
-A deployment may clone the old-arch MongoDB onto the new box and migrate
-from THAT clone while live ingestion moves to the new arch (optionally
-mirroring back to the old stack as the rollback net). Seen in the field;
-properties worth knowing:
+A robust pattern: pause old ingestion, clone the source MongoDB onto the
+new machine, then resume ingestion on the NEW stack (optionally mirroring
+back to the old one as the rollback net) and migrate from the clone. SDK
+offline queues absorb the pause. Properties worth knowing:
 
 - The source is frozen at the clone moment, so no bound is needed and top-up
   finds nothing — the startup guard will still ask (the target ingests live
   while the run starts): **Proceed unbounded is correct** here.
 - Parity/audit tables compare against the CLONE: zeros after the clone
-  moment mean "clone taken here", not a dead mirror. The live old-arch Mongo
-  is invisible to the tool.
-- Duplicates exist ONLY if the clone was taken AFTER ingestion switched
-  (its tail then holds mirrored copies of natively-ingested events). Get the
-  two timestamps — T-swap and T-clone. T-clone ≤ T-swap → no duplicates,
-  skip dedupe. T-clone > T-swap → dedupe with exactly [T-swap, T-clone].
+  moment mean "clone taken here", not a dead mirror. The live old-side
+  MongoDB is invisible to the tool.
+- Cloned INSIDE the ingestion pause (the sequence above) → the clone can
+  never hold a natively-ingested event's mirror copy: **no duplicates, no
+  bound, no dedupe** — the cleanest possible run. Only a clone taken AFTER
+  ingestion resumed has a duplicated tail: dedupe with exactly
+  [ingestion-resume, clone-moment], never earlier.
 - Any doc-count comparison against the live old-arch Mongo will drift by
   everything ingested after T-clone — compare against the clone, or scope
   counts to cd < T-clone.
 
-## Tee-mirror cutover (customer keeps the old architecture until sign-off)
+## Tee-mirror cutover (keep the old architecture until sign-off)
 
-For customers who require approval before switching: the old arch stays
+When approval is required before switching: the old stack stays
 authoritative, nginx TEES the same SDK requests to the new architecture
 (which re-ingests them with its own logic — drill, sessions, aggregations,
 profiles all populate natively), and the bulk migration backfills history
@@ -216,7 +232,7 @@ can deduplicate across that seam — the ONLY protection is the time bound.
    region; post-bound windows show as pending/uncovered, never as defects.
    The post-bound region is the tee's responsibility and is validated by
    comparing dashboards between the two systems, not by this tool.
-5. Customer validates side-by-side as long as needed; both systems ingest
+5. Validate side-by-side as long as needed; both systems ingest
    the same requests the whole time.
 6. On approval: point SDK traffic solely at the new arch, drop the tee,
    decommission old ingestion on its own schedule.
@@ -290,7 +306,7 @@ in either the old or the new system.
 silently dropped), the waive is recorded and counted, and the source audit
 attributes each window's shortfall to its waived docs — sign-off stays
 exact. Only consider a sentinel-uid replay instead if the affected volume
-is large enough to distort historical event totals for a customer AND the
+is large enough to distort historical event totals for an app AND the
 docs carry usable ts/did (check a few samples in the DLQ panel first).
 
 Chunks that were 100% such docs complete as done (structured skips do not
@@ -315,8 +331,8 @@ failed, DLQ, status + pause reason). No network access needed:
 kubectl logs -f deploy/drill-migrator | grep 'progress heartbeat'
 docker logs -f drill-migrator-p1 2>&1 | grep 'progress heartbeat'
 ```
-These lines also flow into the stack's log pipeline (alloy → Loki), so
-Grafana log panels/alerts work with zero extra plumbing.
+Because they go to stdout, they flow into whatever log pipeline collects
+container output (Loki, ELK, CloudWatch, …) with zero extra plumbing.
 
 **3. Actions via curl** (same endpoints the buttons call; POSTs need the
 JSON content type):

@@ -447,7 +447,7 @@ const PAGE = `<!doctype html>
       </p>
       <div id="verify-result" style="margin-top:10px"></div>
       <div id="audit-result" style="margin-top:6px;font-size:12.5px;color:var(--ink-2)"></div>
-      <p>Then: final report (<a href="/report" target="_blank">/report</a>), customer sign-off, revert Kafka retention, decommission the old cluster.</p>
+      <p>Then: final report (<a href="/report" target="_blank">/report</a>), sign-off, revert Kafka retention, decommission the old cluster.</p>
     </div>
   </details>
 </div>
@@ -1192,7 +1192,7 @@ var SCENARIOS = [
       '</ul>' },
   { id: 'tee-new', name: '3 \u00b7 Mirror new \u2192 old',
     bound: true,
-    html: '<p><b>New cluster is already primary; nginx mirrors back to the old stack</b> as the customer\u2019s rollback safety net during validation.</p>' +
+    html: '<p><b>New cluster is already primary; nginx mirrors back to the old stack</b> as the rollback safety net during validation.</p>' +
       '<ul>' +
       '<li>Everything from scenario 2 applies unchanged \u2014 detection, bound, badge, sync parity. ClickHouse is the store that started cold in both directions, so the detector does not care which side is primary.</li>' +
       '<li>The bound = the moment the new cluster became primary. Old-cluster docs after it are the mirror\u2019s copies \u2014 never migrate them.</li>' +
