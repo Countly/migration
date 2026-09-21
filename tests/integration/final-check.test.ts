@@ -166,7 +166,7 @@ describe('final check: the interpreted sign-off', () => {
     expect(out.problems.length).toBeGreaterThan(0);
   });
 
-  it('pending DLQ docs → action note, and their window is NOT flagged (unresolved accounting)', async () => {
+  it('pending DLQ docs → FAIL (undecided = no sign-off); waiving turns it into a note', async () => {
     // one doc the run skipped: present in Mongo, absent in CH, recorded in DLQ
     await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'm_10'` });
     await dlq.add([{
@@ -175,13 +175,15 @@ describe('final check: the interpreted sign-off', () => {
       transform_version: config.transform.version, cd_ms: START + 10 * 12_000,
     }]);
     const out = await check({ cutoverMs: CUTOVER });
-    expect(out.verdict).toBe('PASS_WITH_NOTES');
-    expect(out.problems).toEqual([]);
-    expect(out.notes.join(' ')).toContain('DLQ');
-    // waive → the note softens to the waived form
+    expect(out.verdict).toBe('FAIL');
+    expect(out.problems.join(' ')).toContain('UNRESOLVED');
+    // …but the DLQ'd doc's window is NOT double-flagged (unresolved accounting)
+    expect(out.audit?.mismatchedWindows).toEqual([]);
+    // waive = the decision was made → note, sign-off possible
     await dlq.waive(RUN);
     const out2 = await check({ cutoverMs: CUTOVER });
     expect(out2.verdict).toBe('PASS_WITH_NOTES');
+    expect(out2.problems).toEqual([]);
     expect(out2.notes.join(' ')).toContain('waived');
   });
 
@@ -214,5 +216,13 @@ describe('final check: the interpreted sign-off', () => {
     const out2 = await check({ cutoverMs: CUTOVER });
     expect(out2.problems.join(' ')).toContain('Retry failed chunks');
     await mc.db(DB).collection('mig_ranges').updateOne({ _id: `${RUN}:${COLL}:0` } as never, { $set: { status: 'done' } });
+  });
+
+  it('a WHOLE window missing from the target → FAIL (the audit calls it pending, the check must not)', async () => {
+    // stale ledger says done, but every row of the window is gone from CH
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id LIKE 'm\\_%'` });
+    const out = await check({ cutoverMs: CUTOVER });
+    expect(out.verdict).toBe('FAIL');
+    expect(out.problems.join(' ')).toContain('ZERO rows');
   });
 });

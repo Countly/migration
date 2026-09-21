@@ -1626,7 +1626,7 @@ export class ChunkOrchestrator {
    * so value-level equality there belongs to the differential harness, which
    * pins the transform itself).
    */
-  async contentAudit(samplesPerCollection = 500): Promise<{
+  async contentAudit(samplesPerCollection = 500, upToMs: number | null = null): Promise<{
     sampled: number; matched: number; missing: number; different: number;
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }> {
@@ -1649,7 +1649,14 @@ export class ChunkOrchestrator {
         const [lowDoc] = await coll.find({ cd: { $type: 'date' } }).sort({ cd: 1 }).limit(1).project({ cd: 1 }).toArray();
         const [highDoc] = await coll.find({ cd: { $type: 'date' } }).sort({ cd: -1 }).limit(1).project({ cd: 1 }).toArray();
         if (!lowDoc || !highDoc) continue;
-        const lo = (lowDoc.cd as Date).getTime(), hi = (highDoc.cd as Date).getTime();
+        const lo = (lowDoc.cd as Date).getTime();
+        let hi = (highDoc.cd as Date).getTime();
+        // tee/cutover clamp: post-cutover old-side docs were deliberately
+        // never migrated — sampling them reports phantom "missing" rows
+        if (upToMs !== null) {
+          if (lo >= upToMs) continue;
+          hi = Math.min(hi, upToMs - 1);
+        }
 
         // K random cd probe points, a small run of docs from each — cheap
         // index-served sampling without $sample's whole-collection scan.
@@ -1658,7 +1665,9 @@ export class ChunkOrchestrator {
         const docs: Record<string, unknown>[] = [];
         for (let k = 0; k < probes; k++) {
           const at = new Date(lo + Math.floor(((k + 0.5) / probes) * (hi - lo)));
-          const page = await coll.find({ cd: { $gte: at } }).sort({ cd: 1, _id: 1 }).limit(RUN_LEN).toArray();
+          const cdQ: Record<string, Date> = { $gte: at } as never;
+          if (upToMs !== null) (cdQ as Record<string, Date>).$lt = new Date(upToMs);
+          const page = await coll.find({ cd: cdQ }).sort({ cd: 1, _id: 1 }).limit(RUN_LEN).toArray();
           docs.push(...(page as Record<string, unknown>[]));
         }
 

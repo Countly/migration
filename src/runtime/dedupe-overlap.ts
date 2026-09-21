@@ -7,24 +7,53 @@
  * already ingested natively: every event in the overlap window exists twice
  * in ClickHouse, under two different _ids.
  *
- * The two copies are cleanly separable: the migrated copy carries an _id
- * that exists in the OLD cluster's Mongo; the native row's _id was minted by
- * the new cluster and does not. And because the mirror only ever re-ingests
- * requests the new cluster served first, every migrated row in the overlap
- * window duplicates a native row — deleting all id-matched rows in the
- * window removes exactly the duplicates, never data.
+ * The migrated copy is identifiable — its _id exists in the OLD cluster's
+ * Mongo; a native row's _id was minted by the new cluster and does not.
+ * But an id match alone is NOT proof of duplication: when the tee (or the
+ * new cluster's ingestion) dropped a request, the migrated row is the ONLY
+ * copy of that event, and deleting it would lose data. The identities
+ * differ per side, so no per-event pairing exists — instead every hour
+ * bucket must carry COUNT evidence of native counterparts:
+ *
+ *   native(bucket) = live rows in bucket − id-matched rows in bucket
+ *   safe          ⇔ native ≥ matched − slack
+ *
+ * In a healthy tee every matched row duplicates a native one, so native is
+ * at least matched (plus mirror losses only ever shrink matched). A bucket
+ * where native falls short holds migrated rows WITHOUT counterparts —
+ * those are skipped, reported, and never deleted.
  *
  * Safety: dry-run by default (counts only); execute is refused until a dry
  * run over the SAME window has completed in this process, and the old
- * cluster's Mongo must still be reachable (it is the separator — this is
- * why cleanup must happen BEFORE the old stack is decommissioned).
+ * cluster's Mongo must still be reachable (it is the separator — cleanup
+ * must happen BEFORE the old stack is decommissioned).
  */
 
 import type { Logger } from 'pino';
 import { MongoClient } from 'mongodb';
 import type { Config } from '../config/schema.ts';
+import type { HashResolver } from '../transform/hash-resolver.ts';
+import { chScopeOf } from '../transform/hash-resolver.ts';
 import { StagingManager } from '../target/staging-manager.ts';
 import { discoverCollections } from '../source/discover-collections.ts';
+
+export interface DedupeUnsafeBucket {
+  fromMs: number;
+  toMs: number;
+  matched: number;
+  native: number;
+}
+
+export interface DedupeCollectionRow {
+  collection: string;
+  /** Scoped (a,e,n) live counts — exact safety evidence. Unscoped rows use table-wide counts (weaker). */
+  scoped: boolean;
+  mongoDocsInWindow: number;
+  chMatched: number;
+  deleted: number;
+  /** Buckets whose migrated rows lack count-evidence of native counterparts — never deleted. */
+  unsafe: DedupeUnsafeBucket[];
+}
 
 export interface DedupeOverlapState {
   status: 'not_run' | 'running' | 'completed' | 'failed';
@@ -32,8 +61,8 @@ export interface DedupeOverlapState {
   execute: boolean;
   fromMs: number | null;
   toMs: number | null;
-  collections: Array<{ collection: string; mongoDocsInWindow: number; chMatched: number; deleted: number }>;
-  totals: { mongoDocsInWindow: number; chMatched: number; deleted: number };
+  collections: DedupeCollectionRow[];
+  totals: { mongoDocsInWindow: number; chMatched: number; deleted: number; unsafeMatched: number };
   /** Window of the last COMPLETED dry run — the license to execute. */
   lastDryRun: { fromMs: number; toMs: number; chMatched: number; at: number } | null;
   error: string | null;
@@ -44,19 +73,22 @@ export interface DedupeOverlapState {
 export function newDedupeOverlapState(): DedupeOverlapState {
   return {
     status: 'not_run', phase: '', execute: false, fromMs: null, toMs: null,
-    collections: [], totals: { mongoDocsInWindow: 0, chMatched: 0, deleted: 0 },
+    collections: [], totals: { mongoDocsInWindow: 0, chMatched: 0, deleted: 0, unsafeMatched: 0 },
     lastDryRun: null, error: null, startedAt: null, finishedAt: null,
   };
 }
 
-const ID_BATCH = 200_000;
+const ID_BATCH = 50_000;
+const BUCKET_MS = 3_600_000;
+/** Hard ceiling on one bucket's ids held in memory — pick a smaller window if hit. */
+const MAX_BUCKET_IDS = 3_000_000;
 
 export async function runDedupeOverlap(
-  deps: { config: Config; logger: Logger },
+  deps: { config: Config; logger: Logger; hashResolver: HashResolver },
   state: DedupeOverlapState,
   opts: { fromMs: number; toMs: number; execute: boolean },
 ): Promise<void> {
-  const { config } = deps;
+  const { config, hashResolver } = deps;
   const logger = deps.logger.child({ component: 'DedupeOverlap' });
   const lastDry = state.lastDryRun;
 
@@ -88,33 +120,65 @@ export async function runDedupeOverlap(
     for (const collection of collections) {
       state.phase = `scanning ${collection}`;
       const coll = db.collection(collection);
-      const row = { collection, mongoDocsInWindow: 0, chMatched: 0, deleted: 0 };
+      const defaults = hashResolver.resolveCollectionName(collection, config.source.collectionPrefix);
+      const scope = defaults ? chScopeOf(defaults) : null;
+      const row: DedupeCollectionRow = { collection, scoped: !!scope, mongoDocsInWindow: 0, chMatched: 0, deleted: 0, unsafe: [] };
 
-      // Old-Mongo ids in the window = the mirror's re-ingested docs — the
-      // exact set whose migrated copies are duplicates.
-      let batch: string[] = [];
-      const flush = async (): Promise<void> => {
-        if (batch.length === 0) return;
-        const matched = await staging.countMatchingIdsInWindow(batch, opts.fromMs, opts.toMs);
-        row.chMatched += matched;
-        if (opts.execute && matched > 0) {
-          await staging.deleteMatchingIdsInWindow(batch, opts.fromMs, opts.toMs);
-          row.deleted += matched;
+      const processBucket = async (ids: string[], loMs: number, hiMs: number): Promise<void> => {
+        if (ids.length === 0) return;
+        let matched = 0;
+        for (let i = 0; i < ids.length; i += ID_BATCH) {
+          matched += await staging.countMatchingIdsInWindow(ids.slice(i, i + ID_BATCH), loMs, hiMs);
         }
-        batch = [];
+        row.chMatched += matched;
+        state.totals.chMatched += matched;
+        if (matched === 0) return;
+        // Count evidence of native counterparts: what remains in this bucket
+        // after the matched rows is the native side. Falling short means some
+        // migrated rows are the ONLY copy of their event — never delete those.
+        const liveTotal = await staging.countLiveInCdRange(loMs, hiMs, scope);
+        const native = liveTotal - matched;
+        // slack absorbs ingest-timing straddle at bucket edges, but a bucket
+        // with NO native rows at all is the outage signature outright — the
+        // slack floor must never wave those through
+        const slack = Math.max(10, Math.ceil(matched * 0.02));
+        if (native < matched - slack || native <= 0) {
+          row.unsafe.push({ fromMs: loMs, toMs: hiMs, matched, native });
+          state.totals.unsafeMatched += matched;
+          return;
+        }
+        if (opts.execute) {
+          for (let i = 0; i < ids.length; i += ID_BATCH) {
+            await staging.deleteMatchingIdsInWindow(ids.slice(i, i + ID_BATCH), loMs, hiMs);
+          }
+          row.deleted += matched;
+          state.totals.deleted += matched;
+        }
       };
-      const cursor = coll.find({ cd: { $gte: from, $lt: to } }, { projection: { _id: 1 } }).batchSize(10_000);
+
+      // Old-Mongo ids in the window (cd order → contiguous hour buckets)
+      let bucketStart = -1;
+      let ids: string[] = [];
+      const cursor = coll.find({ cd: { $gte: from, $lt: to } }, { projection: { _id: 1, cd: 1 } })
+        .sort({ cd: 1 }).batchSize(10_000);
       for await (const doc of cursor) {
         row.mongoDocsInWindow++;
-        batch.push(String(doc._id));
-        if (batch.length >= ID_BATCH) await flush();
+        state.totals.mongoDocsInWindow++;
+        const cdMs = (doc.cd as Date).getTime();
+        const bucket = Math.floor(cdMs / BUCKET_MS) * BUCKET_MS;
+        if (bucket !== bucketStart) {
+          await processBucket(ids, Math.max(bucketStart, opts.fromMs), Math.min(bucketStart + BUCKET_MS, opts.toMs));
+          bucketStart = bucket;
+          ids = [];
+        }
+        ids.push(String(doc._id));
+        if (ids.length > MAX_BUCKET_IDS) {
+          throw new Error(`${collection}: more than ${MAX_BUCKET_IDS.toLocaleString('en-US')} docs in one hour bucket — run the dedupe over a smaller {fromMs, toMs} window`);
+        }
       }
-      await flush();
+      await processBucket(ids, Math.max(bucketStart, opts.fromMs), Math.min(bucketStart + BUCKET_MS, opts.toMs));
 
       if (row.mongoDocsInWindow > 0 || row.chMatched > 0) state.collections.push(row);
-      state.totals.mongoDocsInWindow += row.mongoDocsInWindow;
-      state.totals.chMatched += row.chMatched;
-      state.totals.deleted += row.deleted;
     }
 
     state.status = 'completed';
@@ -125,7 +189,11 @@ export async function runDedupeOverlap(
     }
     logger.info(
       { execute: opts.execute, ...state.totals, collections: state.collections.length },
-      opts.execute ? 'Tee-overlap duplicates deleted' : 'Tee-overlap dedupe dry run complete — nothing deleted',
+      opts.execute
+        ? (state.totals.unsafeMatched > 0
+          ? 'Tee-overlap duplicates deleted — SOME BUCKETS SKIPPED: migrated rows there lack native counterparts (see unsafe buckets)'
+          : 'Tee-overlap duplicates deleted')
+        : 'Tee-overlap dedupe dry run complete — nothing deleted',
     );
   } catch (err) {
     state.status = 'failed';

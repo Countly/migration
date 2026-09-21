@@ -86,9 +86,20 @@ A mirrored cutover migrated WITHOUT `LEDGER_CD_UPPER_BOUND` copies the
 mirror's re-ingested docs on top of natively ingested rows: every event in
 the overlap window (tee flip → migration completion) exists twice in
 ClickHouse. The copies are separable — the migrated copy's `_id` exists in
-the old cluster's Mongo; the native one's doesn't — so cleanup is exact and
-loses nothing. **Must run before the old cluster is decommissioned** (old
-Mongo is the separator).
+the old cluster's Mongo; the native one's doesn't. **Must run before the old
+cluster is decommissioned** (old Mongo is the separator).
+
+An id match alone is not proof of duplication: if the tee (or the new
+side's ingestion) dropped a request, the migrated row is the ONLY copy of
+that event. Every hour bucket therefore needs count-evidence of native
+counterparts — `native = live − matched` must roughly cover `matched` —
+before anything in it is deleted. Buckets that fall short are skipped and
+reported (`unsafe` in the result); review those hours (tee outage? wrong
+start time?) instead of forcing them.
+
+There is a dashboard card for this (Overview → **Tee-overlap dedupe**:
+enter the window, *Dry run* first — *Delete duplicates* unlocks only after
+it) as well as the endpoints below.
 
 ```bash
 # 1. DRY RUN (counts only): fromMs = tee flip / IP swap, toMs = migration completion

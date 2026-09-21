@@ -343,6 +343,17 @@ const PAGE = `<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Tee-overlap dedupe <span class="hint">(fix a mirrored run that migrated WITHOUT the cd bound: remove the migrated copies of events the new cluster already ingested natively)</span></h2>
+    <div style="margin-bottom:8px">
+      <input id="dd-from" placeholder="overlap start = tee flip / IP swap (ISO, e.g. 2026-09-18T18:00Z)" style="width:34%;max-width:380px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:12px">
+      <input id="dd-to" placeholder="overlap end = migration completion (ISO)" style="width:28%;max-width:320px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:12px;margin-left:6px">
+      <button class="btn" id="btn-dd-dry" onclick="startDedupe(this, false)">Dry run (count only)</button>
+      <button class="btn" id="btn-dd-exec" onclick="startDedupe(this, true)" disabled title="run the dry run over this window first">Delete duplicates</button>
+    </div>
+    <div id="dedupe-out"><div class="empty">Only for runs that migrated a mirrored setup unbounded. Every hour bucket is checked for count-evidence of native counterparts before anything is deleted — buckets where migrated rows are the ONLY copy are skipped and reported. Old-cluster Mongo must still be up. Start must be AT or AFTER the actual flip: too early deletes real data, too late only leaves a few duplicates.</div></div>
+  </div>
+
+  <div class="card">
     <h2>Dead-letter queue <span class="hint">(unmigratable docs, stored with their full raw source — replay after a fix, or waive)</span></h2>
     <div id="dlq-status" style="margin-bottom:6px"></div>
     <div id="dlq-fixloc" style="font-size:12.5px;color:var(--ink-2);margin-bottom:6px"></div>
@@ -744,6 +755,65 @@ async function allowUnbounded(btn) {
     var out = await res.json();
     toast(out.allowed ? '\u2705 no-mirror declared \u2014 held pods release within seconds' : '\u274c ' + (out.reason || res.status));
   } catch (e) { toast('\u274c ' + e.message); }
+}
+
+function ddWindow() {
+  var f = Date.parse((document.getElementById('dd-from').value || '').trim());
+  var t = Date.parse((document.getElementById('dd-to').value || '').trim());
+  if (isNaN(f) || isNaN(t) || !(f < t)) { toast('Enter both times as ISO (e.g. 2026-09-18T18:00Z), start before end'); return null; }
+  return { fromMs: f, toMs: t };
+}
+async function startDedupe(btn, execute) {
+  var w = ddWindow();
+  if (!w) return;
+  if (execute && !armed.get(btn)) {
+    armed.set(btn, true);
+    btn.dataset.label = btn.textContent;
+    btn.textContent = 'Click again to DELETE the counted duplicates';
+    btn.classList.add('armed');
+    setTimeout(function () { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 8000);
+    return;
+  }
+  if (execute) { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }
+  btn.disabled = true;
+  try {
+    var res = await fetch('/control/dedupe-overlap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ fromMs: w.fromMs, toMs: w.toMs, execute: !!execute }) });
+    var out = await res.json();
+    if (!out.started) toast('Not started: ' + (out.reason || 'unknown'));
+    else toast(execute ? 'Deleting duplicates\u2026' : 'Dry run started \u2014 counting duplicates');
+  } catch (e) { toast('failed: ' + e.message); }
+  btn.disabled = false;
+  pollDedupe();
+}
+var ddTimer = null;
+async function pollDedupe() {
+  try {
+    var dd = await fetch('/api/dedupe-overlap').then(function (r) { return r.json(); });
+    renderDedupe(dd);
+    if (dd.status === 'running') { clearTimeout(ddTimer); ddTimer = setTimeout(pollDedupe, 2000); }
+  } catch (e) { /* engine restarting */ }
+}
+function renderDedupe(dd) {
+  var el = document.getElementById('dedupe-out');
+  if (!el || !dd || dd.status === 'not_run') return;
+  var execBtn = document.getElementById('btn-dd-exec');
+  if (dd.status === 'running') { el.innerHTML = '<div class="empty">Running \u2014 ' + fcEsc(dd.phase) + '</div>'; return; }
+  if (dd.status === 'failed') { el.innerHTML = '<div style="padding:10px 14px;border-radius:8px;background:#FDECEC;color:#B3261E;font-weight:600">Failed: ' + fcEsc(dd.error) + '</div>'; return; }
+  var t = dd.totals || {};
+  var unsafeN = 0;
+  (dd.collections || []).forEach(function (c) { unsafeN += (c.unsafe || []).length; });
+  var html = '<p style="font-weight:600">' + (dd.execute
+    ? '\u2705 Deleted ' + fmt(t.deleted) + ' duplicate row(s).'
+    : 'Dry run: ' + fmt(t.chMatched) + ' migrated row(s) match old-cluster ids in the window (' + fmt(t.mongoDocsInWindow) + ' old-side docs scanned). Nothing deleted.') + '</p>';
+  if (t.unsafeMatched > 0) {
+    html += '<p style="color:#B3261E;font-weight:600">\u26a0 ' + fmt(t.unsafeMatched) + ' matched row(s) in ' + unsafeN + ' hour bucket(s) lack count-evidence of a native counterpart \u2014 there the migrated row may be the ONLY copy. They were ' + (dd.execute ? 'NOT deleted' : 'excluded') + '; review those hours (tee outage / wrong start time?) before touching them.</p>';
+  }
+  if (!dd.execute && dd.lastDryRun) {
+    html += '<p class="hint">Window measured \u2014 the Delete button is now enabled for this exact window.</p>';
+    if (execBtn) { execBtn.disabled = false; execBtn.title = ''; }
+  }
+  html += '<p class="hint">window: ' + new Date(dd.fromMs).toISOString() + ' \u2192 ' + new Date(dd.toMs).toISOString() + ' \u00b7 ' + (dd.collections || []).length + ' collection(s) with matches</p>';
+  el.innerHTML = html;
 }
 
 async function startFinalCheck(btn) {
@@ -1333,7 +1403,7 @@ async function slowTick() {
   } catch { /* engine restarting */ }
 }
 
-tick(); slowTick(); pollFinalCheck();
+tick(); slowTick(); pollFinalCheck(); pollDedupe();
 setInterval(tick, 2000);
 setInterval(slowTick, 5000);
 </script>

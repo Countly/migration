@@ -58,7 +58,7 @@ const fmt = (n: number): string => n.toLocaleString('en-US');
 const iso = (ms: number): string => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
 
 interface ContentAuditRunner {
-  contentAudit(samplesPerCollection?: number): Promise<{
+  contentAudit(samplesPerCollection?: number, upToMs?: number | null): Promise<{
     sampled: number; matched: number; missing: number; different: number;
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }>;
@@ -116,7 +116,10 @@ export async function runFinalCheck(
     if (dlqPending > 0) {
       const top = await dlq.topErrors(runId, 3).catch(() => []);
       const reasons = top.map((t) => `${t.error} ×${fmt(t.n)}`).join(', ');
-      out.notes.push(`${fmt(dlqPending)} skipped docs wait in the DLQ (${reasons}) — they are NOT in ClickHouse. Review a few in the DLQ panel, then Waive them (accepted as unmigratable) or Replay after a fix. Sign-off is complete once the DLQ shows 0 pending.`);
+      // unresolved = undecided: these docs are NOT in ClickHouse and nobody
+      // has accepted that yet — a sign-off cannot authorize teardown over
+      // an open decision, so this is a problem, not a note
+      out.problems.push(`${fmt(dlqPending)} skipped docs wait UNRESOLVED in the DLQ (${reasons}) — they are NOT in ClickHouse. Review a few in the DLQ panel, then Waive them (accepted as unmigratable) or Replay after a fix, and run this check again.`);
     }
     if (dlqWaived > 0) {
       out.notes.push(`${fmt(dlqWaived)} docs were waived earlier — deliberately accepted as not migrated (their raw copies stay in the DLQ collection as the record).`);
@@ -129,6 +132,20 @@ export async function runFinalCheck(
     out.audit = audit;
     await rebuildLedger({ config, logger, ledger, dlq, hashResolver, progress: audit, checkOnly: true, upToMs: cutoverMs });
     const windows = audit.summary.reduce((a, s) => a + s.chunks, 0);
+    // a window with live === 0 is classified 'pending' by the audit, not
+    // mismatched — on a run that claims completion it means the WHOLE
+    // window is missing from the target (e.g. rows removed after attach)
+    const scopedPendingWindows = audit.summary.filter((s) => s.scoped || audit.summary.length === 1)
+      .reduce((a, s) => a + s.pending, 0);
+    const unscopedWindows = audit.summary.length > 1
+      ? audit.summary.filter((s) => !s.scoped).reduce((a, s) => a + s.chunks, 0)
+      : 0;
+    if (scopedPendingWindows > 0) {
+      out.problems.push(`${fmt(scopedPendingWindows)} window(s) hold ZERO rows in ClickHouse for data the source has — whole windows are missing from the target. Rebuild the ledger from data, Retry failed chunks, and run this check again; do NOT decommission the old cluster.`);
+    }
+    if (unscopedWindows > 0) {
+      out.notes.push(`${fmt(unscopedWindows)} window(s) belong to collection(s) without their own (a,e,n) scope and cannot be recounted against the source individually — for those, trust rests on the per-chunk verify at attach time plus the content samples below.`);
+    }
     if (audit.mismatchedWindows.length > 0) {
       out.problems.push(`${fmt(audit.mismatchedWindows.length)} window(s) hold FEWER docs in ClickHouse than the source — data is missing from the target. Click "Retry failed chunks" after a rebuild, or escalate; do NOT decommission the old cluster.`);
     }
@@ -138,7 +155,7 @@ export async function runFinalCheck(
     if (audit.deletionDriftWindows.length > 0) {
       out.notes.push(`${fmt(audit.deletionDriftWindows.length)} window(s) now hold MORE docs in ClickHouse than the source — the source shrank after migration (retention TTL / deletions). Expected on deployments with retention; the migrated copy is the complete one.`);
     }
-    if (audit.mismatchedWindows.length === 0 && audit.checksumMismatchWindows.length === 0) {
+    if (audit.mismatchedWindows.length === 0 && audit.checksumMismatchWindows.length === 0 && scopedPendingWindows === 0) {
       out.passes.push(`Recounted ${fmt(windows)} window(s) directly against the source: every count matches, every checksum fingerprint matches.`);
     }
     if (cutoverMs !== null) {
@@ -148,7 +165,7 @@ export async function runFinalCheck(
 
     // ── 4. Sampled content comparison ──────────────────────────────────────
     out.phase = 'comparing sampled documents field-by-field';
-    const content = await deps.orchestrator.contentAudit(opts.samples);
+    const content = await deps.orchestrator.contentAudit(opts.samples, cutoverMs);
     out.content = { sampled: content.sampled, matched: content.matched, missing: content.missing, different: content.different };
     if (content.missing > 0 || content.different > 0) {
       out.problems.push(`Content sampling found ${fmt(content.missing)} missing and ${fmt(content.different)} differing doc(s) out of ${fmt(content.sampled)} sampled — the migrated content does not match the source; escalate before decommissioning.`);

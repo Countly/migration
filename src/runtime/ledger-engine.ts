@@ -418,7 +418,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         return { started: false, reason: 'execute refused: run a DRY RUN over this exact window first (same call without "execute") and review the matched counts' };
       }
     }
-    void runDedupeOverlap({ config, logger }, dedupeState, { fromMs, toMs, execute });
+    void runDedupeOverlap({ config, logger, hashResolver }, dedupeState, { fromMs, toMs, execute });
     return { started: true, execute, fromMs, toMs };
   });
   app.get('/api/dedupe-overlap', async () => dedupeState);
