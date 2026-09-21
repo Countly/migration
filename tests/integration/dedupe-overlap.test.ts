@@ -190,6 +190,18 @@ describe('tee-overlap dedupe', () => {
     expect(await chCount("_id = 'mirror_10'")).toBe(1);
   });
 
+  it('execute refuses when the run fingerprint no longer matches the licensed dry run', async () => {
+    const state = newDedupeOverlapState();
+    const before = await chCount();
+    const stubLedger = { runFingerprint: async () => '7:7:1700000000000' } as unknown as import('../../src/state/ledger-store.ts').LedgerStore;
+    await runDedupeOverlap({ config, logger, hashResolver, ledger: stubLedger }, state, {
+      fromMs: FLIP, toMs: DONE, execute: true, expectedFingerprint: '5:5:1600000000000',
+    });
+    expect(state.status).toBe('failed');
+    expect(state.error).toContain('changed since the reviewed dry run');
+    expect(await chCount()).toBe(before); // refused before scanning — nothing deleted
+  });
+
   it('duplicateStats counts migration-duplicate groups exactly, beyond the display-sample cap', async () => {
     // 25 duplicated ids below the boundary — more than the 20-group sample
     const rows: Record<string, unknown>[] = [];

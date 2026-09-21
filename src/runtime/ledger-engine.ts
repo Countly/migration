@@ -482,7 +482,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         return { started: false, reason: 'execute refused: the run state changed since the dry run — its counts no longer describe the grid; re-run the dry run with all pods idle' };
       }
     }
-    void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct })
+    void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct, expectedFingerprint: execute ? dedupeState.lastDryRun?.fingerprint ?? null : null })
       .finally(() => { maintenanceOp = null; });
     launchedDd = true;
     return { started: true, execute, fromMs, toMs };
@@ -583,9 +583,10 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     // so rollback's pending-only restore is complete by construction. Best-
     // effort clear at the end; a crashed apply's marker expires in 10 min.
     try {
-      await ledger.setApplyMarker(config.ledger.runId, applyToken);
+      const acquired = await ledger.acquireApplyMarker(config.ledger.runId, applyToken);
+      if (!acquired) return { applied: false, reason: 'another bound apply is in flight — wait for it to settle, then retry' };
     } catch {
-      return { applied: false, reason: 'could not set the apply marker — retry when MongoDB answers' };
+      return { applied: false, reason: 'could not acquire the apply marker — retry when MongoDB answers' };
     }
     try {
       const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, (r) => restores.push(r));

@@ -178,12 +178,20 @@ describe('tee-boundary detection + sync parity', () => {
 
     // apply marker: token-scoped set/clear, stale markers ignored
     const RUN4 = 'boundary-marker-1';
-    await ledger.setApplyMarker(RUN4, 'mtokA');
+    expect(await ledger.acquireApplyMarker(RUN4, 'mtokA')).toBe(true);
     expect((await ledger.getBoundState(RUN4)).applying).toBe(true);
     expect(await ledger.clearApplyMarker(RUN4, 'WRONG')).toBe(false);
     expect((await ledger.getBoundState(RUN4)).applying).toBe(true);
     expect(await ledger.clearApplyMarker(RUN4, 'mtokA')).toBe(true);
     expect((await ledger.getBoundState(RUN4)).applying).toBe(false);
+
+    // marker acquisition is a CAS: one live apply at a time
+    const RUN5 = 'boundary-marker-2';
+    expect(await ledger.acquireApplyMarker(RUN5, 'a1')).toBe(true);
+    expect(await ledger.acquireApplyMarker(RUN5, 'a2')).toBe(false);
+    expect(await ledger.clearApplyMarker(RUN5, 'a1')).toBe(true);
+    expect(await ledger.acquireApplyMarker(RUN5, 'a2')).toBe(true);
+    await ledger.clearApplyMarker(RUN5, 'a2');
 
     // the CURRENT owner's rollback works
     expect(await ledger.rollbackStoredBound(RUN2, t3 as string, 1_000_000_000_000)).toBe(true);

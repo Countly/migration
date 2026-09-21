@@ -608,13 +608,33 @@ export class LedgerStore {
     return { boundMs: doc?.cd_upper_bound_ms ?? null, token: doc?.bound_token ?? null, applying };
   }
 
-  /** Mark an apply as in flight — the post-claim fence releases every claim while this is set, so no pod can hold a provisionally pruned/clamped chunk. */
-  async setApplyMarker(runId: string, token: string): Promise<void> {
-    await this.rc().updateOne(
-      { _id: runId },
-      { $set: { apply_in_progress_token: token, apply_in_progress_at: new Date() } },
-      { upsert: true },
-    );
+  /**
+   * ACQUIRE the apply marker — compare-and-set: succeeds only when no live
+   * marker exists (absent, or stale past the 10-minute crash expiry), so two
+   * applies can never interleave and one's clear can never expose the
+   * other's provisional grid. The fence releases every claim while any live
+   * marker is set.
+   */
+  async acquireApplyMarker(runId: string, token: string): Promise<boolean> {
+    const staleBefore = new Date(Date.now() - 600_000);
+    try {
+      const res = await this.rc().updateOne(
+        {
+          _id: runId,
+          $or: [
+            { apply_in_progress_token: { $exists: false } },
+            { apply_in_progress_at: { $lt: staleBefore } },
+          ],
+        },
+        { $set: { apply_in_progress_token: token, apply_in_progress_at: new Date() } },
+        { upsert: true },
+      );
+      return res.matchedCount > 0 || (res.upsertedCount ?? 0) === 1;
+    } catch (err) {
+      // duplicate key on upsert = a live marker exists on the doc
+      if ((err as { code?: number }).code === 11000) return false;
+      throw err;
+    }
   }
 
   /** Clear only this apply's marker (token-scoped) — a competing apply's marker survives. */

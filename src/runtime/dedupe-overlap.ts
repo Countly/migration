@@ -99,7 +99,7 @@ const MAX_BUCKET_IDS = 3_000_000;
 export async function runDedupeOverlap(
   deps: { config: Config; logger: Logger; hashResolver: HashResolver; ledger?: LedgerStore },
   state: DedupeOverlapState,
-  opts: { fromMs: number; toMs: number; execute: boolean; slackPct?: number },
+  opts: { fromMs: number; toMs: number; execute: boolean; slackPct?: number; expectedFingerprint?: string | null },
 ): Promise<void> {
   const { config, hashResolver } = deps;
   const logger = deps.logger.child({ component: 'DedupeOverlap' });
@@ -125,9 +125,18 @@ export async function runDedupeOverlap(
     await staging.connect();
     const db = mongo.db(config.source.db);
     // fail closed: without the initial fingerprint the staleness guard is
-    // blind, and execute could be licensed against unreviewed counts
+    // blind, and execute could be licensed against unreviewed counts.
+    // Execute ANCHORS to the licensed fingerprint from the reviewed dry run
+    // — the fresh read must EQUAL it, never replace it: adopting a moved
+    // baseline would bless changes the operator never reviewed.
     let fpBefore: string | null = null;
-    if (deps.ledger) fpBefore = await deps.ledger.runFingerprint(config.ledger.runId);
+    if (deps.ledger) {
+      fpBefore = await deps.ledger.runFingerprint(config.ledger.runId);
+      if (opts.execute && opts.expectedFingerprint != null && fpBefore !== opts.expectedFingerprint) {
+        throw new Error('run chunk state changed since the reviewed dry run — execute refused before scanning; re-run the dry run with all pods idle');
+      }
+      if (opts.execute && opts.expectedFingerprint != null) fpBefore = opts.expectedFingerprint;
+    }
 
     state.phase = 'discovering collections';
     const collections = await discoverCollections(db, config.source.collectionPrefix, logger);
