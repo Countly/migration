@@ -62,6 +62,9 @@ export interface RebuildProgress {
   deletionDriftWindows: Array<{ collection: string; lowerCd: string; upperCd: string; source: number; live: number }>;
   /** counts MATCH but the cd-sum fingerprint differs: same number of docs, WRONG docs (identity swap). */
   checksumMismatchWindows: Array<{ collection: string; lowerCd: string; upperCd: string; count: number; sumDeltaMs: number }>;
+  /** When a cutover clamp was applied: the clamp and how many source docs sit beyond it (out of scope). */
+  cutoverMs?: number | null;
+  excludedBeyondCutover?: number;
   error: string | null;
   startedAt: number | null;
   finishedAt: number | null;
@@ -92,10 +95,20 @@ export async function rebuildLedger(opts: {
    * the truth, not the tally.
    */
   checkOnly?: boolean;
+  /**
+   * Tee/mirror cutover clamp: windows are only built for cd < upToMs and
+   * source docs at/after it are counted but excluded. Past the cutover the
+   * old side receives mirrored/live traffic that was never meant to be
+   * migrated, so comparing there reports divergence BY DESIGN — clamping is
+   * what turns the audit into a yes/no answer on tee deployments.
+   */
+  upToMs?: number | null;
 }): Promise<void> {
-  const { config, ledger, dlq, hashResolver, progress, checkOnly = false } = opts;
+  const { config, ledger, dlq, hashResolver, progress, checkOnly = false, upToMs = null } = opts;
   const logger = opts.logger.child({ component: 'LedgerRebuild' });
   const runId = config.ledger.runId;
+  progress.cutoverMs = upToMs;
+  progress.excludedBeyondCutover = 0;
 
   // Own connections — never disturbs the main orchestrator's bindings.
   const mongo = new MongoClient(config.source.uri);
@@ -169,9 +182,16 @@ export async function rebuildLedger(opts: {
       let bounds: Array<{ lowerCd: number; upperCd: number }> = [];
       if (lowDoc && highDoc) {
         const lowerCd = (lowDoc.cd as Date).getTime();
-        const upperCd = (highDoc.cd as Date).getTime();
-        const estimated = await coll.estimatedDocumentCount();
-        bounds = computeChunkBounds(lowerCd, upperCd, estimated, config.ledger.chunkDocsTarget, config.ledger.maxChunkDays);
+        let upperCd = (highDoc.cd as Date).getTime();
+        if (upToMs !== null) {
+          progress.excludedBeyondCutover = (progress.excludedBeyondCutover ?? 0)
+            + await coll.countDocuments({ cd: { $gte: new Date(upToMs) } });
+          upperCd = Math.min(upperCd, upToMs - 1);
+        }
+        if (upperCd >= lowerCd) {
+          const estimated = await coll.estimatedDocumentCount();
+          bounds = computeChunkBounds(lowerCd, upperCd, estimated, config.ledger.chunkDocsTarget, config.ledger.maxChunkDays);
+        }
       }
 
       let idx = 0;

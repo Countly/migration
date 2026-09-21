@@ -21,6 +21,8 @@ import { ClickHousePressure } from '../target/clickhouse-pressure.ts';
 import { ChunkOrchestrator } from './chunk-orchestrator.ts';
 import { wireExitOnComplete } from './exit-on-complete.ts';
 import { rebuildLedger, newRebuildProgress, type RebuildProgress } from './ledger-rebuild.ts';
+import { runFinalCheck, newFinalCheckResult, renderFinalCheckText, type FinalCheckResult } from './final-check.ts';
+import { runDedupeOverlap, newDedupeOverlapState, type DedupeOverlapState } from './dedupe-overlap.ts';
 
 export async function runLedgerEngine(config: Config, logger: Logger): Promise<void> {
   logger.info({ engine: 'ledger', runId: config.ledger.runId }, 'Starting ledger engine (no Redis)');
@@ -294,11 +296,15 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.get('/stats', async () => {
     const stats = orchestrator.getStats();
     const runId = config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId;
-    const [cluster, runTimes] = await Promise.all([
+    const [cluster, clusterSlow, runTimes] = await Promise.all([
       ledger.clusterRate(runId, 120).catch(() => null),
+      // 10-min window: with huge chunks completions land ~once a minute, so
+      // the 2-min window strobes and a freshly opened dashboard tab has no
+      // client-side history yet — this one is real the moment the page loads
+      ledger.clusterRate(runId, 600).catch(() => null),
       ledger.getRunTimes(config.ledger.runId).catch(() => ({ startedAtMs: null, completedAtMs: null })),
     ]);
-    return { ...stats, cluster, runTimes };
+    return { ...stats, cluster, clusterSlow, runTimes };
   });
   app.get('/report', async () => orchestrator.getReport());
   app.post('/control/pause', async () => { orchestrator.pause(); return { status: orchestrator.getStatus() }; });
@@ -374,6 +380,48 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     return { started: true, samples };
   });
   app.get('/api/audit-content', async () => ({ ...auditContentState, progress: orchestrator.contentAuditProgress }));
+
+  // ── Final check: the whole sign-off, interpreted (chunks + DLQ + source
+  // recount + checksums + content samples → one PASS/NOTES/FAIL verdict) ──
+  const finalCheckState: FinalCheckResult = newFinalCheckResult();
+  app.post<{ Body: { cutoverMs?: number; samples?: number } }>('/control/final-check', async (req) => {
+    if (finalCheckState.status === 'running') return { started: false, reason: 'final check already running' };
+    if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — run the final check after completion (or while paused)' };
+    const busyFc = await ledger.activeClaims(config.ledger.runId, config.worker.podId);
+    if (busyFc.length > 0) return { started: false, reason: `other pods are actively migrating (${busyFc.map((row) => row.pod).join(', ')}) — run the final check after completion` };
+    const cutoverMs = typeof req.body?.cutoverMs === 'number' && Number.isFinite(req.body.cutoverMs) ? req.body.cutoverMs : null;
+    const samples = Math.min(10_000, Math.max(50, req.body?.samples ?? 500));
+    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples });
+    return { started: true, cutoverMs, samples };
+  });
+  app.get('/api/final-check', async () => finalCheckState);
+  app.get('/final-check.txt', async (_req, reply) => {
+    reply.type('text/plain; charset=utf-8').send(renderFinalCheckText(finalCheckState, config.ledger.runId));
+  });
+
+  // ── Tee-overlap dedupe: remove duplicates a missing cd bound created ────
+  // Dry-run by default; execute is licensed by a completed dry run over the
+  // SAME window in this process — measure first, delete second.
+  const dedupeState: DedupeOverlapState = newDedupeOverlapState();
+  app.post<{ Body: { fromMs?: number; toMs?: number; execute?: boolean } }>('/control/dedupe-overlap', async (req) => {
+    if (dedupeState.status === 'running') return { started: false, reason: 'dedupe already running' };
+    if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — dedupe only applies after completion' };
+    const fromMs = req.body?.fromMs;
+    const toMs = req.body?.toMs;
+    if (typeof fromMs !== 'number' || typeof toMs !== 'number' || !(fromMs < toMs)) {
+      return { started: false, reason: 'pass the overlap window as {fromMs, toMs} (epoch ms): fromMs = the tee flip / IP swap, toMs = migration completion' };
+    }
+    const execute = req.body?.execute === true;
+    if (execute) {
+      const dry = dedupeState.lastDryRun;
+      if (!dry || dry.fromMs !== fromMs || dry.toMs !== toMs) {
+        return { started: false, reason: 'execute refused: run a DRY RUN over this exact window first (same call without "execute") and review the matched counts' };
+      }
+    }
+    void runDedupeOverlap({ config, logger }, dedupeState, { fromMs, toMs, execute });
+    return { started: true, execute, fromMs, toMs };
+  });
+  app.get('/api/dedupe-overlap', async () => dedupeState);
   app.get('/api/dryrun', async () => dryState);
   app.get('/api/config', async () => ({
     knobs: [

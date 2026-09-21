@@ -55,6 +55,52 @@ once, for minutes, at cutover — never for the migration.
 | A doc CRASHES the process every time (poison pill) | After 3 crash-retries the chunk is auto-split instead of retried; repeated splitting converges on a ≤1-min window quarantined as a tiny failed chunk — everything else migrates (verified: 20k-doc drill localized 1 poison doc to a 2-doc window in 25 restarts) | Inspect the few source docs in the failed chunk's cd window; fix/remove them, then `POST /control/retry-failed` |
 | Live ClickHouse itself must be rebuilt | Live events still sit in the Kafka log; history still sits in frozen Mongo | Recreate table → reset ONLY the ClickHouse-sink connector's offsets to earliest (aggregator groups untouched) → re-run the migrator |
 
+## Final check — the one-click sign-off
+
+Don't interpret audit buckets by hand: the **Final check** runs everything
+(chunk states, DLQ, full source recount, cd-checksum fingerprints, sampled
+content comparison), applies the tee/cutover rules itself, and answers the
+only question that matters — *is it safe to decommission the old cluster?* —
+as **PASS / PASS WITH NOTES / FAIL** in plain sentences with the action named
+on every red line.
+
+- Dashboard: the **Final check** card → *Run final check*. On tee/mirror runs
+  without a stored bound, type the cutover time into the field first.
+- SSH-only:
+
+```bash
+# start (add {"cutoverMs": <epoch ms of the tee flip>} for mirror runs without a stored bound)
+curl -s -X POST localhost:PORT/control/final-check -H 'content-type: application/json' -d '{}'
+# read the verdict (re-run until it says PASS/FAIL; shows progress while running)
+curl -s localhost:PORT/final-check.txt
+```
+
+A stored/env cd bound is picked up automatically as the cutover. Post-cutover
+source windows are excluded and explained in a note — divergence there is the
+mirror still feeding the old side, not data loss. Run it while the old
+cluster is still up: the source is the reference.
+
+## Tee-overlap dedupe — fixing a missing bound after the fact
+
+A mirrored cutover migrated WITHOUT `LEDGER_CD_UPPER_BOUND` copies the
+mirror's re-ingested docs on top of natively ingested rows: every event in
+the overlap window (tee flip → migration completion) exists twice in
+ClickHouse. The copies are separable — the migrated copy's `_id` exists in
+the old cluster's Mongo; the native one's doesn't — so cleanup is exact and
+loses nothing. **Must run before the old cluster is decommissioned** (old
+Mongo is the separator).
+
+```bash
+# 1. DRY RUN (counts only): fromMs = tee flip / IP swap, toMs = migration completion
+curl -s -X POST localhost:PORT/control/dedupe-overlap -H 'content-type: application/json' \
+  -d '{"fromMs": 1789700000000, "toMs": 1789794970435}'
+curl -s localhost:PORT/api/dedupe-overlap        # totals.chMatched = the duplicates
+# 2. EXECUTE (refused unless the dry run over the SAME window completed first)
+curl -s -X POST localhost:PORT/control/dedupe-overlap -H 'content-type: application/json' \
+  -d '{"fromMs": 1789700000000, "toMs": 1789794970435, "execute": true}'
+# 3. re-run the Final check with the same cutover to confirm
+```
+
 ## Verification cheat sheet
 
 ```sql

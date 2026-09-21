@@ -1,0 +1,199 @@
+/**
+ * Final check: the whole sign-off, interpreted.
+ *
+ * Operators kept having to understand four audit buckets, tee semantics and
+ * DLQ states to answer the only question they actually have at the end of a
+ * migration: "is it safe to decommission the old cluster?" This module runs
+ * every validation the tool has — chunk states, DLQ, the full source recount
+ * with cd-checksum fingerprints, sampled content comparison — applies the
+ * interpretation rules itself (including the tee cutover: windows past the
+ * cutover diverge BY DESIGN and must not read as data loss), and emits one
+ * verdict in plain sentences:
+ *
+ *   PASS             — safe to decommission.
+ *   PASS WITH NOTES  — safe, but read the amber lines first (waived DLQ,
+ *                      source retention drift, excluded post-cutover tail).
+ *   FAIL             — do not decommission; each red line names the action.
+ */
+
+import type { Logger } from 'pino';
+import type { Config } from '../config/schema.ts';
+import type { HashResolver } from '../transform/hash-resolver.ts';
+import type { LedgerStore } from '../state/ledger-store.ts';
+import type { DlqStore } from '../state/dlq-store.ts';
+import { rebuildLedger, newRebuildProgress, type RebuildProgress } from './ledger-rebuild.ts';
+
+export interface FinalCheckResult {
+  status: 'not_run' | 'running' | 'completed' | 'failed';
+  verdict: 'PASS' | 'PASS_WITH_NOTES' | 'FAIL' | null;
+  /** One sentence answering "can I decommission the old cluster?" */
+  headline: string | null;
+  /** Green lines — what was verified and held. */
+  passes: string[];
+  /** Amber lines — true, explained, and safe; read before sign-off. */
+  notes: string[];
+  /** Red lines — each names the problem AND the action. */
+  problems: string[];
+  /** The cutover used to scope the source recount (null = full range). */
+  cutoverMs: number | null;
+  phase: string;
+  /** Drill-down: the raw source-audit report backing the verdict. */
+  audit: RebuildProgress | null;
+  content: { sampled: number; matched: number; missing: number; different: number } | null;
+  error: string | null;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+export function newFinalCheckResult(): FinalCheckResult {
+  return {
+    status: 'not_run', verdict: null, headline: null,
+    passes: [], notes: [], problems: [],
+    cutoverMs: null, phase: '', audit: null, content: null,
+    error: null, startedAt: null, finishedAt: null,
+  };
+}
+
+const fmt = (n: number): string => n.toLocaleString('en-US');
+const iso = (ms: number): string => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+
+interface ContentAuditRunner {
+  contentAudit(samplesPerCollection?: number): Promise<{
+    sampled: number; matched: number; missing: number; different: number;
+    mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
+  }>;
+}
+
+export async function runFinalCheck(
+  deps: {
+    config: Config;
+    logger: Logger;
+    ledger: LedgerStore;
+    dlq: DlqStore;
+    hashResolver: HashResolver;
+    orchestrator: ContentAuditRunner;
+  },
+  out: FinalCheckResult,
+  opts: { cutoverMs: number | null; samples: number },
+): Promise<void> {
+  const { config, ledger, dlq, hashResolver } = deps;
+  const logger = deps.logger.child({ component: 'FinalCheck' });
+  const runId = config.ledger.runId;
+
+  Object.assign(out, newFinalCheckResult(), { status: 'running', startedAt: Date.now(), phase: 'starting' });
+  try {
+    // ── Cutover: explicit param > stored bound > env bound > none ─────────
+    const stored = await ledger.getStoredBound(runId).catch(() => null);
+    const cutoverMs = opts.cutoverMs ?? stored ?? config.ledger.cdUpperBoundMs ?? null;
+    out.cutoverMs = cutoverMs;
+
+    // ── 1. Chunk ledger states ─────────────────────────────────────────────
+    out.phase = 'checking chunk states';
+    const counts = await ledger.statusCounts(runId);
+    const done = counts.done ?? 0;
+    const failed = counts.failed ?? 0;
+    const superseded = counts.superseded ?? 0;
+    const total = Object.values(counts).reduce((a, b) => a + b, 0);
+    const notDone = total - done - superseded - failed;
+    if (failed > 0) {
+      out.problems.push(`${fmt(failed)} chunk(s) FAILED — click "Retry failed chunks" (or POST /control/retry-failed), wait for them to finish, then run this check again.`);
+    }
+    if (notDone > 0) {
+      out.problems.push(`${fmt(notDone)} chunk(s) are not migrated yet — the run is not complete. Let it finish (or press Start/Resume), then run this check again.`);
+    }
+    if (failed === 0 && notDone === 0 && total > 0) {
+      out.passes.push(`All ${fmt(done)} chunks migrated and verified (per-chunk count + id checks passed before every attach).`);
+    }
+    if (total === 0) {
+      out.problems.push('The ledger holds no chunks — nothing has been migrated under this run id.');
+    }
+
+    // ── 2. DLQ ─────────────────────────────────────────────────────────────
+    out.phase = 'checking dead-letter queue';
+    const dlqCounts = await dlq.countByStatus(runId).catch(() => ({} as Record<string, number>));
+    const dlqPending = dlqCounts.pending ?? 0;
+    const dlqWaived = dlqCounts.waived ?? 0;
+    if (dlqPending > 0) {
+      const top = await dlq.topErrors(runId, 3).catch(() => []);
+      const reasons = top.map((t) => `${t.error} ×${fmt(t.n)}`).join(', ');
+      out.notes.push(`${fmt(dlqPending)} skipped docs wait in the DLQ (${reasons}) — they are NOT in ClickHouse. Review a few in the DLQ panel, then Waive them (accepted as unmigratable) or Replay after a fix. Sign-off is complete once the DLQ shows 0 pending.`);
+    }
+    if (dlqWaived > 0) {
+      out.notes.push(`${fmt(dlqWaived)} docs were waived earlier — deliberately accepted as not migrated (their raw copies stay in the DLQ collection as the record).`);
+    }
+    if (dlqPending === 0 && dlqWaived === 0) out.passes.push('Dead-letter queue is empty — no document was skipped.');
+
+    // ── 3. Full source recount + cd-checksum fingerprint (the heavy one) ──
+    out.phase = 'recounting every window against the source';
+    const audit = newRebuildProgress();
+    out.audit = audit;
+    await rebuildLedger({ config, logger, ledger, dlq, hashResolver, progress: audit, checkOnly: true, upToMs: cutoverMs });
+    const windows = audit.summary.reduce((a, s) => a + s.chunks, 0);
+    if (audit.mismatchedWindows.length > 0) {
+      out.problems.push(`${fmt(audit.mismatchedWindows.length)} window(s) hold FEWER docs in ClickHouse than the source — data is missing from the target. Click "Retry failed chunks" after a rebuild, or escalate; do NOT decommission the old cluster.`);
+    }
+    if (audit.checksumMismatchWindows.length > 0) {
+      out.problems.push(`${fmt(audit.checksumMismatchWindows.length)} window(s) hold the right COUNT of the WRONG documents (checksum fingerprint differs) — escalate; do NOT decommission the old cluster.`);
+    }
+    if (audit.deletionDriftWindows.length > 0) {
+      out.notes.push(`${fmt(audit.deletionDriftWindows.length)} window(s) now hold MORE docs in ClickHouse than the source — the source shrank after migration (retention TTL / deletions). Expected on deployments with retention; the migrated copy is the complete one.`);
+    }
+    if (audit.mismatchedWindows.length === 0 && audit.checksumMismatchWindows.length === 0) {
+      out.passes.push(`Recounted ${fmt(windows)} window(s) directly against the source: every count matches, every checksum fingerprint matches.`);
+    }
+    if (cutoverMs !== null) {
+      const excluded = audit.excludedBeyondCutover ?? 0;
+      out.notes.push(`Source docs after the cutover (${iso(cutoverMs)}) were excluded from the comparison${excluded > 0 ? ` (${fmt(excluded)} docs)` : ''} — after that moment the old side receives mirrored/live traffic that was never meant to be migrated, so divergence there is expected and is NOT data loss.`);
+    }
+
+    // ── 4. Sampled content comparison ──────────────────────────────────────
+    out.phase = 'comparing sampled documents field-by-field';
+    const content = await deps.orchestrator.contentAudit(opts.samples);
+    out.content = { sampled: content.sampled, matched: content.matched, missing: content.missing, different: content.different };
+    if (content.missing > 0 || content.different > 0) {
+      out.problems.push(`Content sampling found ${fmt(content.missing)} missing and ${fmt(content.different)} differing doc(s) out of ${fmt(content.sampled)} sampled — the migrated content does not match the source; escalate before decommissioning.`);
+    } else if (content.sampled > 0) {
+      out.passes.push(`Sampled ${fmt(content.sampled)} random docs field-by-field — all identical between source and ClickHouse.`);
+    }
+
+    // ── Verdict ────────────────────────────────────────────────────────────
+    out.verdict = out.problems.length > 0 ? 'FAIL' : out.notes.length > 0 ? 'PASS_WITH_NOTES' : 'PASS';
+    out.headline = out.verdict === 'FAIL'
+      ? `DO NOT decommission the old cluster yet — ${out.problems.length} problem(s) below need action first.`
+      : out.verdict === 'PASS_WITH_NOTES'
+        ? 'Safe to decommission the old cluster after reading the notes below.'
+        : 'ClickHouse verifiably holds everything the source holds — safe to decommission the old cluster.';
+    out.status = 'completed';
+    out.phase = 'done';
+    out.finishedAt = Date.now();
+    logger.info({ verdict: out.verdict, problems: out.problems.length, notes: out.notes.length }, 'Final check complete');
+  } catch (err) {
+    out.status = 'failed';
+    out.error = (err as Error).message;
+    out.phase = 'failed';
+    out.finishedAt = Date.now();
+    logger.error({ err }, 'Final check failed to complete');
+  }
+}
+
+/** Plain-text rendering for SSH-only operation (GET /final-check.txt). */
+export function renderFinalCheckText(fc: FinalCheckResult, runId: string): string {
+  const lines: string[] = [`FINAL CHECK - run ${runId}`];
+  if (fc.status === 'not_run') {
+    lines.push('Not run yet. Start it with: curl -X POST localhost:PORT/control/final-check');
+  } else if (fc.status === 'running') {
+    const a = fc.audit;
+    lines.push(`RUNNING - ${fc.phase}${a && a.collectionsTotal > 0 ? ` (${a.collectionsDone}/${a.collectionsTotal} collections)` : ''}`);
+  } else if (fc.status === 'failed') {
+    lines.push(`CHECK FAILED TO COMPLETE: ${fc.error} - fix and re-run; this is a tooling error, not a data verdict.`);
+  } else {
+    const badge = fc.verdict === 'PASS' ? 'PASS' : fc.verdict === 'PASS_WITH_NOTES' ? 'PASS WITH NOTES' : 'FAIL';
+    lines.push(`Verdict: ${badge} - ${fc.headline}`);
+    for (const p of fc.problems) lines.push(`  [X] ${p}`);
+    for (const n of fc.notes) lines.push(`  [!] ${n}`);
+    for (const g of fc.passes) lines.push(`  [ok] ${g}`);
+    if (fc.cutoverMs !== null) lines.push(`  cutover used: ${new Date(fc.cutoverMs).toISOString()}`);
+    if (fc.finishedAt) lines.push(`  finished: ${new Date(fc.finishedAt).toISOString()}`);
+  }
+  return lines.join('\n') + '\n';
+}

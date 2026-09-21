@@ -572,4 +572,40 @@ export class StagingManager {
     }
     return out;
   }
+
+  /** Live rows in [fromMs, toMs) whose _id is one of the given ids. */
+  async countMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number): Promise<number> {
+    let total = 0;
+    for (let i = 0; i < ids.length; i += 50_000) {
+      const page = ids.slice(i, i + 50_000);
+      const res = await this.ch().query({
+        query: `SELECT count() AS n FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
+                  AND _id IN {ids:Array(String)}`,
+        query_params: { ids: page, lo: fromMs, hi: toMs },
+        format: 'JSONEachRow',
+      });
+      const rows = await res.json<{ n: string }>();
+      total += Number(rows[0]?.n ?? 0);
+    }
+    return total;
+  }
+
+  /**
+   * Lightweight-delete live rows in [fromMs, toMs) whose _id is one of the
+   * given ids. Tee-overlap cleanup: rows the migration copied from the old
+   * cluster that the mirror had already re-ingested natively. The cd window
+   * keeps each DELETE partition-prunable on multi-billion-row tables.
+   */
+  async deleteMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number): Promise<void> {
+    for (let i = 0; i < ids.length; i += 50_000) {
+      const page = ids.slice(i, i + 50_000);
+      await this.ch().command({
+        query: `DELETE FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
+                  AND _id IN {ids:Array(String)}`,
+        query_params: { ids: page, lo: fromMs, hi: toMs },
+      });
+    }
+  }
 }

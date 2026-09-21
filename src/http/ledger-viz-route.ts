@@ -301,6 +301,15 @@ const PAGE = `<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Final check <span class="hint">— one click answers: is it safe to decommission the old source? (chunks + DLQ + full source recount + checksums + content samples — interpreted for you)</span></h2>
+    <div style="margin-bottom:8px">
+      <button class="btn primary" id="btn-finalcheck" onclick="startFinalCheck(this)">Run final check</button>
+      <input id="fc-cutover" placeholder="cutover time (optional, e.g. 2026-09-18T18:00Z) — only for tee/mirror runs without a stored bound" style="width:52%;max-width:560px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:12px;margin-left:8px">
+    </div>
+    <div id="finalcheck-out"><div class="empty">Not run. Run it after the migration completes — it recounts every window against the source, so give it time on big runs; progress shows here. SSH-only: <code>curl -X POST :PORT/control/final-check</code> then <code>curl :PORT/final-check.txt</code></div></div>
+  </div>
+
+  <div class="card">
     <h2>Collections</h2>
     <div id="collections"><div class="empty">Waiting for first chunk…</div></div>
   </div>
@@ -513,7 +522,7 @@ async function control(action, okMsg, btn, needsConfirm) {
     btn.dataset.label = btn.textContent;
     btn.textContent = 'Click again to confirm';
     btn.classList.add('armed');
-    setTimeout(() => { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 4000);
+    setTimeout(() => { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 8000);
     return;
   }
   if (btn) { armed.delete(btn); if (btn.dataset.label) { btn.textContent = btn.dataset.label; btn.classList.remove('armed'); } btn.disabled = true; }
@@ -534,7 +543,7 @@ async function startRebuild(btn, force) {
     btn.dataset.label = btn.textContent;
     btn.textContent = 'Click again to confirm';
     btn.classList.add('armed');
-    setTimeout(() => { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 4000);
+    setTimeout(() => { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 8000);
     return;
   }
   armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); btn.disabled = true;
@@ -720,6 +729,59 @@ function updatePhaseBadges() {
 }
 updatePhaseBadges();
 
+async function startFinalCheck(btn) {
+  var body = {};
+  var cutRaw = (document.getElementById('fc-cutover').value || '').trim();
+  if (cutRaw) {
+    var ms = Date.parse(cutRaw);
+    if (isNaN(ms)) { toast('Could not parse the cutover time — use ISO like 2026-09-18T18:00Z'); return; }
+    body.cutoverMs = ms;
+  }
+  btn.disabled = true;
+  try {
+    var res = await fetch('/control/final-check', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    var out = await res.json();
+    if (!out.started) toast('Not started: ' + (out.reason || 'unknown'));
+    else toast('Final check started — the verdict will appear below');
+  } catch (e) { toast('failed: ' + e.message); }
+  btn.disabled = false;
+  pollFinalCheck();
+}
+var fcTimer = null;
+async function pollFinalCheck() {
+  try {
+    var fc = await fetch('/api/final-check').then(function (r) { return r.json(); });
+    renderFinalCheck(fc);
+    if (fc.status === 'running') { clearTimeout(fcTimer); fcTimer = setTimeout(pollFinalCheck, 2000); }
+  } catch (e) { /* engine restarting — next poll or reload recovers */ }
+}
+function fcEsc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+function renderFinalCheck(fc) {
+  var el = document.getElementById('finalcheck-out');
+  if (!el || !fc || fc.status === 'not_run') return;
+  if (fc.status === 'running') {
+    var a = fc.audit || {};
+    el.innerHTML = '<div class="empty">Running — ' + fcEsc(fc.phase) + (a.collectionsTotal ? ' (' + a.collectionsDone + '/' + a.collectionsTotal + ' collections)' : '') + '</div>';
+    return;
+  }
+  if (fc.status === 'failed') {
+    el.innerHTML = '<div style="padding:10px 14px;border-radius:8px;background:#FDECEC;color:#B3261E;font-weight:600">The check itself failed to complete: ' + fcEsc(fc.error) + ' — a tooling error, not a data verdict. Re-run it.</div>';
+    return;
+  }
+  var pal = fc.verdict === 'PASS' ? ['#E4F6EC', '#157A45'] : fc.verdict === 'PASS_WITH_NOTES' ? ['#FDEEDD', '#A05A16'] : ['#FDECEC', '#B3261E'];
+  var badge = fc.verdict === 'PASS' ? 'PASS' : fc.verdict === 'PASS_WITH_NOTES' ? 'PASS WITH NOTES' : 'FAIL';
+  var html = '<div style="padding:12px 16px;border-radius:10px;background:' + pal[0] + ';color:' + pal[1] + '">'
+    + '<div style="font-size:16px;font-weight:800;margin-bottom:4px">' + badge + '</div>'
+    + '<div style="font-weight:600">' + fcEsc(fc.headline) + '</div></div>'
+    + '<ul style="margin:10px 0 0;padding-left:20px;line-height:1.55">';
+  (fc.problems || []).forEach(function (p) { html += '<li style="color:#B3261E;font-weight:600">' + fcEsc(p) + '</li>'; });
+  (fc.notes || []).forEach(function (n) { html += '<li style="color:#A05A16">' + fcEsc(n) + '</li>'; });
+  (fc.passes || []).forEach(function (g) { html += '<li style="color:#157A45">' + fcEsc(g) + '</li>'; });
+  html += '</ul>';
+  if (fc.cutoverMs) html += '<p class="hint" style="margin-top:6px">cutover applied: source compared only for cd &lt; ' + new Date(fc.cutoverMs).toISOString() + '</p>';
+  el.innerHTML = html;
+}
+
 async function tick() {
   try {
     const [stats, chunkResp] = await Promise.all([
@@ -760,15 +822,27 @@ async function tick() {
       if (changes >= 3 && (last.t - windowStart.t) >= 10000) break;
     }
     var rspan = (last.t - windowStart.t) / 1000;
-    var liveRate = rspan >= 10 ? Math.max(0, (last.d - windowStart.d) / rspan) : null;
+    // the client window is only trustworthy once it has WITNESSED chunk
+    // completions — a freshly opened tab on a huge-chunk run showed "0"
+    // (field report); until then the server's 10-min ledger window is truth
+    var clientReady = changes >= 3 && rspan >= 10;
+    var slowRate = stats.clusterSlow && stats.clusterSlow.docsPerSecond > 0 ? stats.clusterSlow.docsPerSecond : null;
+    var liveRate = clientReady ? Math.max(0, (last.d - windowStart.d) / rspan)
+                 : slowRate !== null ? slowRate
+                 : null;
     var multiPod = stats.cluster && stats.cluster.pods > 1;
     var effRate = liveRate !== null ? liveRate
                 : multiPod && stats.status === 'running' ? stats.cluster.docsPerSecond
                 : stats.docsPerSecond;
     if (stats.status === 'completed') {
-      // a pod restarted after completion migrated nothing itself — its
-      // local average is 0 and would read as an anomaly
-      dpsEl.textContent = stats.docsPerSecond >= 1 ? fmt(stats.docsPerSecond) + ' avg' : '\u2013';
+      // whole-RUN average from ledger docs + run timeline; the pod's own
+      // lifetime counter is only its share of a multi-pod run (field: a
+      // 4-pod run showed 5,060 instead of the run's ~20,300), and a pod
+      // restarted after completion migrated nothing at all
+      var rt = stats.runTimes || {};
+      var runSec = rt.startedAtMs && rt.completedAtMs ? (rt.completedAtMs - rt.startedAtMs) / 1000 : 0;
+      var runAvg = runSec > 0 && sum.docsDone > 0 ? sum.docsDone / runSec : stats.docsPerSecond;
+      dpsEl.textContent = runAvg >= 1 ? fmt(Math.round(runAvg)) + ' avg' : '\u2013';
     } else if (liveRate !== null) {
       dpsEl.textContent = fmt(Math.round(liveRate)) + (multiPod ? ' \u00b7 ' + stats.cluster.pods + ' pods' : '');
     } else if (stats.status === 'running') {
@@ -1048,7 +1122,7 @@ async function applyBound(btn, ms) {
     btn.dataset.label = btn.textContent;
     btn.textContent = 'Click again to confirm';
     btn.classList.add('armed');
-    setTimeout(function() { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 4000);
+    setTimeout(function() { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 8000);
     return;
   }
   armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); btn.disabled = true;
@@ -1223,7 +1297,7 @@ async function slowTick() {
   } catch { /* engine restarting */ }
 }
 
-tick(); slowTick();
+tick(); slowTick(); pollFinalCheck();
 setInterval(tick, 2000);
 setInterval(slowTick, 5000);
 </script>
