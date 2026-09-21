@@ -227,6 +227,16 @@ describe('tee-boundary detection + sync parity', () => {
     expect(await ledger.recoverPruneJournal(RJ, null)).toEqual({ recovered: 1, skippedLiveApply: 0 });
     expect(await ranges.countDocuments({ _id: 'rj:live' } as never)).toBe(1);
 
+    // huge receipts PAGE across journal documents (16MiB BSON limit) and
+    // recover in full
+    const RJ3 = 'prune-journal-3';
+    const big = Array.from({ length: 5_001 }, (_, i) => mk(RJ3, `rj3:${i}`, i * 10, i * 10 + 9));
+    await ledger.journalPruneReceipt(RJ3, 'tokBig', { deletedChunks: big as never[], clampedChunks: [] });
+    expect(await ledger.countPruneJournal(RJ3)).toBe(2);
+    expect(await ledger.recoverPruneJournal(RJ3, null)).toEqual({ recovered: 2, skippedLiveApply: 0 });
+    expect(await ranges.countDocuments({ run_id: RJ3 } as never)).toBe(5_001);
+    expect(await ledger.countPruneJournal(RJ3)).toBe(0);
+
     // a COMMITTED apply's leftover entry restores NOTHING — its own bound filters every chunk out
     const RJ2 = 'prune-journal-2';
     expect(await ledger.setStoredBoundIf(RJ2, 120, 'test', null)).toBeTruthy();

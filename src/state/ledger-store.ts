@@ -884,9 +884,30 @@ export class LedgerStore {
     return this.client.db(this.dbName).collection('mig_prune_journal');
   }
 
-  /** Persist a prune receipt durably — called by the sink BEFORE the prune's destructive writes. */
+  /**
+   * Persist a prune receipt durably — called by the sink BEFORE the prune's
+   * destructive writes. PAGED: a large grid's receipt must never approach
+   * the 16MiB BSON document limit (which would fail every apply attempt
+   * before pruning), so deleted chunks split across journal documents.
+   * Clamped straddlers (at most one per collection) ride in the first page.
+   */
   async journalPruneReceipt(runId: string, token: string, receipt: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }): Promise<void> {
-    await this.pj().insertOne({ run_id: runId, token, created_at: new Date(), receipt });
+    const PAGE = 5_000;
+    const { deletedChunks, clampedChunks } = receipt;
+    if (deletedChunks.length === 0 && clampedChunks.length === 0) return;
+    const docs: Array<{ run_id: string; token: string; created_at: Date; receipt: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> } }> = [];
+    for (let i = 0; i < Math.max(1, Math.ceil(deletedChunks.length / PAGE)); i++) {
+      docs.push({
+        run_id: runId, token, created_at: new Date(),
+        receipt: { deletedChunks: deletedChunks.slice(i * PAGE, (i + 1) * PAGE), clampedChunks: i === 0 ? clampedChunks : [] },
+      });
+    }
+    await this.pj().insertMany(docs);
+  }
+
+  /** Number of prune-journal entries for a run — non-zero means unsettled destructive work. */
+  async countPruneJournal(runId: string): Promise<number> {
+    return this.pj().countDocuments({ run_id: runId });
   }
 
   /** Remove an apply's journal entries once its outcome is settled (committed or fully rolled back). */

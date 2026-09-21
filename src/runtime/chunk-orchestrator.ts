@@ -225,8 +225,38 @@ export class ChunkOrchestrator {
    * the freshly claimed chunk lies at/beyond it, the chunk is superseded
    * (never read); a straddler is clamped in place before processing.
    */
+  /**
+   * True while orphaned prune-journal receipts exist, after attempting to
+   * recover them. Non-empty means a bound apply died mid-flight and the grid
+   * may be MUTILATED: a clamped straddler processed now would permanently
+   * lose its truncated range (the restore only touches pending chunks).
+   * Entries owned by a live apply marker stay (that apply settles them).
+   */
+  private async pruneJournalHolds(): Promise<boolean> {
+    if (await this.d.ledger.countPruneJournal(this.runId) === 0) return false;
+    const rec = await this.d.ledger.recoverPruneJournal(this.runId, this.envBoundMs);
+    if (rec.recovered > 0) this.logger.warn(rec, 'Restored prune-journal receipts from a bound apply that died mid-flight');
+    return (await this.d.ledger.countPruneJournal(this.runId)) > 0;
+  }
+
   private async supersedeIfBeyondBound(chunk: ChunkDoc): Promise<boolean> {
     if (chunk.lower_cd < 0) return false; // sentinel sweep — no cd semantics
+    // Orphaned prune journal: no chunk is processed until it drains — this
+    // is also the RETRY site for receipts skipped at startup because their
+    // apply marker was still live (nothing else re-runs recovery after the
+    // marker expires).
+    try {
+      if (await this.pruneJournalHolds()) {
+        await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+        this.logger.info({ chunk: chunk._id }, 'Orphaned prune journal present — claim released until it drains');
+        await sleep(1_000);
+        return true;
+      }
+    } catch {
+      // unreadable journal = unknown grid provenance — do not process
+      await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+      return true;
+    }
     let bound: number | null = null;
     let boundToken: string | null = null;
     try {
@@ -517,7 +547,16 @@ export class ChunkOrchestrator {
       if (chunk && await this.supersedeIfBeyondBound(chunk as ChunkDoc)) continue;
       if (!chunk) {
         const remaining = await this.d.ledger.countRegularNonTerminal(this.runId);
-        if (remaining === 0) break;
+        if (remaining === 0) {
+          // an orphaned prune journal may be about to bring deleted chunks
+          // back — the run must not advance past regulars until it drains
+          // (a fully pruned grid has no claims, so the post-claim fence
+          // never fires; this gate is the recovery site for that shape)
+          let holds = true;
+          try { holds = await this.pruneJournalHolds(); } catch { /* unreadable = hold */ }
+          if (holds) { await sleep(5_000); continue; }
+          break;
+        }
         if (!config.worker.enabled) {
           const orphans = await this.d.ledger.findRecoverable(this.runId, null, true);
           for (const orphan of orphans) await this.recoverOne(orphan, this.logger, true);
@@ -708,7 +747,14 @@ export class ChunkOrchestrator {
       if (chunk && await this.supersedeIfBeyondBound(chunk as ChunkDoc)) continue;
       if (!chunk) {
         const remaining = await this.d.ledger.countRegularNonTerminal(this.runId);
-        if (remaining === 0) return;
+        if (remaining === 0) {
+          // same gate as the finish loop: a fully pruned grid must not read
+          // as drained while orphaned prune receipts await restoration
+          let holds = true;
+          try { holds = await this.pruneJournalHolds(); } catch { /* unreadable = hold */ }
+          if (holds) { await sleep(5_000); continue; }
+          return;
+        }
         if (!config.worker.enabled) {
           const orphans = await this.d.ledger.findRecoverable(this.runId, null, true);
           for (const orphan of orphans) await this.recoverOne(orphan, this.logger, true);
