@@ -392,7 +392,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     return null;
   };
   const finalCheckState: FinalCheckResult = newFinalCheckResult();
-  app.post<{ Body: { cutoverMs?: number; samples?: number } }>('/control/final-check', async (req) => {
+  app.post<{ Body: { cutoverMs?: number; samples?: number; deep?: boolean } }>('/control/final-check', async (req) => {
     if (finalCheckState.status === 'running') return { started: false, reason: 'final check already running' };
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — run the final check after completion (or while paused)' };
     // no exclusion: the SERVING pod's own live claims block the check too —
@@ -411,8 +411,9 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       }
     }
     const samples = Math.min(10_000, Math.max(50, req.body?.samples ?? 500));
-    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples });
-    return { started: true, cutoverMs, samples };
+    const deep = req.body?.deep === true;
+    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep });
+    return { started: true, cutoverMs, samples, deep };
   });
   app.get('/api/final-check', async () => finalCheckState);
   app.get('/final-check.txt', async (_req, reply) => {

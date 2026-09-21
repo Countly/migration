@@ -97,13 +97,29 @@ only question that matters — *is it safe to decommission the old cluster?* —
 as **PASS / PASS WITH NOTES / FAIL** in plain sentences with the action named
 on every red line.
 
-- Dashboard: the **Final check** card → *Run final check*. On tee/mirror runs
-  without a stored bound, type the cutover time into the field first.
+Two tiers:
+
+- **Quick** (default — minutes): chunk states + DLQ + target-vs-ledger
+  verification (every migrated window's live count against the recorded
+  count, plus duplicate attribution) + random content samples against the
+  source. Catches everything that can happen AFTER reading. Capped at
+  PASS WITH NOTES — the note names what it did not re-prove.
+- **Deep** (opt-in — hours on large runs): additionally recounts EVERY
+  window against the source with cd-checksum fingerprints. This is the one
+  check that would catch a self-consistently under-reading reader, so run
+  it once before the source is deleted; while the source still exists,
+  quick is enough for routine confidence.
+
+- Dashboard: the **Final check** card → *Run final check* (tick *deep source
+  recount* for the pre-teardown gate). On tee/mirror runs without a stored
+  bound, type the cutover time into the field first.
 - SSH-only:
 
 ```bash
-# start (add {"cutoverMs": <epoch ms of the tee flip>} for mirror runs without a stored bound)
+# quick (add {"cutoverMs": <epoch ms of the tee flip>} for mirror runs without a stored bound)
 curl -s -X POST localhost:PORT/control/final-check -H 'content-type: application/json' -d '{}'
+# deep — before deleting the source
+curl -s -X POST localhost:PORT/control/final-check -H 'content-type: application/json' -d '{"deep": true}'
 # read the verdict (re-run until it says PASS/FAIL; shows progress while running)
 curl -s localhost:PORT/final-check.txt
 ```

@@ -304,7 +304,8 @@ const PAGE = `<!doctype html>
     <h2>Final check <span class="hint">— one click answers: is it safe to decommission the old source? (chunks + DLQ + full source recount + checksums + content samples — interpreted for you)</span></h2>
     <div style="margin-bottom:8px">
       <button class="btn primary" id="btn-finalcheck" onclick="startFinalCheck(this)">Run final check</button>
-      <input id="fc-cutover" placeholder="cutover time (optional, e.g. 2026-09-18T18:00Z) — only for tee/mirror runs without a stored bound" style="width:52%;max-width:560px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:12px;margin-left:8px">
+      <label class="hint" style="margin-left:8px;cursor:pointer"><input type="checkbox" id="fc-deep" style="vertical-align:-2px"> deep source recount (slow — the pre-teardown gate; quick mode verifies against the run ledger in minutes)</label>
+      <input id="fc-cutover" placeholder="cutover time (optional, e.g. 2026-09-18T18:00Z) — only for tee/mirror runs without a stored bound" style="width:52%;max-width:560px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:12px;margin-left:8px;margin-top:6px">
     </div>
     <div id="finalcheck-out"><div class="empty">Not run. Run it after the migration completes — it recounts every window against the source, so give it time on big runs; progress shows here. SSH-only: <code>curl -X POST :PORT/control/final-check</code> then <code>curl :PORT/final-check.txt</code></div></div>
   </div>
@@ -818,6 +819,8 @@ function renderDedupe(dd) {
 
 async function startFinalCheck(btn) {
   var body = {};
+  var deepEl = document.getElementById('fc-deep');
+  if (deepEl && deepEl.checked) body.deep = true;
   var cutRaw = (document.getElementById('fc-cutover').value || '').trim();
   if (cutRaw) {
     var ms = Date.parse(cutRaw);
@@ -856,7 +859,8 @@ function renderFinalCheck(fc) {
     return;
   }
   var pal = fc.verdict === 'PASS' ? ['#E4F6EC', '#157A45'] : fc.verdict === 'PASS_WITH_NOTES' ? ['#FDEEDD', '#A05A16'] : ['#FDECEC', '#B3261E'];
-  var badge = fc.verdict === 'PASS' ? 'PASS' : fc.verdict === 'PASS_WITH_NOTES' ? 'PASS WITH NOTES' : 'FAIL';
+  var badge = (fc.verdict === 'PASS' ? 'PASS' : fc.verdict === 'PASS_WITH_NOTES' ? 'PASS WITH NOTES' : 'FAIL')
+    + (fc.mode === 'deep' ? ' \u00b7 deep (full source recount)' : ' \u00b7 quick (ledger verify + samples)');
   var html = '<div style="padding:12px 16px;border-radius:10px;background:' + pal[0] + ';color:' + pal[1] + '">'
     + '<div style="font-size:16px;font-weight:800;margin-bottom:4px">' + badge + '</div>'
     + '<div style="font-weight:600">' + fcEsc(fc.headline) + '</div></div>'

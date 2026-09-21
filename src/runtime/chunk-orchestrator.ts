@@ -1636,7 +1636,7 @@ export class ChunkOrchestrator {
    * so value-level equality there belongs to the differential harness, which
    * pins the transform itself).
    */
-  async contentAudit(samplesPerCollection = 500, upToMs: number | null = null): Promise<{
+  async contentAudit(samplesPerCollection = 500, upToMs: number | null = null, totalBudget: number | null = null): Promise<{
     sampled: number; matched: number; missing: number; different: number;
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }> {
@@ -1651,6 +1651,11 @@ export class ChunkOrchestrator {
         const defaults = this.d.hashResolver.resolveCollectionName(name, config.source.collectionPrefix);
         return !(defaults && skipEventNames.has(defaults.e));
       });
+      // a TOTAL budget keeps many-collection deployments sane: 2,500
+      // collections × 500 samples each is a million-doc audit nobody asked for
+      if (totalBudget !== null && collections.length > 0) {
+        samplesPerCollection = Math.min(samplesPerCollection, Math.max(10, Math.ceil(totalBudget / collections.length)));
+      }
 
       let missing = 0, different = 0;
       for (const collection of collections) {

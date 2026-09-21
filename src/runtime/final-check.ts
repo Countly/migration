@@ -25,6 +25,8 @@ import { rebuildLedger, newRebuildProgress, type RebuildProgress } from './ledge
 
 export interface FinalCheckResult {
   status: 'not_run' | 'running' | 'completed' | 'failed';
+  /** quick = ledger-verify + sampled source checks (minutes); deep = full source recount + checksums (the pre-teardown gate). */
+  mode: 'quick' | 'deep' | null;
   verdict: 'PASS' | 'PASS_WITH_NOTES' | 'FAIL' | null;
   /** One sentence answering "can I decommission the old cluster?" */
   headline: string | null;
@@ -47,7 +49,7 @@ export interface FinalCheckResult {
 
 export function newFinalCheckResult(): FinalCheckResult {
   return {
-    status: 'not_run', verdict: null, headline: null,
+    status: 'not_run', mode: null, verdict: null, headline: null,
     passes: [], notes: [], problems: [],
     cutoverMs: null, phase: '', audit: null, content: null,
     error: null, startedAt: null, finishedAt: null,
@@ -58,10 +60,11 @@ const fmt = (n: number): string => n.toLocaleString('en-US');
 const iso = (ms: number): string => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
 
 interface ContentAuditRunner {
-  contentAudit(samplesPerCollection?: number, upToMs?: number | null): Promise<{
+  contentAudit(samplesPerCollection?: number, upToMs?: number | null, totalBudget?: number | null): Promise<{
     sampled: number; matched: number; missing: number; different: number;
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }>;
+  verifyMigration(): Promise<Record<string, unknown>>;
 }
 
 export async function runFinalCheck(
@@ -74,13 +77,14 @@ export async function runFinalCheck(
     orchestrator: ContentAuditRunner;
   },
   out: FinalCheckResult,
-  opts: { cutoverMs: number | null; samples: number },
+  opts: { cutoverMs: number | null; samples: number; deep?: boolean },
 ): Promise<void> {
   const { config, ledger, dlq, hashResolver } = deps;
   const logger = deps.logger.child({ component: 'FinalCheck' });
   const runId = config.ledger.runId;
+  const deep = opts.deep === true;
 
-  Object.assign(out, newFinalCheckResult(), { status: 'running', startedAt: Date.now(), phase: 'starting' });
+  Object.assign(out, newFinalCheckResult(), { status: 'running', mode: deep ? 'deep' : 'quick', startedAt: Date.now(), phase: 'starting' });
   try {
     // ── Cutover: explicit param > stored bound > env bound > none ─────────
     // fail CLOSED: if the bound cannot be read, the check errors out rather
@@ -131,9 +135,38 @@ export async function runFinalCheck(
     }
     if (dlqPending === 0 && dlqWaived === 0) out.passes.push('Dead-letter queue is empty — no document was skipped.');
 
-    // ── 3. Full source recount + cd-checksum fingerprint (the heavy one) ──
-    out.phase = 'recounting every window against the source';
+    // ── 3a. QUICK tier: target vs the run's own ledger (minutes) ──────────
+    // Catches everything that happened AFTER reading: lost partitions, rows
+    // deleted from the live table, duplicate attribution. What it cannot see
+    // is a self-consistently under-reading reader — the ledger agreeing with
+    // itself while the source held more. That class is covered
+    // probabilistically by the content samples below, and exactly by the
+    // deep recount — which is why quick mode never returns a plain PASS.
+    if (!deep) {
+      out.phase = 'verifying the target against the run ledger';
+      const verify = await deps.orchestrator.verifyMigration();
+      const vMism = (verify.mismatches as Array<Record<string, unknown>> | undefined) ?? [];
+      const vDup = Number((verify as Record<string, unknown>).migrationDuplicates ?? 0);
+      if (verify.ok !== true) {
+        if (vMism.length > 0) {
+          out.problems.push(`${fmt(vMism.length)} chunk window(s) hold a different live row count than the ledger recorded — rows were lost or duplicated after migration. Run "Retry failed chunks" after a rebuild, or escalate; do NOT decommission the old cluster.`);
+        }
+        if (vDup > 0) {
+          out.problems.push(`${fmt(vDup)} document(s) exist more than once below the migration boundary — a migration-side duplicate class; escalate before decommissioning.`);
+        }
+        if (vMism.length === 0 && vDup === 0) {
+          out.problems.push('Ledger verification reported a failure — inspect GET /api/verify before decommissioning.');
+        }
+      } else {
+        out.passes.push('Target verified against the run ledger: every migrated chunk window holds exactly the recorded row count, with no migration-side duplicates.');
+      }
+      out.notes.push(`Quick mode: the ledger itself was not re-proven against the source. Per-chunk verification at attach time plus the random content samples below cover that class probabilistically — run the DEEP check ({"deep": true}, or the checkbox in the dashboard) before deleting the source if you want the full recount + checksum fingerprints.`);
+    }
+
+    // ── 3b. DEEP tier: full source recount + cd-checksum fingerprint ──────
     const audit = newRebuildProgress();
+    if (deep) {
+    out.phase = 'recounting every window against the source';
     out.audit = audit;
     await rebuildLedger({ config, logger, ledger, dlq, hashResolver, progress: audit, checkOnly: true, upToMs: cutoverMs });
     const windows = audit.summary.reduce((a, s) => a + s.chunks, 0);
@@ -171,10 +204,11 @@ export async function runFinalCheck(
       const excluded = audit.excludedBeyondCutover ?? 0;
       out.notes.push(`Source docs after the cutover (${iso(cutoverMs)}) were excluded from the comparison${excluded > 0 ? ` (${fmt(excluded)} docs)` : ''} — after that moment the old side receives mirrored/live traffic that was never meant to be migrated, so divergence there is expected and is NOT data loss.`);
     }
+    }
 
     // ── 4. Sampled content comparison ──────────────────────────────────────
     out.phase = 'comparing sampled documents field-by-field';
-    const content = await deps.orchestrator.contentAudit(opts.samples, cutoverMs);
+    const content = await deps.orchestrator.contentAudit(opts.samples, cutoverMs, Math.max(2_000, opts.samples));
     out.content = { sampled: content.sampled, matched: content.matched, missing: content.missing, different: content.different };
     if (content.missing > 0 || content.different > 0) {
       out.problems.push(`Content sampling found ${fmt(content.missing)} missing and ${fmt(content.different)} differing doc(s) out of ${fmt(content.sampled)} sampled — the migrated content does not match the source; escalate before decommissioning.`);
@@ -214,7 +248,7 @@ export function renderFinalCheckText(fc: FinalCheckResult, runId: string): strin
     lines.push(`CHECK FAILED TO COMPLETE: ${fc.error} - fix and re-run; this is a tooling error, not a data verdict.`);
   } else {
     const badge = fc.verdict === 'PASS' ? 'PASS' : fc.verdict === 'PASS_WITH_NOTES' ? 'PASS WITH NOTES' : 'FAIL';
-    lines.push(`Verdict: ${badge} - ${fc.headline}`);
+    lines.push(`Verdict: ${badge} (${fc.mode === 'deep' ? 'deep: full source recount' : 'quick: ledger verify + samples'}) - ${fc.headline}`);
     for (const p of fc.problems) lines.push(`  [X] ${p}`);
     for (const n of fc.notes) lines.push(`  [!] ${n}`);
     for (const g of fc.passes) lines.push(`  [ok] ${g}`);

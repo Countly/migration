@@ -49,6 +49,7 @@ const chRow = (id: string, cdMs: number): Record<string, unknown> => ({
 
 const contentClean = {
   contentAudit: async (samples = 500) => ({ sampled: samples, matched: samples, missing: 0, different: 0, mismatches: [] }),
+  verifyMigration: async () => ({ ok: true, mismatches: [], migrationDuplicates: 0 }),
 };
 
 describe('final check: the interpreted sign-off', () => {
@@ -59,12 +60,12 @@ describe('final check: the interpreted sign-off', () => {
   let hashResolver: HashResolver;
   let config: Config;
 
-  const check = async (opts?: { cutoverMs?: number | null; orchestrator?: typeof contentClean }) => {
+  const check = async (opts?: { cutoverMs?: number | null; orchestrator?: typeof contentClean; deep?: boolean }) => {
     const out = newFinalCheckResult();
     await runFinalCheck(
       { config, logger, ledger, dlq, hashResolver, orchestrator: opts?.orchestrator ?? contentClean },
       out,
-      { cutoverMs: opts?.cutoverMs ?? null, samples: 100 },
+      { cutoverMs: opts?.cutoverMs ?? null, samples: 100, deep: opts?.deep ?? true },
     );
     expect(out.status).toBe('completed');
     return out;
@@ -202,6 +203,23 @@ describe('final check: the interpreted sign-off', () => {
   it('summarize reports cluster-truth docsSkipped from the ledger', async () => {
     await mc.db(DB).collection('mig_ranges').updateOne({ _id: `${RUN}:${COLL}:0` } as never, { $set: { docs_skipped: 7 } });
     expect((await ledger.summarize(RUN)).docsSkipped).toBe(7);
+  });
+
+  it('quick mode: ledger verify + samples, capped at PASS WITH NOTES, never plain PASS', async () => {
+    const out = await check({ cutoverMs: CUTOVER, deep: false });
+    expect(out.mode).toBe('quick');
+    expect(out.problems).toEqual([]);
+    expect(out.verdict).toBe('PASS_WITH_NOTES');
+    expect(out.notes.join(' ')).toContain('DEEP');
+    expect(out.audit).toBeNull(); // no source recount ran
+
+    const badVerify = {
+      ...contentClean,
+      verifyMigration: async () => ({ ok: false, mismatches: [{ chunk: 'x', expected: 10, live: 7 }], migrationDuplicates: 0 }),
+    };
+    const out2 = await check({ cutoverMs: CUTOVER, deep: false, orchestrator: badVerify });
+    expect(out2.verdict).toBe('FAIL');
+    expect(out2.problems.join(' ')).toContain('different live row count');
   });
 
   it('content mismatch and failed chunks each FAIL with their own action line', async () => {
