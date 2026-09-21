@@ -72,8 +72,8 @@ export interface DedupeOverlapState {
   toMs: number | null;
   collections: DedupeCollectionRow[];
   totals: { mongoDocsInWindow: number; chMatched: number; deleted: number; unsafeMatched: number };
-  /** Window + slack of the last COMPLETED dry run — the license to execute (same window AND same slack). */
-  lastDryRun: { fromMs: number; toMs: number; slackPct: number; chMatched: number; at: number } | null;
+  /** Window + slack + run fingerprint of the last COMPLETED dry run — the license to execute (same window, same slack, unchanged run state). */
+  lastDryRun: { fromMs: number; toMs: number; slackPct: number; chMatched: number; fingerprint: string | null; at: number } | null;
   /** Set when the run's chunk state changed while dedupe scanned — counts are stale; re-run the dry run. */
   runStateChanged: boolean;
   error: string | null;
@@ -213,10 +213,11 @@ export async function runDedupeOverlap(
     // snapshot, so if anyone re-opened work mid-scan (retry-failed, top-up
     // mapping) the counts above are stale — detect and say so rather than
     // hold a cluster-wide claim barrier for an operator-induced edge case.
+    let fpAfter: string | null = null;
     if (deps.ledger && fpBefore !== null) {
       // durable marker, not a claims poll: work that starts AND finishes
       // during the scan still moves the fingerprint
-      const fpAfter = await deps.ledger.runFingerprint(config.ledger.runId).catch(() => null);
+      fpAfter = await deps.ledger.runFingerprint(config.ledger.runId).catch(() => null);
       if (fpAfter !== fpBefore) {
         state.runStateChanged = true;
         logger.warn({ fpBefore, fpAfter }, 'Run chunk state changed during dedupe — counts are stale; re-run the dry run once the pods are idle');
@@ -226,7 +227,7 @@ export async function runDedupeOverlap(
     state.phase = 'done';
     state.finishedAt = Date.now();
     if (!opts.execute) {
-      state.lastDryRun = { fromMs: opts.fromMs, toMs: opts.toMs, slackPct: effectiveSlackPct(opts.slackPct), chMatched: state.totals.chMatched, at: Date.now() };
+      state.lastDryRun = { fromMs: opts.fromMs, toMs: opts.toMs, slackPct: effectiveSlackPct(opts.slackPct), chMatched: state.totals.chMatched, fingerprint: fpAfter, at: Date.now() };
     }
     logger.info(
       { execute: opts.execute, ...state.totals, collections: state.collections.length },

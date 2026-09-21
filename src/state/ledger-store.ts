@@ -719,8 +719,10 @@ export class LedgerStore {
         // re-inserting is idempotent — chunks already present are fine; any
         // OTHER failure means the grid was NOT restored and must propagate
         const e = err as { code?: number; writeErrors?: Array<{ code?: number }> };
-        const dupOnly = e.code === 11000
-          || ((e.writeErrors?.length ?? 0) > 0 && (e.writeErrors ?? []).every((w) => w.code === 11000));
+        // when per-write errors exist THEY are the truth — a top-level 11000
+        // can front a mixed batch where other writes failed for real reasons
+        const we = e.writeErrors ?? [];
+        const dupOnly = we.length > 0 ? we.every((w) => w.code === 11000) : e.code === 11000;
         if (!dupOnly) throw err;
       }
     }

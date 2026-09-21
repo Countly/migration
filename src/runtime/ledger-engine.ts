@@ -447,6 +447,17 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       if (dedupeState.runStateChanged) {
         return { started: false, reason: 'execute refused: the run state changed during the dry run (a pod claimed work mid-scan) — its counts are stale; re-run the dry run with all pods idle' };
       }
+      // the license also covers the gap BETWEEN dry run and execute: work
+      // that landed since (even started-and-finished) moves the fingerprint
+      let fpNow: string;
+      try {
+        fpNow = await ledger.runFingerprint(config.ledger.runId);
+      } catch {
+        return { started: false, reason: 'execute refused: could not read the run fingerprint to validate the dry-run license — retry when MongoDB answers' };
+      }
+      if (dry.fingerprint === null || fpNow !== dry.fingerprint) {
+        return { started: false, reason: 'execute refused: the run state changed since the dry run — its counts no longer describe the grid; re-run the dry run with all pods idle' };
+      }
     }
     void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct });
     return { started: true, execute, fromMs, toMs };
