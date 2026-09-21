@@ -327,6 +327,15 @@ export class StagingManager {
    * Used when retrying a chunk that was already (partially) promoted — redo
    * must start from a clean window or verify-then-attach would skip it.
    */
+  /**
+   * Ids per query when passed as a {ids:Array(String)} parameter. ClickHouse
+   * receives query params as HTTP form fields capped by
+   * http_max_field_value_size (128 KiB default): ~5,000 ObjectId strings
+   * already trip "HTML Form Exception: Field value too long" (field report).
+   * 2,000 ids ≈ 52 KB — safely under default limits everywhere.
+   */
+  private static readonly ID_PARAM_PAGE = 2_000;
+
   private scopeSql(scope?: { a: string; e: string; n?: string } | null): string {
     if (!scope) return '';
     return 'AND a = {sa:String} AND e = {se:String}' + (scope.n !== undefined ? ' AND n = {sn:String}' : '');
@@ -562,8 +571,8 @@ export class StagingManager {
       ? 'AND cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})'
       : '';
     const out = new Map<string, number>();
-    for (let i = 0; i < ids.length; i += 10_000) {
-      const page = ids.slice(i, i + 10_000);
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
       const res = await this.ch().query({
         query: `SELECT _id, toUnixTimestamp64Milli(cd) AS cd_ms FROM ${this.fq(this.config.table)}
                 WHERE _id IN {ids:Array(String)} ${bound}`,
@@ -590,8 +599,8 @@ export class StagingManager {
   /** DISTINCT given ids present live in [fromMs, toMs) — duplicate rows of one id never vouch for another id's absence. Scope keeps a same-_id row in a SIBLING collection from vouching either. */
   async countDistinctMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
     let total = 0;
-    for (let i = 0; i < ids.length; i += 50_000) {
-      const page = ids.slice(i, i + 50_000);
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
       const res = await this.ch().query({
         // alias must not be 'n' — the scope filter references the real column n
         query: `SELECT uniqExact(_id) AS cnt FROM ${this.fq(this.config.table)}
@@ -609,8 +618,8 @@ export class StagingManager {
   /** Live rows in [fromMs, toMs) whose _id is one of the given ids, scoped to a collection's (a,e,n) when known. */
   async countMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
     let total = 0;
-    for (let i = 0; i < ids.length; i += 50_000) {
-      const page = ids.slice(i, i + 50_000);
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
       const res = await this.ch().query({
         query: `SELECT count() AS cnt FROM ${this.fq(this.config.table)}
                 WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
@@ -631,8 +640,8 @@ export class StagingManager {
    * keeps each DELETE partition-prunable on multi-billion-row tables.
    */
   async deleteMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<void> {
-    for (let i = 0; i < ids.length; i += 50_000) {
-      const page = ids.slice(i, i + 50_000);
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
       await this.ch().command({
         query: `DELETE FROM ${this.fq(this.config.table)}
                 WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
