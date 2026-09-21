@@ -279,7 +279,7 @@ export class ChunkOrchestrator {
     }
 
     // ── UNBOUNDED-WITH-LIVE-TARGET GUARD ──────────────────────────────────
-    // The one mistake the tool cannot detect afterwards (field: Wurth-it): a
+    // The one mistake the tool cannot detect afterwards (seen in the field): a
     // mirrored cutover migrated without LEDGER_CD_UPPER_BOUND duplicates the
     // whole overlap window. The condition IS detectable up front — a fresh
     // run whose target ClickHouse is already receiving live data — so the

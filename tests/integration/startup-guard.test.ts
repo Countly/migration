@@ -1,5 +1,5 @@
 /**
- * Unbounded-with-live-target startup guard — the "Wurth-it mistake" made
+ * Unbounded-with-live-target startup guard — the missing-bound mistake made
  * impossible to make silently. Pinned here:
  *
  *  - a FRESH run against a ClickHouse that is already receiving live data,
