@@ -77,7 +77,7 @@ export async function runFinalCheck(
     orchestrator: ContentAuditRunner;
   },
   out: FinalCheckResult,
-  opts: { cutoverMs: number | null; samples: number; deep?: boolean },
+  opts: { cutoverMs: number | null; samples: number; deep?: boolean; acceptUnscoped?: boolean },
 ): Promise<void> {
   const { config, ledger, dlq, hashResolver } = deps;
   const logger = deps.logger.child({ component: 'FinalCheck' });
@@ -185,8 +185,13 @@ export async function runFinalCheck(
     if (scopedPendingWindows > 0) {
       out.problems.push(`${fmt(scopedPendingWindows)} window(s) hold ZERO rows in ClickHouse for data the source has — whole windows are missing from the target. Rebuild the ledger from data, Retry failed chunks, and run this check again; do NOT decommission the old cluster.`);
     }
-    if (unscopedWindows > 0) {
-      out.notes.push(`${fmt(unscopedWindows)} window(s) belong to collection(s) without their own (a,e,n) scope and cannot be recounted against the source individually — for those, trust rests on the per-chunk verify at attach time plus the content samples below.`);
+    if (unscopedWindows > 0 && opts.acceptUnscoped !== true) {
+      // a teardown authorization must not stand on windows that CANNOT be
+      // recounted — the operator either keeps the source or accepts the
+      // reduced evidence explicitly
+      out.problems.push(`${fmt(unscopedWindows)} window(s) belong to collection(s) without their own (a,e,n) scope and CANNOT be recounted against the source. Their evidence is per-chunk attach verification, sampled id coverage and the content samples — if that is acceptable, re-run with {"acceptUnscoped": true}; otherwise keep the source.`);
+    } else if (unscopedWindows > 0) {
+      out.notes.push(`${fmt(unscopedWindows)} window(s) in unscopable collection(s) were EXPLICITLY ACCEPTED on reduced evidence (attach-time verification + sampled id coverage + content samples) — recorded here for the sign-off trail.`);
     }
     if (audit.mismatchedWindows.length > 0) {
       out.problems.push(`${fmt(audit.mismatchedWindows.length)} window(s) hold FEWER docs in ClickHouse than the source — data is missing from the target. Click "Retry failed chunks" after a rebuild, or escalate; do NOT decommission the old cluster.`);

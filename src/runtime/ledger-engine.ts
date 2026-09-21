@@ -384,7 +384,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // ── Final check: the whole sign-off, interpreted (chunks + DLQ + source
   // recount + checksums + content samples → one PASS/NOTES/FAIL verdict) ──
   const finalCheckState: FinalCheckResult = newFinalCheckResult();
-  app.post<{ Body: { cutoverMs?: number; samples?: number; deep?: boolean } }>('/control/final-check', async (req) => {
+  app.post<{ Body: { cutoverMs?: number; samples?: number; deep?: boolean; acceptUnscoped?: boolean } }>('/control/final-check', async (req) => {
     if (finalCheckState.status === 'running') return { started: false, reason: 'final check already running' };
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — run the final check after completion (or while paused)' };
     // no exclusion: the SERVING pod's own live claims block the check too —
@@ -409,8 +409,9 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     }
     const samples = Math.min(10_000, Math.max(50, typeof req.body?.samples === 'number' && Number.isFinite(req.body.samples) ? req.body.samples : 500));
     const deep = req.body?.deep === true;
-    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep });
-    return { started: true, cutoverMs, samples, deep };
+    const acceptUnscoped = req.body?.acceptUnscoped === true;
+    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep, acceptUnscoped });
+    return { started: true, cutoverMs, samples, deep, acceptUnscoped };
   });
   app.get('/api/final-check', async () => finalCheckState);
   app.get('/final-check.txt', async (_req, reply) => {

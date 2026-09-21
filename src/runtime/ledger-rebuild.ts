@@ -132,6 +132,23 @@ export async function rebuildLedger(opts: {
 
     let driftChecks = 0;
     let idChecks = 0;
+    // Missing = sampled ids ABSENT live, minus the absent ones the DLQ
+    // explains. Presence is an id-set lookup (scoped, windowed), never a
+    // count: counts let a waived-but-present id discount twice and a
+    // duplicate row vouch for a different id.
+    const missingAfterDlq = async (
+      collection2: string,
+      sampleIds: string[],
+      lowerCd: number,
+      upperCd: number,
+      scope2: { a: string; e: string; n?: string } | null,
+    ): Promise<number> => {
+      const present = await staging.fetchLiveCdByIds(sampleIds, { loMs: lowerCd, hiMs: upperCd - 1 }, scope2);
+      const absent = sampleIds.filter((id) => !present.has(id));
+      if (absent.length === 0) return 0;
+      const unresolvedIds = await dlq.unresolvedIdsAmong(runId, collection2, absent);
+      return absent.filter((id) => !unresolvedIds.has(id)).length;
+    };
     progress.phase = 'discovering collections';
     let collections = await discoverCollections(db, config.source.collectionPrefix, logger);
     const skipEventNames = new Set(['[CLY]_apm_device', '[CLY]_apm_network']);
@@ -265,14 +282,7 @@ export async function rebuildLedger(opts: {
             const sampleIds = (await coll
               .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
               .limit(5_000).toArray()).map((d) => String(d._id));
-            // DISTINCT coverage: a duplicate row of one sampled id must not
-            // vouch for another sampled id being absent
-            const present = await staging.countDistinctMatchingIdsInWindow(sampleIds, b.lowerCd, b.upperCd, scope);
-            // DLQ'd docs are legitimately absent — but only the SAMPLED ids
-            // that are themselves in the DLQ may be discounted; unrelated
-            // unresolved docs elsewhere in the window explain nothing
-            const unresolvedInSample = await dlq.countUnresolvedMatchingIds(runId, collection, sampleIds, b.lowerCd, b.upperCd);
-            const missing = Math.max(0, sampleIds.length - present - unresolvedInSample);
+            const missing = await missingAfterDlq(collection, sampleIds, b.lowerCd, b.upperCd, scope);
             if (missing > 0 && (progress.driftSubsetMissing ?? []).length < 200) {
               (progress.driftSubsetMissing ?? (progress.driftSubsetMissing = [])).push({
                 collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
@@ -289,11 +299,7 @@ export async function rebuildLedger(opts: {
           const uSample = (await coll
             .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
             .limit(5_000).toArray()).map((d) => String(d._id));
-          const uPresent = await staging.countDistinctMatchingIdsInWindow(uSample, b.lowerCd, b.upperCd, null);
-          const uUnresolved = unresolved > 0
-            ? await dlq.countUnresolvedMatchingIds(runId, collection, uSample, b.lowerCd, b.upperCd)
-            : 0;
-          const uMissing = uSample.length - uPresent - uUnresolved;
+          const uMissing = await missingAfterDlq(collection, uSample, b.lowerCd, b.upperCd, null);
           if (uMissing > 0 && (progress.idCoverageMissing ?? []).length < 200) {
             (progress.idCoverageMissing ?? (progress.idCoverageMissing = [])).push({
               collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
@@ -312,12 +318,7 @@ export async function rebuildLedger(opts: {
           const idSample = (await coll
             .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
             .limit(5_000).toArray()).map((d) => String(d._id));
-          const idPresent = await staging.countDistinctMatchingIdsInWindow(idSample, b.lowerCd, b.upperCd, scope);
-          // sampled ids that are themselves DLQ'd are legitimately absent
-          const idUnresolved = unresolved > 0
-            ? await dlq.countUnresolvedMatchingIds(runId, collection, idSample, b.lowerCd, b.upperCd)
-            : 0;
-          const idMissing = idSample.length - idPresent - idUnresolved;
+          const idMissing = await missingAfterDlq(collection, idSample, b.lowerCd, b.upperCd, scope);
           if (idMissing > 0 && (progress.idCoverageMissing ?? []).length < 200) {
             (progress.idCoverageMissing ?? (progress.idCoverageMissing = [])).push({
               collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
