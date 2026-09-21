@@ -542,9 +542,20 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       // concurrent applies cannot both win — the loser rolls its prune back.
       const stored = await ledger.setStoredBoundIf(config.ledger.runId, boundMs, source, priorBound);
       if (!stored) {
-        // a competing apply won: restore only what ITS bound permits
-        const winner = await ledger.getStoredBound(config.ledger.runId).catch(() => null);
-        for (const r of restores.reverse()) await ledger.restorePrune(r, winner).catch(() => {});
+        // a competing apply won: restore only what ITS bound permits — and
+        // if that bound cannot be read, restore NOTHING (fail closed: an
+        // unbounded restore could resurrect chunks the winner pruned)
+        let winner: number | null;
+        try {
+          winner = await ledger.getStoredBound(config.ledger.runId);
+        } catch {
+          return { applied: false, indeterminate: true, reason: 'another bound application raced this one AND the winning bound could not be read — nothing was restored (fail closed); when MongoDB answers, read mig_run_config and re-apply deliberately or Rebuild ledger from data' };
+        }
+        const rollbackErrors: string[] = [];
+        for (const r of restores.reverse()) await ledger.restorePrune(r, winner).catch((e: Error) => rollbackErrors.push(e.message));
+        if (rollbackErrors.length > 0) {
+          return { applied: false, indeterminate: true, reason: `another bound application raced this one and restoring this call's prune failed (${rollbackErrors.join('; ')}) — grid state is INDETERMINATE: Rebuild ledger from data or re-apply deliberately` };
+        }
         return { applied: false, reason: 'another bound application raced this one (the stored bound changed mid-apply) — this call was rolled back; re-read the current bound and retry deliberately' };
       }
       // Post-store verification: a claim that raced the fence shows up as a

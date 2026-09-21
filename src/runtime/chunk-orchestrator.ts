@@ -2163,10 +2163,6 @@ export class ChunkOrchestrator {
   async verifyMigration(upToMs: number | null = null): Promise<Record<string, unknown>> {
     const { ledger, staging } = this.d;
     const all = await ledger.listAll(this.runId);
-    const byCollection = new Map<string, boolean>();
-    for (const c of all) {
-      if (this.isNullCdChunk(c as ChunkDoc)) byCollection.set(c.collection, true);
-    }
 
     let checked = 0;
     let unscopedSkipped = 0;
@@ -2177,41 +2173,14 @@ export class ChunkOrchestrator {
     this.verifyProgress.running = true;
     this.verifyProgress.total = targets.length;
     this.verifyProgress.checked = 0;
-    this.verifyProgress.phase = 'recounting chunk windows';
     try {
-      // Bounded concurrency: each window count is minmax-pruned and cheap,
-      // but a 10TB run has tens of thousands of them — sequential would take
-      // hours, unbounded would hammer ClickHouse.
-      const CONCURRENCY = 8;
-      let cursor = 0;
-      await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
-        for (;;) {
-          const i = cursor++;
-          if (i >= targets.length) return;
-          const chunk = targets[i];
-          const scope = this.scopeOf(chunk as ChunkDoc);
-          if (!scope && collectionCount > 1) { unscopedSkipped++; continue; }
-          // Chunks past the cutover cannot be count-compared at all: their
-          // windows mix natively-ingested rows into the same (a,e,n) scope,
-          // and after a tee-overlap dedupe their migrated rows were deleted
-          // on purpose. Skip and report them — the cutover-scoped region is
-          // what this verification vouches for.
-          if (upToMs !== null && chunk.upper_cd > upToMs) { pastCutoverSkipped++; continue; }
-          const live = await staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd, scope);
-          const relaxed = byCollection.get(chunk.collection) === true;
-          const bad = relaxed ? live < chunk.rows_expected : live !== chunk.rows_expected;
-          checked++;
-          this.verifyProgress.checked = checked;
-          if (bad) mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live });
-        }
-      }));
-
-      // Null-cd sweep rows live INSIDE regular windows at ts-derived cds, so
-      // the window comparison above deliberately tolerates them — which also
-      // means their loss would be invisible. Verify them directly: the
-      // source's cd:null ids must still exist live (scoped when possible).
+      // Null-cd sweep rows live INSIDE regular windows at ts-derived cds.
+      // Index them FIRST (and verify them directly by id): the window loop
+      // subtracts them so a sweep surplus can never mask the loss of regular
+      // rows, and the comparison stays STRICT for every collection.
       this.verifyProgress.phase = 'verifying null-cd sweep rows';
       const db = this.d.mongoReader.getDatabase();
+      const sweptCdsByCollection = new Map<string, number[]>();
       for (const chunk of all) {
         if (!this.isNullCdChunk(chunk as ChunkDoc) || chunk.status !== 'done' || chunk.rows_expected <= 0) continue;
         const idDocs = await db.collection(chunk.collection)
@@ -2234,7 +2203,41 @@ export class ChunkOrchestrator {
         if (liveSweep.size < chunk.rows_expected) {
           mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live: liveSweep.size });
         }
+        sweptCdsByCollection.set(chunk.collection, [...liveSweep.values()].sort((a, b) => a - b));
       }
+
+      this.verifyProgress.phase = 'recounting chunk windows';
+      // Bounded concurrency: each window count is minmax-pruned and cheap,
+      // but a 10TB run has tens of thousands of them — sequential would take
+      // hours, unbounded would hammer ClickHouse.
+      const CONCURRENCY = 8;
+      let cursor = 0;
+      await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
+        for (;;) {
+          const i = cursor++;
+          if (i >= targets.length) return;
+          const chunk = targets[i];
+          const scope = this.scopeOf(chunk as ChunkDoc);
+          if (!scope && collectionCount > 1) { unscopedSkipped++; continue; }
+          // Chunks past the cutover cannot be count-compared at all: their
+          // windows mix natively-ingested rows into the same (a,e,n) scope,
+          // and after a tee-overlap dedupe their migrated rows were deleted
+          // on purpose. Skip and report them — the cutover-scoped region is
+          // what this verification vouches for.
+          if (upToMs !== null && chunk.upper_cd > upToMs) { pastCutoverSkipped++; continue; }
+          let live = await staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd, scope);
+          const swept = sweptCdsByCollection.get(chunk.collection);
+          if (swept) {
+            let sLo = 0, sHi = swept.length;
+            while (sLo < sHi) { const m = (sLo + sHi) >> 1; if (swept[m] < chunk.lower_cd) sLo = m + 1; else sHi = m; }
+            for (let k = sLo; k < swept.length && swept[k] < chunk.upper_cd; k++) live--;
+          }
+          const bad = live !== chunk.rows_expected;
+          checked++;
+          this.verifyProgress.checked = checked;
+          if (bad) mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live });
+        }
+      }));
 
       this.verifyProgress.phase = 'scanning for duplicates (per partition)';
 

@@ -704,7 +704,16 @@ export class LedgerStore {
         c.upper_cd > currentBoundMs ? { ...c, upper_cd: currentBoundMs } : c
       ));
     if (insertable.length > 0) {
-      await this.c().insertMany(insertable, { ordered: false }).catch(() => {});
+      try {
+        await this.c().insertMany(insertable, { ordered: false });
+      } catch (err) {
+        // re-inserting is idempotent — chunks already present are fine; any
+        // OTHER failure means the grid was NOT restored and must propagate
+        const e = err as { code?: number; writeErrors?: Array<{ code?: number }> };
+        const dupOnly = e.code === 11000
+          || ((e.writeErrors?.length ?? 0) > 0 && (e.writeErrors ?? []).every((w) => w.code === 11000));
+        if (!dupOnly) throw err;
+      }
     }
     for (const c of restore.clampedChunks) {
       const upper = currentBoundMs !== null ? Math.min(c.upper_cd, currentBoundMs) : c.upper_cd;
