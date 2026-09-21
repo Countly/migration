@@ -216,6 +216,35 @@ export class ChunkOrchestrator {
   // Main
   // -------------------------------------------------------------------------
 
+  /**
+   * The last line of the map-vs-apply defense: if a stored bound exists and
+   * the freshly claimed chunk lies at/beyond it, the chunk is superseded
+   * (never read); a straddler is clamped in place before processing.
+   */
+  private async supersedeIfBeyondBound(chunk: ChunkDoc): Promise<boolean> {
+    if (chunk.lower_cd < 0) return false; // sentinel sweep — no cd semantics
+    let bound: number | null = null;
+    try {
+      bound = this.d.config.ledger.cdUpperBoundMs ?? await this.d.ledger.getStoredBound(this.runId);
+    } catch {
+      // cannot read the bound — do not process on unknown configuration
+      await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+      return true;
+    }
+    if (bound === null) return false;
+    if (chunk.lower_cd >= bound) {
+      await this.d.ledger.supersede(chunk._id, this.podId).catch(() => {});
+      this.logger.warn({ chunk: chunk._id, bound }, 'Claimed chunk lies beyond the stored bound — superseded, never read');
+      return true;
+    }
+    if (chunk.upper_cd > bound) {
+      await this.d.ledger.clampUpper(chunk._id, bound).catch(() => {});
+      chunk.upper_cd = bound;
+      this.logger.warn({ chunk: chunk._id, bound }, 'Claimed straddler clamped to the stored bound before reading');
+    }
+    return false;
+  }
+
   private async boundaryGuard(): Promise<void> {
     const { config } = this.d;
     if (config.ledger.cdUpperBoundMs != null || config.ledger.unboundedOk) return;
@@ -443,6 +472,10 @@ export class ChunkOrchestrator {
       await this.reclaimExpiredLeases(null, this.logger);
 
       const chunk = await this.d.ledger.claimNextGlobal(this.runId, this.podId, config.ledger.leaseSec);
+      // Post-claim bound fence: however a beyond-bound chunk slipped into
+      // the grid (map pass racing a bound apply), it must never be READ —
+      // the fence sits after the claim, where no further race can exist.
+      if (chunk && await this.supersedeIfBeyondBound(chunk as ChunkDoc)) continue;
       if (!chunk) {
         const remaining = await this.d.ledger.countRegularNonTerminal(this.runId);
         if (remaining === 0) break;
@@ -630,6 +663,10 @@ export class ChunkOrchestrator {
       await this.reclaimExpiredLeases(null, this.logger);
 
       const chunk = await this.d.ledger.claimNextGlobal(this.runId, this.podId, config.ledger.leaseSec);
+      // Post-claim bound fence: however a beyond-bound chunk slipped into
+      // the grid (map pass racing a bound apply), it must never be READ —
+      // the fence sits after the claim, where no further race can exist.
+      if (chunk && await this.supersedeIfBeyondBound(chunk as ChunkDoc)) continue;
       if (!chunk) {
         const remaining = await this.d.ledger.countRegularNonTerminal(this.runId);
         if (remaining === 0) return;

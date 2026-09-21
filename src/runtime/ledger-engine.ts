@@ -384,8 +384,12 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // ── Final check: the whole sign-off, interpreted (chunks + DLQ + source
   // recount + checksums + content samples → one PASS/NOTES/FAIL verdict) ──
   const finalCheckState: FinalCheckResult = newFinalCheckResult();
+  // declared here so final-check and dedupe can mutually exclude: dedupe
+  // deletes target rows the ledger fingerprint cannot see
+  const dedupeState: DedupeOverlapState = newDedupeOverlapState();
   app.post<{ Body: { cutoverMs?: number; samples?: number; deep?: boolean; acceptUnscoped?: boolean } }>('/control/final-check', async (req) => {
     if (finalCheckState.status === 'running') return { started: false, reason: 'final check already running' };
+    if (dedupeState.status === 'running') return { started: false, reason: 'a dedupe is running — it changes the target under the check; wait for it to finish' };
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — run the final check after completion (or while paused)' };
     // no exclusion: the SERVING pod's own live claims block the check too —
     // a paused pod mid-chunk still owns half-written state
@@ -421,9 +425,9 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // ── Tee-overlap dedupe: remove duplicates a missing cd bound created ────
   // Dry-run by default; execute is licensed by a completed dry run over the
   // SAME window in this process — measure first, delete second.
-  const dedupeState: DedupeOverlapState = newDedupeOverlapState();
   app.post<{ Body: { fromMs?: number; toMs?: number; execute?: boolean; slackPct?: number } }>('/control/dedupe-overlap', async (req) => {
     if (dedupeState.status === 'running') return { started: false, reason: 'dedupe already running' };
+    if (finalCheckState.status === 'running') return { started: false, reason: 'a final check is running — dedupe would delete rows it already audited; wait for the verdict' };
     // destructive against the live table: the migration must be fully
     // stopped — no pod (this one included) may hold an active chunk claim,
     // dry run included, so the counts it licenses execute with are stable

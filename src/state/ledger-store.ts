@@ -621,6 +621,27 @@ export class LedgerStore {
     return row ? `${row.n}:${row.done}:${row.maxU ? row.maxU.getTime() : 0}` : '0:0:0';
   }
 
+  /** Supersede a chunk this pod holds — the bound says it must never be read. */
+  async supersede(chunkId: string, podId: string): Promise<void> {
+    await this.c().updateOne(
+      { _id: chunkId, pod_id: podId },
+      { $set: { status: 'superseded', pod_id: null, lease_until: null, updated_at: new Date() } },
+    );
+  }
+
+  /** Release a claim untouched (status back to pending) — used when configuration cannot be read. */
+  async releaseClaim(chunkId: string, podId: string): Promise<void> {
+    await this.c().updateOne(
+      { _id: chunkId, pod_id: podId, status: 'in_progress' },
+      { $set: { status: 'pending', pod_id: null, lease_until: null, updated_at: new Date() } },
+    );
+  }
+
+  /** Clamp a chunk's upper edge to the bound (claimed straddler). */
+  async clampUpper(chunkId: string, boundMs: number): Promise<void> {
+    await this.c().updateOne({ _id: chunkId }, { $set: { upper_cd: boundMs, updated_at: new Date() } });
+  }
+
   /**
    * Self-heal for the map-vs-apply race: a map pass that read no bound (or
    * an older one) may insert chunks a just-applied bound forbids. Called by
