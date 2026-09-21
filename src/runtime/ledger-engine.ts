@@ -501,6 +501,14 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   });
   app.get('/api/boundary', async () => ({ ...boundaryState, applied: boundaryApplied }));
 
+  // Startup-guard answer: "nothing mirrors traffic between the stacks" —
+  // cluster-wide (stored in run config), releases every held pod.
+  app.post('/control/allow-unbounded', async () => {
+    await ledger.setUnboundedAck(config.ledger.runId, config.worker.podId);
+    logger.warn('Operator declared no-mirror: unbounded run allowed — held pods release within seconds');
+    return { allowed: true, note: 'held pods release within ~3s; the decision is stored cluster-wide in mig_run_config' };
+  });
+
   // ── ONE endpoint for the whole boundary flow ────────────────────────────
   // {} → detect, and auto-apply when the seam is an exact ingestion-pause
   // gap; {"acceptAnchor":true} → also take an anchor suggestion; {"boundMs"}

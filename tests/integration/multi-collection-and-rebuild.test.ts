@@ -125,6 +125,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     process.env.LEDGER_CHUNK_DOCS_TARGET = '250';
     process.env.LEDGER_MONITOR_INTERVAL_MS = '0';
     process.env.BACKPRESSURE_ENABLED = 'false';
+    process.env.LEDGER_UNBOUNDED_OK = 'true'; // no-mirror declaration — the top-up tests migrate recent-cd docs
     config = loadConfig();
 
     const mongoReader = new MongoReader({
@@ -890,7 +891,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
       SERVICE_NAME: 'skiponly', MONGO_URI, MONGO_DB: DB, MONGO_COUNTLY_DB: `${DB}_countly`,
       MANIFEST_DB: DB, CLICKHOUSE_URL: CH_URL, CLICKHOUSE_PASSWORD: CH_PASSWORD, CLICKHOUSE_DB: DB,
       LEDGER_RUN_ID: SK, LEDGER_CHUNK_DOCS_TARGET: '5000', MONGO_PAGE_SIZE: '500',
-      LEDGER_MONITOR_INTERVAL_MS: '0', BACKPRESSURE_ENABLED: 'false', MULTI_POD_ENABLED: 'false',
+      LEDGER_MONITOR_INTERVAL_MS: '0', BACKPRESSURE_ENABLED: 'false', MULTI_POD_ENABLED: 'false', LEDGER_UNBOUNDED_OK: 'true',
       POD_ID: 'skip-pod',
     });
     delete process.env.LEDGER_CD_UPPER_BOUND;

@@ -138,7 +138,7 @@ export class ChunkOrchestrator {
   private consecutiveFailed = 0;
   private sourceShrankChunks = 0;
   private streakHadPermanent = false;
-  private pauseReason: 'operator' | 'not-started' | 'breaker-transient' | 'breaker-data' | null = null;
+  private pauseReason: 'operator' | 'not-started' | 'boundary-unset' | 'breaker-transient' | 'breaker-data' | null = null;
   private probeOkStreak = 0;
   private autoResuming = false;
   private resumeProbeTimer: NodeJS.Timeout | null = null;
@@ -172,7 +172,7 @@ export class ChunkOrchestrator {
   // -------------------------------------------------------------------------
 
   stopAfterChunk(): void { this.stopping = true; }
-  pause(reason: 'operator' | 'not-started' | 'breaker-transient' | 'breaker-data' = 'operator'): void {
+  pause(reason: 'operator' | 'not-started' | 'boundary-unset' | 'breaker-transient' | 'breaker-data' = 'operator'): void {
     this.paused = true;
     this.pauseReason = reason;
     if (this.status === 'running') this.status = 'paused';
@@ -207,6 +207,42 @@ export class ChunkOrchestrator {
   // Main
   // -------------------------------------------------------------------------
 
+  private async boundaryGuard(): Promise<void> {
+    const { config } = this.d;
+    if (config.ledger.cdUpperBoundMs != null || config.ledger.unboundedOk) return;
+    if (await this.d.ledger.getStoredBound(this.runId).catch(() => null)) return;
+    if (await this.d.ledger.getUnboundedAck(this.runId).catch(() => false)) return;
+    // only a FRESH run: a resumed run already made this decision
+    const counts = await this.d.ledger.statusCounts(this.runId).catch(() => null);
+    if (counts === null || Object.values(counts).reduce((a, b) => a + b, 0) > 0) return;
+    const live = await this.d.staging.hasLiveCdSince(Date.now() - 30 * 60_000).catch(() => false);
+    if (!live) return;
+
+    this.pause('boundary-unset');
+    this.logger.warn(
+      { runId: this.runId },
+      'GUARD: target ClickHouse is receiving live data and no cd upper bound is set — if a mirror re-ingests the same requests on both sides, running unbounded WILL duplicate the overlap window. Apply a bound (POST /control/set-boundary) or declare no-mirror (POST /control/allow-unbounded).',
+    );
+    while (!this.stopping) {
+      if ((await this.d.ledger.getStoredBound(this.runId).catch(() => null)) !== null) {
+        this.logger.info({ runId: this.runId }, 'Boundary guard released: a cd bound was applied');
+        this.resume();
+        return;
+      }
+      if (await this.d.ledger.getUnboundedAck(this.runId).catch(() => false)) {
+        this.logger.warn({ runId: this.runId }, 'Boundary guard released: operator declared no-mirror — running unbounded');
+        this.resume();
+        return;
+      }
+      if (!this.paused) {
+        // a plain Resume does not answer the mirror question — re-hold
+        this.pause('boundary-unset');
+        this.logger.warn('Resume ignored while the boundary question is open — apply a bound or POST /control/allow-unbounded');
+      }
+      await sleep(3_000);
+    }
+  }
+
   async run(): Promise<void> {
     this.status = 'running';
     this.startedAt = Date.now();
@@ -240,6 +276,18 @@ export class ChunkOrchestrator {
         if (this.stopping) { this.status = 'stopped'; return; }
         this.startedAt = Date.now(); // the run starts when it was started
       }
+    }
+
+    // ── UNBOUNDED-WITH-LIVE-TARGET GUARD ──────────────────────────────────
+    // The one mistake the tool cannot detect afterwards (field: Wurth-it): a
+    // mirrored cutover migrated without LEDGER_CD_UPPER_BOUND duplicates the
+    // whole overlap window. The condition IS detectable up front — a fresh
+    // run whose target ClickHouse is already receiving live data — so the
+    // run holds there until the operator answers the mirror question: apply
+    // a bound (set-boundary), or declare no-mirror (allow-unbounded).
+    if (!this.dryRun) {
+      await this.boundaryGuard();
+      if (this.stopping) { this.status = 'stopped'; return; }
     }
 
     // Transient-outage self-healing: only acts while paused with reason

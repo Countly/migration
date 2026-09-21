@@ -212,6 +212,24 @@ An exact gap applies unattended; an anchor (quantified ambiguity) is never
 auto-applied without `acceptAnchor`. The dashboard flow and the separate
 `/control/detect-boundary` + `/control/apply-bound` endpoints keep working.
 
+### The startup guard — the bound mistake, made impossible to miss
+
+A FRESH run that finds its target ClickHouse already receiving live data,
+with no cd bound set, **holds before mapping** (`pauseReason:
+boundary-unset`). That is exactly the setup where an unset bound either
+duplicates the overlap window (mirror active) or is a deliberate choice
+(cutover-first / in-place, where new data must still be migrated). The tool
+cannot tell those apart from data alone, so it asks — once:
+
+- mirror active → apply the bound (`POST /control/set-boundary`, the
+  dashboard card, or `LEDGER_CD_UPPER_BOUND`); the run releases itself, or
+- nothing mirrors traffic → click **Proceed unbounded** in the banner, or
+  `curl -X POST localhost:PORT/control/allow-unbounded` (cluster-wide,
+  releases every held pod), or deploy with `LEDGER_UNBOUNDED_OK=1`.
+
+A plain Resume is deliberately ignored while the question is open. Resumed
+runs and runs whose target holds no recent data never trip the guard.
+
 ### Bound is opt-in — pick the mode deliberately
 
 | Situation | LEDGER_CD_UPPER_BOUND | Behavior |

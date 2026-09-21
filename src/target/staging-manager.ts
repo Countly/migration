@@ -573,6 +573,17 @@ export class StagingManager {
     return out;
   }
 
+  /** Does the live table hold ANY row with cd at/after fromMs? (partition-pruned, LIMIT 1) */
+  async hasLiveCdSince(fromMs: number): Promise<boolean> {
+    const res = await this.ch().query({
+      query: `SELECT 1 AS x FROM ${this.fq(this.config.table)}
+              WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) LIMIT 1`,
+      query_params: { lo: fromMs },
+      format: 'JSONEachRow',
+    });
+    return (await res.json<{ x: number }>()).length > 0;
+  }
+
   /** Live rows in [fromMs, toMs) whose _id is one of the given ids. */
   async countMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number): Promise<number> {
     let total = 0;

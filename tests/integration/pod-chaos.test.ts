@@ -90,6 +90,7 @@ describe('pod chaos: random SIGKILL across all stages, exact end state', () => {
     LEDGER_LEASE_SEC: '2', // dead pods' leases recover in seconds
     LEDGER_MONITOR_INTERVAL_MS: '0',
     BACKPRESSURE_ENABLED: 'false',
+    LEDGER_UNBOUNDED_OK: 'true', // live writers run alongside the pods — the guard's question is answered
     MULTI_POD_ENABLED: 'true',
     LOG_LEVEL: 'fatal',
     // fast retries: local CH is healthy here; prod-like backoff would only

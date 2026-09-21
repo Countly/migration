@@ -482,6 +482,7 @@ export class LedgerStore {
   private rc(): Collection<{
     _id: string; cd_upper_bound_ms: number; set_at: Date; set_by: string;
     start_gate_open?: boolean; start_gate_opened_at?: Date; start_gate_opened_by?: string;
+    unbounded_ok?: boolean; unbounded_ok_by?: string; unbounded_ok_at?: Date;
   }> {
     if (!this.coll) throw new Error('LedgerStore not connected');
     return this.client.db(this.dbName).collection('mig_run_config');
@@ -581,6 +582,20 @@ export class LedgerStore {
   async getStoredBound(runId: string): Promise<number | null> {
     const doc = await this.rc().findOne({ _id: runId });
     return doc?.cd_upper_bound_ms ?? null;
+  }
+
+  /** Cluster-wide operator answer to the startup guard: "nothing mirrors traffic — run unbounded". */
+  async getUnboundedAck(runId: string): Promise<boolean> {
+    const doc = await this.rc().findOne({ _id: runId });
+    return doc?.unbounded_ok === true;
+  }
+
+  async setUnboundedAck(runId: string, by: string): Promise<void> {
+    await this.rc().updateOne(
+      { _id: runId },
+      { $set: { unbounded_ok: true, unbounded_ok_by: by, unbounded_ok_at: new Date() } },
+      { upsert: true },
+    );
   }
 
   async setStoredBound(runId: string, boundMs: number, setBy: string): Promise<void> {

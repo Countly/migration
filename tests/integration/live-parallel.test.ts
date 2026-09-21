@@ -103,6 +103,8 @@ describe('migration under concurrent live ingestion', () => {
     // would trip it and pause the engine (which the test would catch below).
     process.env.LEDGER_MONITOR_INTERVAL_MS = '150';
     process.env.BACKPRESSURE_ENABLED = 'false';
+    // live-parallel IS the scenario the startup guard asks about — declare no-mirror, like the operator would
+    process.env.LEDGER_UNBOUNDED_OK = 'true';
     const config = loadConfig();
 
     const mongoReader = new MongoReader({

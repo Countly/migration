@@ -82,6 +82,8 @@ export const configSchema = z.object({
             // click starts the whole fleet, pods that join later start
             // immediately, and a pod that restarts after Start stays started.
             startPaused: booleanFromEnv.default(false),
+            /** Explicit no-mirror declaration: skips the unbounded-with-live-target startup guard. */
+            unboundedOk: booleanFromEnv.default(false),
             // Dry run: sampled rehearsal against a Null-engine clone.
             dryRun: booleanFromEnv.default(false),
             dryRunSamplePct: numberFromEnv.default(2).pipe(z.number().min(0.1).max(5)),

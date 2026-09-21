@@ -729,6 +729,23 @@ function updatePhaseBadges() {
 }
 updatePhaseBadges();
 
+async function allowUnbounded(btn) {
+  if (!armed.get(btn)) {
+    armed.set(btn, true);
+    btn.dataset.label = btn.textContent;
+    btn.textContent = 'Click again to confirm: NOTHING mirrors traffic';
+    btn.classList.add('armed');
+    setTimeout(function () { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 8000);
+    return;
+  }
+  armed.delete(btn); btn.disabled = true;
+  try {
+    var res = await fetch('/control/allow-unbounded', { method: 'POST' });
+    var out = await res.json();
+    toast(out.allowed ? '\u2705 no-mirror declared \u2014 held pods release within seconds' : '\u274c ' + (out.reason || res.status));
+  } catch (e) { toast('\u274c ' + e.message); }
+}
+
 async function startFinalCheck(btn) {
   var body = {};
   var cutRaw = (document.getElementById('fc-cutover').value || '').trim();
@@ -936,17 +953,31 @@ async function tick() {
     var hint = document.getElementById('pause-hint');
     if (isPaused) {
       hint.style.display = '';
-      hint.textContent = stats.pauseReason === 'not-started'
-        ? '\u23f8 NOT STARTED \u2014 deployed and waiting. Nothing has been read, mapped or indexed yet; '
-          + 'run preflight, build indexes and rehearse first, then click Start to begin the run (all pods).'
-        : '\u23f8 ENGINE PAUSED' +
-        (stats.pauseReason === 'breaker-transient' ? ' (backend outage \u2014 auto-resume armed)' :
-         stats.pauseReason === 'breaker-data' ? ' (systematic data problem \u2014 needs you)' : ' (by operator)') +
-        ' \u2014 Retry / Replay / Waive only QUEUE work; click Resume to process it.';
+      if (stats.pauseReason === 'boundary-unset') {
+        hint.innerHTML = '\u26a0 HELD BY THE BOUNDARY GUARD \u2014 the target ClickHouse is already receiving live data and no cd bound is set. '
+          + 'If a mirror re-ingests the same requests on both sides, running unbounded WILL duplicate the overlap window. '
+          + 'Either apply a bound (Tee boundary card below), or \u2014 if NOTHING mirrors traffic between the stacks \u2014 '
+          + '<button class="btn" style="margin-left:6px" onclick="allowUnbounded(this)">Proceed unbounded</button>';
+      } else {
+        hint.textContent = stats.pauseReason === 'not-started'
+          ? '\u23f8 NOT STARTED \u2014 deployed and waiting. Nothing has been read, mapped or indexed yet; '
+            + 'run preflight, build indexes and rehearse first, then click Start to begin the run (all pods).'
+          : '\u23f8 ENGINE PAUSED' +
+          (stats.pauseReason === 'breaker-transient' ? ' (backend outage \u2014 auto-resume armed)' :
+           stats.pauseReason === 'breaker-data' ? ' (systematic data problem \u2014 needs you)' : ' (by operator)') +
+          ' \u2014 Retry / Replay / Waive only QUEUE work; click Resume to process it.';
+      }
     } else { hint.style.display = 'none'; }
     var prBtn = document.getElementById('btn-pauseresume');
     if (prBtn) {
-      if (isPaused) {
+      if (isPaused && stats.pauseReason === 'boundary-unset') {
+        // a plain Resume cannot answer the mirror question — the banner
+        // above carries the two real actions (bound / proceed unbounded)
+        prBtn.dataset.action = '';
+        prBtn.innerHTML = '\u25b6 Resume';
+        prBtn.classList.remove('primary');
+        prBtn.disabled = true;
+      } else if (isPaused) {
         prBtn.dataset.action = 'resume';
         prBtn.innerHTML = stats.pauseReason === 'not-started' ? '\u25b6 Start' : '\u25b6 Resume';
         prBtn.classList.add('primary');
@@ -1076,6 +1107,7 @@ var SCENARIOS = [
       '<li><b>LEDGER_CD_UPPER_BOUND: LEAVE UNSET.</b> The migration must take everything, including data still arriving in the old cluster \u2014 top-up passes chase it until the final drain finds nothing new.</li>' +
       '<li>Cutover-first: switch SDK ingestion to the new cluster, then run the migration (old drill data is frozen). Bulk-before-cutover: run the bulk first, switch ingestion, then let the final top-up pass drain the tail.</li>' +
       '<li>Ignore the Tee boundary card \u2014 it is for mirrored setups only. Applying a bound here would ORPHAN newly arrived data.</li>' +
+      '<li>If ingestion already switched to the new cluster before the run starts, the startup guard will hold and ask \u2014 <b>Proceed unbounded</b> is the correct answer for this scenario.</li>' +
       '<li>Sign-off: Verify + Audit vs source + content audit, DLQ pending = 0.</li>' +
       '</ul>' },
   { id: 'tee-old', name: '2 \u00b7 Mirror old \u2192 new',
