@@ -236,9 +236,17 @@ export class ChunkOrchestrator {
       if (this.envBoundMs !== null) {
         bound = this.envBoundMs; // immutable — never rolls back, no token
       } else {
-        const info = await this.d.ledger.getStoredBoundInfo(this.runId);
-        bound = info?.boundMs ?? null;
-        boundToken = info?.token ?? null;
+        const state = await this.d.ledger.getBoundState(this.runId);
+        if (state.applying) {
+          // an apply is mid-flight: the grid is PROVISIONAL (pruned/clamped
+          // chunks may still roll back) — hold nothing until it settles
+          await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+          this.logger.info({ chunk: chunk._id }, 'Bound apply in flight — claim released until the grid settles');
+          await sleep(1_000);
+          return true;
+        }
+        bound = state.boundMs;
+        boundToken = state.token;
       }
     } catch {
       // cannot read the bound — do not process on unknown configuration

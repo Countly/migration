@@ -488,6 +488,7 @@ export class LedgerStore {
   private rc(): Collection<{
     _id: string; cd_upper_bound_ms: number; set_at: Date; set_by: string;
     bound_token?: string;
+    apply_in_progress_token?: string; apply_in_progress_at?: Date;
     start_gate_open?: boolean; start_gate_opened_at?: Date; start_gate_opened_by?: string;
     unbounded_ok?: boolean; unbounded_ok_by?: string; unbounded_ok_at?: Date;
   }> {
@@ -596,6 +597,33 @@ export class LedgerStore {
     const doc = await this.rc().findOne({ _id: runId });
     if (doc?.cd_upper_bound_ms === undefined) return null;
     return { boundMs: doc.cd_upper_bound_ms, token: doc.bound_token ?? null };
+  }
+
+  /** One read for the post-claim fence: the bound, its token, and whether an apply is mid-flight (provisional grid — claims must not hold anything). */
+  async getBoundState(runId: string): Promise<{ boundMs: number | null; token: string | null; applying: boolean }> {
+    const doc = await this.rc().findOne({ _id: runId });
+    // a marker older than 10 min is a crashed apply — never let it stall the run
+    const applying = !!doc?.apply_in_progress_token
+      && (doc.apply_in_progress_at?.getTime() ?? 0) > Date.now() - 600_000;
+    return { boundMs: doc?.cd_upper_bound_ms ?? null, token: doc?.bound_token ?? null, applying };
+  }
+
+  /** Mark an apply as in flight — the post-claim fence releases every claim while this is set, so no pod can hold a provisionally pruned/clamped chunk. */
+  async setApplyMarker(runId: string, token: string): Promise<void> {
+    await this.rc().updateOne(
+      { _id: runId },
+      { $set: { apply_in_progress_token: token, apply_in_progress_at: new Date() } },
+      { upsert: true },
+    );
+  }
+
+  /** Clear only this apply's marker (token-scoped) — a competing apply's marker survives. */
+  async clearApplyMarker(runId: string, token: string): Promise<boolean> {
+    const res = await this.rc().updateOne(
+      { _id: runId, apply_in_progress_token: token },
+      { $unset: { apply_in_progress_token: '', apply_in_progress_at: '' } },
+    );
+    return res.matchedCount > 0;
   }
 
   /** Cluster-wide operator answer to the startup guard: "nothing mirrors traffic — run unbounded". */

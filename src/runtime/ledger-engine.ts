@@ -578,6 +578,15 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     // caller knowing exactly which token to roll back by
     const applyToken = `apply:${config.worker.podId}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
     let storeAttempted = false;
+    // apply marker: from here until settled, the post-claim fence releases
+    // every claim — no pod can hold a provisionally pruned/clamped chunk,
+    // so rollback's pending-only restore is complete by construction. Best-
+    // effort clear at the end; a crashed apply's marker expires in 10 min.
+    try {
+      await ledger.setApplyMarker(config.ledger.runId, applyToken);
+    } catch {
+      return { applied: false, reason: 'could not set the apply marker — retry when MongoDB answers' };
+    }
     try {
       const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, (r) => restores.push(r));
       // Compare-and-set against the prior bound this call validated: two
@@ -674,6 +683,10 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         return { applied: false, indeterminate: true, reason: `apply failed (${(err as Error).message}) AND restoring pruned chunks failed (${rollbackErrors.join('; ')}) — grid state is INDETERMINATE: when MongoDB answers, Rebuild ledger from data or re-apply the intended bound` };
       }
       return { applied: false, reason: (err as Error).message };
+    } finally {
+      // best-effort: a clear that fails leaves the marker to its 10-minute
+      // expiry — claims release (visibly, safely) until then
+      await ledger.clearApplyMarker(config.ledger.runId, applyToken).catch(() => {});
     }
   };
   app.post<{ Body: { boundMs?: number } }>('/control/apply-bound', async (req, reply) => {

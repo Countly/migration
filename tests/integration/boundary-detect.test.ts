@@ -176,6 +176,15 @@ describe('tee-boundary detection + sync parity', () => {
     const rows3 = await mc.db(DB).collection('mig_ranges').find({ run_id: RUN3b } as never).sort({ idx: 1 }).toArray();
     expect(rows3.map((r) => [r.idx, r.status])).toEqual([[1, 'pending'], [2, 'superseded']]);
 
+    // apply marker: token-scoped set/clear, stale markers ignored
+    const RUN4 = 'boundary-marker-1';
+    await ledger.setApplyMarker(RUN4, 'mtokA');
+    expect((await ledger.getBoundState(RUN4)).applying).toBe(true);
+    expect(await ledger.clearApplyMarker(RUN4, 'WRONG')).toBe(false);
+    expect((await ledger.getBoundState(RUN4)).applying).toBe(true);
+    expect(await ledger.clearApplyMarker(RUN4, 'mtokA')).toBe(true);
+    expect((await ledger.getBoundState(RUN4)).applying).toBe(false);
+
     // the CURRENT owner's rollback works
     expect(await ledger.rollbackStoredBound(RUN2, t3 as string, 1_000_000_000_000)).toBe(true);
     expect(await ledger.getStoredBound(RUN2)).toBe(1_000_000_000_000);
