@@ -67,6 +67,9 @@ export interface RebuildProgress {
   excludedBeyondCutover?: number;
   /** Drift windows (live > source) whose sampled source ids were NOT all found in the target — surplus rows were masking missing ones. */
   driftSubsetMissing?: Array<{ collection: string; lowerCd: string; upperCd: string; sampled: number; missing: number }>;
+  /** Drift coverage bookkeeping: how many drift windows were id-checked, and how many were only PARTIALLY sampled (>5k source docs). */
+  driftWindowsChecked?: number;
+  driftWindowsPartial?: number;
   /** Count-exact, checksum-clean windows where sampled source ids are missing live — documents swapped for others. */
   idCoverageMissing?: Array<{ collection: string; lowerCd: string; upperCd: string; sampled: number; missing: number }>;
   error: string | null;
@@ -275,10 +278,14 @@ export async function rebuildLedger(opts: {
             });
           }
           // A surplus count proves nothing about coverage: expired rows the
-          // target kept can MASK current source docs it is missing. Spot-check
-          // drift windows by id — sampled source ids must all exist live.
-          if (isDrift && driftChecks < 50 && mongoCount > 0) {
+          // target kept can MASK current source docs it is missing. EVERY
+          // drift window gets the id check; windows larger than the 5k
+          // sample are counted as PARTIAL so the verdict can state the
+          // exact evidence instead of implying completeness.
+          if (isDrift && mongoCount > 0) {
             driftChecks++;
+            progress.driftWindowsChecked = (progress.driftWindowsChecked ?? 0) + 1;
+            if (mongoCount > 5_000) progress.driftWindowsPartial = (progress.driftWindowsPartial ?? 0) + 1;
             const sampleIds = (await coll
               .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
               .limit(5_000).toArray()).map((d) => String(d._id));
@@ -383,9 +390,12 @@ export async function rebuildLedger(opts: {
           scope_a: scope?.a ?? null, scope_e: scope?.e ?? null, scope_n: scope?.n ?? null,
           idx, lower_cd: -1, upper_cd: 0,
           status, pod_id: null, lease_until: null, staging_table: null,
-          docs_read: status === 'done' ? nullCdIds.length : 0,
+          // the expectation is what actually LIVES (waived/pending docs are
+          // accepted exclusions) — storing the undiscounted total would make
+          // every later verifyMigration fail on an accepted waiver
+          docs_read: status === 'done' ? swept : 0,
           docs_skipped: 0,
-          rows_expected: status === 'done' ? nullCdIds.length : 0,
+          rows_expected: status === 'done' ? swept : 0,
           partitions: [], attached: [],
           attach_method: null, attempts: 0,
           last_error: status === 'failed' ? `rebuilt from data: swept=${swept} of ${nullCdIds.length} null-cd docs` : null,

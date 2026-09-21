@@ -233,11 +233,15 @@ export class ChunkOrchestrator {
         // no-mirror answer settles the question — restarts re-ask it when
         // the target is live (one click; the ack persists cluster-wide)
         const live = await this.d.staging.hasLiveCdSince(Date.now() - GUARD_LIVE_LOOKBACK_MS);
-        if (!live) {
-          // The target being empty of recent data is only provable BEFORE
-          // this run writes — persist the verdict cluster-wide so a pod
-          // starting later (or a restart) does not mistake THIS run's
-          // attached rows for live ingestion and demand a spurious ack.
+        if (live) return 'hold';
+        // No RECENT rows is inconclusive on its own — a mirrored target that
+        // has been idle for a day still holds mirror history that unbounded
+        // migration would duplicate. Only a target with NO rows at all
+        // proves no-mirror; that verdict is persisted cluster-wide (it is
+        // only provable BEFORE this run writes). Anything else holds for the
+        // operator's explicit answer.
+        const info = await this.d.staging.targetTableInfo();
+        if (!info.exists || info.rows === 0) {
           await this.d.ledger.setUnboundedAck(this.runId, `${this.podId} auto:empty-target-at-start`);
           return 'proceed';
         }

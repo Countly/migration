@@ -208,7 +208,8 @@ export async function runFinalCheck(
       out.problems.push(`${fmt((audit.driftSubsetMissing ?? []).length)} retention-drift window(s) are MISSING current source docs behind their surplus counts (${fmt(missingN)} sampled ids not found live) — surplus rows were masking gaps; do NOT decommission the old cluster.`);
     }
     if (audit.deletionDriftWindows.length > 0 && (audit.driftSubsetMissing ?? []).length === 0) {
-      out.notes.push(`${fmt(audit.deletionDriftWindows.length)} window(s) now hold MORE docs in ClickHouse than the source — the source shrank after migration (retention TTL / deletions). Sampled source ids in those windows were all found live, so the surplus is retained history, not masked gaps.`);
+      const partial = audit.driftWindowsPartial ?? 0;
+      out.notes.push(`${fmt(audit.deletionDriftWindows.length)} window(s) now hold MORE docs in ClickHouse than the source — the source shrank after migration (retention TTL / deletions). Every drift window was id-checked (${fmt(audit.driftWindowsChecked ?? 0)} checked${partial > 0 ? `; ${fmt(partial)} larger than the 5,000-id sample were checked on that sample — statistical, not exhaustive, evidence` : ' exhaustively'}) and the sampled source ids were all found live.`);
     }
     if (audit.mismatchedWindows.length === 0 && audit.checksumMismatchWindows.length === 0 && scopedPendingWindows === 0 && (audit.idCoverageMissing ?? []).length === 0) {
       out.passes.push(`Recounted ${fmt(windows)} window(s) directly against the source: every count matches, every checksum fingerprint matches, and sampled identity coverage is complete.`);

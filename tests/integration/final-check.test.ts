@@ -249,7 +249,7 @@ describe('final check: the interpreted sign-off', () => {
     await ch.insert({ table: `${DB}.drill_events`, format: 'JSONEachRow', values: [chRow('m_60', START + 60 * 12_000)] });
     const out2 = await check({ cutoverMs: CUTOVER });
     expect(out2.verdict).toBe('PASS_WITH_NOTES');
-    expect(out2.notes.join(' ')).toContain('retained history');
+    expect(out2.notes.join(' ')).toContain('found live');
 
     // a DUPLICATE row of one id must not vouch for another id's absence:
     // same total row count, one id missing — distinct coverage catches it.
