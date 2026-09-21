@@ -334,7 +334,7 @@ export class StagingManager {
    * already trip "HTML Form Exception: Field value too long" (field report).
    * 2,000 ids ≈ 52 KB — safely under default limits everywhere.
    */
-  private static readonly ID_PARAM_PAGE = 2_000;
+  static readonly ID_PARAM_PAGE = 2_000;
 
   private scopeSql(scope?: { a: string; e: string; n?: string } | null): string {
     if (!scope) return '';

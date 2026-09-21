@@ -176,19 +176,19 @@ export async function runDedupeOverlap(
           return;
         }
         if (opts.execute) {
-          // durable fence before EVERY delete page: rows attached after the
-          // matched/native snapshot would be misclassified as native cover —
-          // any run-state movement aborts BEFORE the next page deletes.
-          // (Within one page the exposure is milliseconds; an attach takes
-          // a chunk's full read-transform-insert-verify cycle.)
-          for (let i = 0; i < ids.length; i += ID_BATCH) {
+          // durable fence before EVERY actual DELETE command: the stride is
+          // the staging layer's own page size (same constant, so they cannot
+          // drift), meaning each fenced call issues exactly one command.
+          // Within one command the exposure is milliseconds; an attach takes
+          // a chunk's full read-transform-insert-verify cycle.
+          for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
             if (deps.ledger && fpBefore !== null) {
               const fpNow = await deps.ledger.runFingerprint(config.ledger.runId);
               if (fpNow !== fpBefore) {
                 throw new Error('run chunk state changed during execute — aborted before the next delete page; re-run the dry run with all pods idle');
               }
             }
-            await staging.deleteMatchingIdsInWindow(ids.slice(i, i + ID_BATCH), loMs, hiMs, scope);
+            await staging.deleteMatchingIdsInWindow(ids.slice(i, i + StagingManager.ID_PARAM_PAGE), loMs, hiMs, scope);
           }
           row.deleted += matched;
           state.totals.deleted += matched;
