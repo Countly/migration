@@ -473,6 +473,31 @@ describe('multi-collection scoping + ledger rebuild', () => {
     expect(clean.mismatchedWindows.length).toBe(0);
   }, 60_000);
 
+  it('a replayed DLQ row bumps its done chunk\'s rows_expected — strict verify stays green after the documented replay workflow', async () => {
+    const srcTs = BASE + 55 * 60_000 + 30_000; // inside a migrated window, between existing docs
+    const rawDoc = { _id: 'rp_replay', uid: 'r1', did: 'dr', ts: srcTs, cd: new Date(srcTs), sg: { v: 1 }, c: 1 };
+    // the doc failed during migration: present in the source, absent in CH
+    await mc.db(DB).collection(COLL1).insertOne(rawDoc as never);
+    await dlqStore.add([{
+      run_id: RUN, source_id: 'rp_replay', collection: COLL1, reason: 'insert_rejected',
+      error: 'transient insert failure', transform_version: 'v-old', raw_doc: rawDoc,
+    } as never]);
+
+    const chunkFilter = { run_id: RUN, collection: COLL1, status: 'done', lower_cd: { $gte: 0, $lte: srcTs }, upper_cd: { $gt: srcTs } };
+    const chunkBefore = await mc.db(DB).collection('mig_ranges').findOne(chunkFilter as never);
+    const verifyBefore = await orchestrator.verifyMigration();
+
+    const res = await orchestrator.replayDlq();
+    expect(res.replayed).toBe(1);
+
+    const chunkAfter = await mc.db(DB).collection('mig_ranges').findOne({ _id: chunkBefore!._id } as never);
+    expect(chunkAfter!.rows_expected).toBe((chunkBefore!.rows_expected as number) + 1);
+    // the repaired window is NOT reported as an over-count
+    const verifyAfter = await orchestrator.verifyMigration();
+    expect((verifyAfter.mismatches as Array<{ chunk: string }>).map((m) => m.chunk))
+      .toEqual((verifyBefore.mismatches as Array<{ chunk: string }>).map((m) => m.chunk));
+  }, 60_000);
+
   it('dry-run replay writes to the Null table, never live (field bug)', async () => {
     // A DLQ entry under the DRY run id with a perfectly good raw doc
     const goodDoc = { _id: 'dryreplay_1', uid: 'u', did: 'd', ts: BASE + 1_000, cd: new Date(BASE + 1_000), sg: { v: 1 }, c: 1 };

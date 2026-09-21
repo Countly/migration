@@ -905,6 +905,25 @@ export class LedgerStore {
     await this.pj().insertMany(docs);
   }
 
+  /**
+   * A replayed DLQ row now lives inside a done chunk's window — bump that
+   * chunk's expectation so the strict verification stays an equality after
+   * the documented replay workflow, instead of reporting the repaired
+   * window as an over-count forever. Rows whose cd no done regular chunk
+   * covers are skipped: nobody verifies those windows.
+   */
+  async incReplayExpected(runId: string, collection: string, cdMsList: number[]): Promise<number> {
+    let applied = 0;
+    for (const cdMs of cdMsList) {
+      const r = await this.c().updateOne(
+        { run_id: runId, collection, status: 'done', lower_cd: { $gte: 0, $lte: cdMs }, upper_cd: { $gt: cdMs } },
+        { $inc: { rows_expected: 1 }, $set: { updated_at: new Date() } },
+      );
+      if (r.modifiedCount > 0) applied++;
+    }
+    return applied;
+  }
+
   /** Number of prune-journal entries for a run — non-zero means unsettled destructive work. */
   async countPruneJournal(runId: string): Promise<number> {
     return this.pj().countDocuments({ run_id: runId });

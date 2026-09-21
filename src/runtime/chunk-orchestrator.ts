@@ -507,6 +507,14 @@ export class ChunkOrchestrator {
         }).catch((err) => {
           this.logger.error({ err: (err as Error).message }, 'Chunks BEYOND the bound have already executed — post-bound data may be duplicated; purge/retry those chunks');
         });
+      } else if (envBound === null && config.ledger.cdUpperBoundMs !== null) {
+        // The stored bound this pod adopted on an earlier pass was ROLLED
+        // BACK (its apply raced and unwound). A stale in-memory copy would
+        // silently skip top-ups beyond it and let the run complete with
+        // newer source documents unmigrated — drop it so this and every
+        // later pass derive the effective bound from current stored state.
+        this.logger.warn({ dropped: new Date(config.ledger.cdUpperBoundMs).toISOString() }, 'Stored run bound was rolled back — dropping the adopted in-memory bound');
+        config.ledger.cdUpperBoundMs = null;
       }
       let newChunks = 0;
       if (mapPass > 0) {
@@ -1926,6 +1934,29 @@ export class ChunkOrchestrator {
     let replayed = 0;
     let stillFailing = 0;
     let alreadyLive = 0;
+    const cdMsOf = (r: OutputRow): number => Date.parse(r.cd.replace(' ', 'T') + 'Z');
+    // A replayed row lands INSIDE a done chunk's window, whose rows_expected
+    // was computed after subtracting the DLQ'd doc — without bumping it the
+    // strict verification reports every repaired window as an over-count and
+    // the documented replay workflow can never reach a sign-off verdict.
+    // Only regular date-cd docs need it: sweep sentinels compare with < (a
+    // replayed sweep row is subtracted from regular windows by the verify's
+    // sweep index), and windows nobody verifies need no adjustment.
+    const bumpExpected = async (ms: Array<{ collection: string; cdMs: number; regular: boolean }>): Promise<void> => {
+      if (this.dryRun) return;
+      const byColl = new Map<string, number[]>();
+      for (const m of ms) {
+        if (!m.regular) continue;
+        const a = byColl.get(m.collection) ?? [];
+        a.push(m.cdMs);
+        byColl.set(m.collection, a);
+      }
+      for (const [collection, cds] of byColl) {
+        await this.d.ledger.incReplayExpected(this.runId, collection, cds).catch((e: Error) => {
+          this.logger.error({ collection, rows: cds.length, err: e.message }, 'Replayed rows inserted but rows_expected could not be updated — verification will report these windows as over-counts; note them against the replay receipt');
+        });
+      }
+    };
     this.replayProgress.running = true;
     Object.assign(this.replayProgress, { processed: 0, replayed: 0, stillFailing: 0, alreadyLive: 0 });
     try {
@@ -1943,10 +1974,14 @@ export class ChunkOrchestrator {
       this.replayProgress.processed += batch.length;
       const rows: OutputRow[] = [];
       const ids: string[] = [];
+      const metas: Array<{ collection: string; cdMs: number; regular: boolean }> = [];
       for (const entry of batch) {
         const defaults = this.d.hashResolver.resolveCollectionName(entry.collection, config.source.collectionPrefix) ?? undefined;
         const { row } = transformDocument(entry.raw_doc as SourceDocument, defaults, this.coercions);
-        if (row) { rows.push(row); ids.push(entry._id); }
+        if (row) {
+          rows.push(row); ids.push(entry._id);
+          metas.push({ collection: entry.collection, cdMs: cdMsOf(row), regular: (entry.raw_doc as { cd?: unknown }).cd instanceof Date });
+        }
         else {
           await dlq.recordRetryError(entry._id, 'still fails transform under ' + config.transform.version);
           stillFailing++;
@@ -1957,7 +1992,6 @@ export class ChunkOrchestrator {
       // fixed transform migrates DLQ'd docs from the source; replaying them
       // on top would duplicate. Marked resolved: the doc IS migrated.
       if (rows.length > 0 && !this.dryRun) {
-        const cdMsOf = (r: OutputRow): number => Date.parse(r.cd.replace(' ', 'T') + 'Z');
         const cdVals = rows.map(cdMsOf);
         const liveCd = await staging.fetchLiveCdByIds(
           rows.map((r) => r._id),
@@ -1965,11 +1999,12 @@ export class ChunkOrchestrator {
         );
         const keep: OutputRow[] = [];
         const keepIds: string[] = [];
+        const keepMetas: Array<{ collection: string; cdMs: number; regular: boolean }> = [];
         const resolvedIds: string[] = [];
         for (let j = 0; j < rows.length; j++) {
           const cdMs = Date.parse(rows[j].cd.replace(' ', 'T') + 'Z');
           if (liveCd.get(rows[j]._id) === cdMs) { resolvedIds.push(ids[j]); }
-          else { keep.push(rows[j]); keepIds.push(ids[j]); }
+          else { keep.push(rows[j]); keepIds.push(ids[j]); keepMetas.push(metas[j]); }
         }
         if (resolvedIds.length > 0) {
           await dlq.markResolved(resolvedIds, config.transform.version + ' (already live — no insert)');
@@ -1977,6 +2012,7 @@ export class ChunkOrchestrator {
         }
         rows.length = 0; rows.push(...keep);
         ids.length = 0; ids.push(...keepIds);
+        metas.length = 0; metas.push(...keepMetas);
       }
       if (rows.length === 0) { this.syncReplayProgress(replayed, stillFailing, alreadyLive); continue; }
       try {
@@ -1988,6 +2024,7 @@ export class ChunkOrchestrator {
           classifyError,
         );
         await dlq.markResolved(ids, config.transform.version);
+        await bumpExpected(metas);
         replayed += rows.length;
       } catch (err) {
         // Isolate row-level failures within the replay batch too.
@@ -1995,6 +2032,7 @@ export class ChunkOrchestrator {
           try {
             await staging.insertIntoLive([rows[j]], `dlqreplay:${batchKey}:${j}`, replayTarget);
             await dlq.markResolved([ids[j]], config.transform.version);
+            await bumpExpected([metas[j]]);
             replayed++;
           } catch (rowErr) {
             await dlq.recordRetryError(ids[j], (rowErr as Error).message.slice(0, 1_000));
