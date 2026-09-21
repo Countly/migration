@@ -34,6 +34,12 @@ const COLL = `drill_events${createHash('sha1').update('views' + APP).digest('hex
 const APP2 = 'app_dd_outage';
 const COLL2 = `drill_events${createHash('sha1').update('views' + APP2).digest('hex')}`;
 const OUTAGE = 40;
+// third app: outage bucket where migrated null-cd SWEEP rows outnumber the
+// matched rows — without the sweep correction they'd read as native evidence
+const APP3 = 'app_dd_sweep';
+const COLL3 = `drill_events${createHash('sha1').update('views' + APP3).digest('hex')}`;
+const SWEEPM = 30;
+const SWEEPN = 35;
 // base collection: no per-collection (a,e,n) scope resolvable — its matches
 // must never be deleted, even though sibling native traffic fills the table
 const BASE = 20;
@@ -64,9 +70,9 @@ describe('tee-overlap dedupe', () => {
     await mc.connect();
     await mc.db(DB).dropDatabase();
     await mc.db(`${DB}_countly`).dropDatabase();
-    await mc.db(`${DB}_countly`).collection('apps').insertMany([{ _id: APP }, { _id: APP2 }] as never[]);
+    await mc.db(`${DB}_countly`).collection('apps').insertMany([{ _id: APP }, { _id: APP2 }, { _id: APP3 }] as never[]);
     await mc.db(`${DB}_countly`).collection('events').insertMany([
-      { _id: APP, list: ['views'] }, { _id: APP2, list: ['views'] },
+      { _id: APP, list: ['views'] }, { _id: APP2, list: ['views'] }, { _id: APP3, list: ['views'] },
     ] as never[]);
 
     ch = createClient({ url: CH_URL, password: CH_PASSWORD });
@@ -200,6 +206,39 @@ describe('tee-overlap dedupe', () => {
     expect(state.status).toBe('failed');
     expect(state.error).toContain('changed since the reviewed dry run');
     expect(await chCount()).toBe(before); // refused before scanning — nothing deleted
+  });
+
+  it('migrated null-cd sweep rows never count as native evidence', async () => {
+    // outage bucket: SWEEPM mirrored docs migrated, native side never landed —
+    // but SWEEPN migrated sweep rows (null cd in Mongo, ts-derived cd in CH)
+    // sit in the same bucket. Uncorrected, native = 65 - 30 = 35 >= matched
+    // and execute would delete the only copies.
+    const sweepDocs: Record<string, unknown>[] = [];
+    const sweepRows: Record<string, unknown>[] = [];
+    for (let i = 0; i < SWEEPM; i++) {
+      const cd = FLIP + i * 1_000;
+      sweepDocs.push({ _id: `sw_mirror_${i}`, uid: 'u', did: 'd', ts: cd, cd: new Date(cd), sg: {}, c: 1 });
+      sweepRows.push({ ...chRow(`sw_mirror_${i}`, cd), a: APP3 });
+    }
+    for (let i = 0; i < SWEEPN; i++) {
+      const cd = FLIP + 30_000 + i * 100; // ts-derived cd, same hour bucket
+      sweepDocs.push({ _id: `sw_null_${i}`, uid: 'u', did: 'd', ts: cd, cd: null, sg: {}, c: 1 });
+      sweepRows.push({ ...chRow(`sw_null_${i}`, cd), a: APP3 });
+    }
+    await mc.db(DB).collection(COLL3).insertMany(sweepDocs as never[]);
+    await mc.db(DB).collection(COLL3).createIndex({ cd: 1, _id: 1 });
+    await ch.insert({ table: `${DB}.drill_events`, values: sweepRows, format: 'JSONEachRow' });
+
+    const state = newDedupeOverlapState();
+    await runDedupeOverlap({ config, logger, hashResolver }, state, { fromMs: FLIP, toMs: DONE, execute: true });
+    expect(state.status).toBe('completed');
+    const sweepRow = state.collections.find((c) => c.collection === COLL3);
+    expect(sweepRow?.deleted).toBe(0);
+    expect(sweepRow?.unsafe.every((u) => u.reason === 'no-native-evidence')).toBe(true);
+    expect(sweepRow?.unsafe.reduce((a, u) => a + u.matched, 0)).toBe(SWEEPM);
+    // every row survived — mirrors AND sweep rows
+    expect(await chCount("_id LIKE 'sw_mirror_%'")).toBe(SWEEPM);
+    expect(await chCount("_id LIKE 'sw_null_%'")).toBe(SWEEPN);
   });
 
   it('duplicateStats counts migration-duplicate groups exactly, beyond the display-sample cap', async () => {

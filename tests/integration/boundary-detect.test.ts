@@ -198,6 +198,43 @@ describe('tee-boundary detection + sync parity', () => {
     expect(await ledger.getStoredBound(RUN2)).toBe(1_000_000_000_000);
   });
 
+  it('prune journal: orphaned receipts restore under the governing bound; live applies are skipped', async () => {
+    const mk = (run: string, id: string, lo: number, up: number) => ({
+      _id: id, run_id: run, collection: 'c', idx: 0, lower_cd: lo, upper_cd: up,
+      status: 'pending', attempts: 0, created_at: new Date(), updated_at: new Date(),
+    });
+    const ranges = mc.db(DB).collection('mig_ranges');
+
+    // crash BEFORE the bound committed: deleted chunk reinserted, straddler unclamped
+    const RJ = 'prune-journal-1';
+    await ranges.insertOne(mk(RJ, 'rj:straddle', 50, 100) as never); // on-disk: clamped by the dead apply
+    await ledger.journalPruneReceipt(RJ, 'tokDead', {
+      deletedChunks: [mk(RJ, 'rj:gone', 150, 200)] as never[],
+      clampedChunks: [{ _id: 'rj:straddle', upper_cd: 180 }],
+    });
+    expect(await ledger.recoverPruneJournal(RJ, null)).toEqual({ recovered: 1, skippedLiveApply: 0 });
+    const rows = await ranges.find({ run_id: RJ } as never).sort({ _id: 1 }).toArray();
+    expect(rows.map((r) => [r._id, r.lower_cd, r.upper_cd])).toEqual([['rj:gone', 150, 200], ['rj:straddle', 50, 180]]);
+    // the journal is empty now — recovery is idempotent
+    expect(await ledger.recoverPruneJournal(RJ, null)).toEqual({ recovered: 0, skippedLiveApply: 0 });
+
+    // a LIVE apply's entry is someone's in-flight work — skipped until its marker clears
+    await ledger.journalPruneReceipt(RJ, 'tokLive', { deletedChunks: [mk(RJ, 'rj:live', 300, 400)] as never[], clampedChunks: [] });
+    expect(await ledger.acquireApplyMarker(RJ, 'tokLive')).toBe(true);
+    expect(await ledger.recoverPruneJournal(RJ, null)).toEqual({ recovered: 0, skippedLiveApply: 1 });
+    expect(await ranges.countDocuments({ _id: 'rj:live' } as never)).toBe(0);
+    expect(await ledger.clearApplyMarker(RJ, 'tokLive')).toBe(true);
+    expect(await ledger.recoverPruneJournal(RJ, null)).toEqual({ recovered: 1, skippedLiveApply: 0 });
+    expect(await ranges.countDocuments({ _id: 'rj:live' } as never)).toBe(1);
+
+    // a COMMITTED apply's leftover entry restores NOTHING — its own bound filters every chunk out
+    const RJ2 = 'prune-journal-2';
+    expect(await ledger.setStoredBoundIf(RJ2, 120, 'test', null)).toBeTruthy();
+    await ledger.journalPruneReceipt(RJ2, 'tokDone', { deletedChunks: [mk(RJ2, 'rj2:beyond', 130, 200)] as never[], clampedChunks: [] });
+    expect(await ledger.recoverPruneJournal(RJ2, null)).toEqual({ recovered: 1, skippedLiveApply: 0 });
+    expect(await ranges.countDocuments({ _id: 'rj2:beyond' } as never)).toBe(0);
+  });
+
   it('restorePrune under a winning bound never resurrects what that bound pruned', async () => {
     const RUN3 = 'boundary-restore-1';
     const mk = (idx: number, lo: number, hi: number) => ({

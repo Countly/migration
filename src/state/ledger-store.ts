@@ -798,7 +798,7 @@ export class LedgerStore {
    * Refuses when any non-pending chunk reaches past the bound — that data
    * (possibly) already moved and needs purge tooling, not a config flip.
    */
-  async pruneBeyondBound(runId: string, boundMs: number, receiptSink?: (r: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }) => void): Promise<{
+  async pruneBeyondBound(runId: string, boundMs: number, receiptSink?: (r: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }) => void | Promise<void>): Promise<{
     deleted: number; clamped: number;
     /** What the prune changed, verbatim — a raced apply restores it. */
     restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> };
@@ -822,7 +822,9 @@ export class LedgerStore {
         { projection: { _id: 1, upper_cd: 1 } },
       )
       .toArray()).map((c) => ({ _id: String(c._id), upper_cd: c.upper_cd }));
-    receiptSink?.({ deletedChunks, clampedChunks });
+    // awaited: a sink that persists the receipt durably must finish BEFORE
+    // the destructive writes below — its failure aborts the prune untouched
+    await receiptSink?.({ deletedChunks, clampedChunks });
     const del = await this.c().deleteMany({
       _id: { $in: deletedChunks.map((c) => c._id) }, status: 'pending',
     });
@@ -871,6 +873,53 @@ export class LedgerStore {
       const upper = currentBoundMs !== null ? Math.min(c.upper_cd, currentBoundMs) : c.upper_cd;
       await this.c().updateOne({ _id: c._id, status: 'pending' }, { $set: { upper_cd: upper, updated_at: new Date() } });
     }
+  }
+
+  /** Prune journal (mig_prune_journal): receipts persisted BEFORE each destructive prune. */
+  private pj(): Collection<{
+    run_id: string; token: string; created_at: Date;
+    receipt: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> };
+  }> {
+    if (!this.coll) throw new Error('LedgerStore not connected');
+    return this.client.db(this.dbName).collection('mig_prune_journal');
+  }
+
+  /** Persist a prune receipt durably — called by the sink BEFORE the prune's destructive writes. */
+  async journalPruneReceipt(runId: string, token: string, receipt: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }): Promise<void> {
+    await this.pj().insertOne({ run_id: runId, token, created_at: new Date(), receipt });
+  }
+
+  /** Remove an apply's journal entries once its outcome is settled (committed or fully rolled back). */
+  async clearPruneJournal(runId: string, token: string): Promise<void> {
+    await this.pj().deleteMany({ run_id: runId, token });
+  }
+
+  /**
+   * Restore orphaned prune journal entries — receipts whose apply died
+   * between the prune and a settled outcome. Restoration happens under the
+   * GOVERNING bound (env else stored), which makes it safe to run against
+   * ANY leftover entry: a journal whose apply actually committed its bound
+   * restores nothing (every pruned chunk is at/beyond that bound), while a
+   * crashed pre-commit apply gets its chunks back in full. Entries owned by
+   * a LIVE (non-stale) apply marker are someone's in-flight work — skipped.
+   * Runs at engine startup and before every new apply.
+   */
+  async recoverPruneJournal(runId: string, envBoundMs: number | null = null): Promise<{ recovered: number; skippedLiveApply: number }> {
+    const entries = await this.pj().find({ run_id: runId }).sort({ created_at: -1 }).toArray();
+    if (entries.length === 0) return { recovered: 0, skippedLiveApply: 0 };
+    const rc = await this.rc().findOne({ _id: runId });
+    const markerLive = rc?.apply_in_progress_token && rc.apply_in_progress_at
+      && rc.apply_in_progress_at.getTime() >= Date.now() - 600_000
+      ? rc.apply_in_progress_token : null;
+    const governing = envBoundMs ?? await this.getStoredBound(runId);
+    let recovered = 0, skippedLiveApply = 0;
+    for (const entry of entries) {
+      if (markerLive !== null && entry.token === markerLive) { skippedLiveApply++; continue; }
+      await this.restorePrune(entry.receipt, governing);
+      await this.pj().deleteOne({ run_id: runId, token: entry.token, created_at: entry.created_at });
+      recovered++;
+    }
+    return { recovered, skippedLiveApply };
   }
 
   /**

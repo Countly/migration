@@ -96,6 +96,18 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   await hashResolver.build();
   logger.info('Ledger engine: all services connected (MongoDB + ClickHouse only)');
 
+  // A bound apply that died between its prune and a settled outcome left its
+  // receipts in mig_prune_journal — restore them under the governing bound
+  // before any mapping or claiming sees the mutilated grid. (Remapping does
+  // NOT always recreate a pruned range: a collection whose regular chunks
+  // were all pruned but whose null-cd sentinel survived reads as already
+  // mapped.) A committed apply's leftover entry restores nothing — its own
+  // bound filters every chunk out — so this is safe against ANY leftover.
+  const orphanedPrunes = await ledger.recoverPruneJournal(config.ledger.runId, config.ledger.cdUpperBoundMs ?? null);
+  if (orphanedPrunes.recovered > 0) {
+    logger.warn(orphanedPrunes, 'Startup: restored prune-journal receipts left by an apply that died mid-flight — the grid holds its pre-apply chunks again');
+  }
+
   // Backpressure sampler (TTL-cached inside the orchestrator — never per-batch)
   const pressureClient = createClickHouseClient({
     url: config.target.url,
@@ -589,7 +601,18 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       return { applied: false, reason: 'could not acquire the apply marker — retry when MongoDB answers' };
     }
     try {
-      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, (r) => restores.push(r));
+      // an earlier apply that died mid-flight left journal receipts — restore
+      // them (under the governing bound, so a committed apply's leftovers are
+      // no-ops) before this apply prunes anything on top of a mutilated grid
+      const orphaned = await ledger.recoverPruneJournal(config.ledger.runId, envBoundAtBoot);
+      if (orphaned.recovered > 0) logger.warn(orphaned, 'Restored prune-journal receipts from an earlier apply that died mid-flight');
+      // receipts land in the journal BEFORE each destructive write: a crash
+      // anywhere past this point is recoverable from storage, not memory
+      const journalSink = async (r: { deletedChunks: import('../state/ledger-store.ts').ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }): Promise<void> => {
+        await ledger.journalPruneReceipt(config.ledger.runId, applyToken, r);
+        restores.push(r);
+      };
+      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, journalSink);
       // Compare-and-set against the prior bound this call validated: two
       // concurrent applies cannot both win — the loser rolls its prune back.
       storeAttempted = true;
@@ -609,6 +632,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         if (rollbackErrors.length > 0) {
           return { applied: false, indeterminate: true, reason: `another bound application raced this one and restoring this call's prune failed (${rollbackErrors.join('; ')}) — grid state is INDETERMINATE: Rebuild ledger from data or re-apply deliberately` };
         }
+        await ledger.clearPruneJournal(config.ledger.runId, applyToken).catch(() => {});
         return { applied: false, reason: 'another bound application raced this one (the stored bound changed mid-apply) — this call was rolled back; re-read the current bound and retry deliberately' };
       }
       // Post-store verification: a claim that raced the fence shows up as a
@@ -616,13 +640,16 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       // active claim. EVERY receipt collected so far rolls back on failure —
       // no half-applied state and no grid gaps, whichever step failed.
       try {
-        const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, (r) => restores.push(r));
+        const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, journalSink);
         const claimsAfter = await ledger.activeClaims(config.ledger.runId);
         if (claimsAfter.length > 0) {
           throw new Error(`pods claimed chunks during apply (${claimsAfter.map((c) => `${c.pod}×${c.count}`).join(', ')})`);
         }
         const total = { deleted: (pruned.deleted + pruned2.deleted), clamped: (pruned.clamped + pruned2.clamped) };
         logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), source, ...total }, 'Run bound applied — pods adopt it on their next map pass');
+        // settled: the committed bound now governs — leftover journal entries
+        // would restore nothing anyway, but clear them to keep recovery quiet
+        await ledger.clearPruneJournal(config.ledger.runId, applyToken).catch(() => {});
         // a guard-held engine has its answer now
         if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume(true);
         return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
@@ -652,6 +679,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
           // an unverified rollback must never claim restoration
           return { applied: false, indeterminate: true, reason: `apply failed (${(raceErr as Error).message}) AND the rollback itself failed (${rollbackErrors.join('; ')}) — bound/grid state is INDETERMINATE: when MongoDB answers, read GET /api/boundary and mig_run_config, then re-apply the intended bound or Rebuild ledger from data` };
         }
+        await ledger.clearPruneJournal(config.ledger.runId, applyToken).catch(() => {});
         return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (${boundRolledBack ? 'bound and pruned chunks restored' : 'a newer bound governs; chunks restored under it'}) (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
       }
     } catch (err) {
@@ -683,6 +711,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       if (rollbackErrors.length > 0) {
         return { applied: false, indeterminate: true, reason: `apply failed (${(err as Error).message}) AND restoring pruned chunks failed (${rollbackErrors.join('; ')}) — grid state is INDETERMINATE: when MongoDB answers, Rebuild ledger from data or re-apply the intended bound` };
       }
+      await ledger.clearPruneJournal(config.ledger.runId, applyToken).catch(() => {});
       return { applied: false, reason: (err as Error).message };
     } finally {
       // best-effort: a clear that fails leaves the marker to its 10-minute

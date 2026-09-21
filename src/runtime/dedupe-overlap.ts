@@ -92,6 +92,8 @@ export function newDedupeOverlapState(): DedupeOverlapState {
 export const effectiveSlackPct = (v: number | undefined): number => Math.min(5, Math.max(0, v ?? 0));
 
 const ID_BATCH = 50_000;
+// same shape cap as the rebuild: null-cd docs are outliers by construction
+const MAX_NULLCD_IDS = 1_000_000;
 const BUCKET_MS = 3_600_000;
 /** Hard ceiling on one bucket's ids held in memory — pick a smaller window if hit. */
 const MAX_BUCKET_IDS = 3_000_000;
@@ -150,6 +152,32 @@ export async function runDedupeOverlap(
       const scope = defaults ? chScopeOf(defaults) : null;
       const row: DedupeCollectionRow = { collection, scoped: !!scope, mongoDocsInWindow: 0, chMatched: 0, deleted: 0, unsafe: [] };
 
+      // Migrated null-cd docs land in ClickHouse at a ts-DERIVED cd — inside
+      // the overlap window they are counted by the live totals below, but the
+      // cd-ordered cursor never selects their Mongo docs, so uncorrected they
+      // would read as NATIVE counterparts and could vouch for deleting rows
+      // that are the only copy of their event. Count them per hour bucket and
+      // subtract them from the evidence. (Only scoped collections matter:
+      // unscoped ones never reach the evidence test.)
+      const sweepByBucket = new Map<number, number>();
+      if (scope) {
+        const nullCdIds: string[] = [];
+        const nullCursor = coll.find({ cd: null }, { projection: { _id: 1 } }).batchSize(10_000);
+        for await (const doc of nullCursor) {
+          nullCdIds.push(String(doc._id));
+          if (nullCdIds.length > MAX_NULLCD_IDS) {
+            throw new Error(`${collection}: more than ${MAX_NULLCD_IDS.toLocaleString('en-US')} null-cd documents — their sweep rows cannot be separated from native evidence; this collection needs manual review`);
+          }
+        }
+        if (nullCdIds.length > 0) {
+          const liveNullCd = await staging.fetchLiveCdByIds(nullCdIds, { loMs: opts.fromMs, hiMs: opts.toMs - 1 }, scope);
+          for (const cdMs of liveNullCd.values()) {
+            const b = Math.floor(cdMs / BUCKET_MS) * BUCKET_MS;
+            sweepByBucket.set(b, (sweepByBucket.get(b) ?? 0) + 1);
+          }
+        }
+      }
+
       const processBucket = async (ids: string[], loMs: number, hiMs: number): Promise<void> => {
         if (ids.length === 0) return;
         let matched = 0;
@@ -173,7 +201,9 @@ export async function runDedupeOverlap(
         // after the matched rows is the native side. Falling short means some
         // migrated rows are the ONLY copy of their event — never delete those.
         const liveTotal = await staging.countLiveInCdRange(loMs, hiMs, scope);
-        const native = liveTotal - matched;
+        // sweep rows are MIGRATED, not native — they never count as evidence
+        const sweep = sweepByBucket.get(Math.floor(loMs / BUCKET_MS) * BUCKET_MS) ?? 0;
+        const native = liveTotal - matched - sweep;
         // strict by default: every matched row needs a native counterpart in
         // its bucket. slackPct (operator-chosen, ≤5%) only absorbs
         // ingest-timing straddle at bucket edges; zero natives is the outage
