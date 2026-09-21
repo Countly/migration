@@ -647,10 +647,17 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     } catch (err) {
       // lost-ack store: the token was minted BEFORE the write, so a store
       // whose acknowledgement was lost can still be unwound by token — and
-      // its fence casualties restored — best-effort before anything else
+      // its fence casualties restored. These compensations FAIL CLOSED: a
+      // failure here means a chunk may sit terminally superseded under a
+      // bound that no longer exists, which must never read as an ordinary
+      // rolled-back response.
+      const lostAckErrors: string[] = [];
       if (storeAttempted) {
-        await ledger.rollbackStoredBound(config.ledger.runId, applyToken, priorBound).catch(() => {});
-        await ledger.restoreSuperseded(config.ledger.runId, applyToken).catch(() => {});
+        await ledger.rollbackStoredBound(config.ledger.runId, applyToken, priorBound).catch((e: Error) => lostAckErrors.push(`bound: ${e.message}`));
+        await ledger.restoreSuperseded(config.ledger.runId, applyToken).catch((e: Error) => lostAckErrors.push(`superseded: ${e.message}`));
+      }
+      if (lostAckErrors.length > 0) {
+        return { applied: false, indeterminate: true, reason: `apply failed (${(err as Error).message}) AND unwinding the possibly-persisted store failed (${lostAckErrors.join('; ')}) — a chunk may remain superseded under a rolled-back bound: when MongoDB answers, Rebuild ledger from data or re-apply the intended bound` };
       }
       // restore ONLY under the bound that actually governs — a lost CAS ack
       // may have persisted the new bound, so an assumed prior would restore
