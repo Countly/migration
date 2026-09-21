@@ -601,9 +601,17 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (${boundRolledBack ? 'bound and pruned chunks restored' : 'a newer bound governs; chunks restored under it'}) (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
       }
     } catch (err) {
+      // restore ONLY under the bound that actually governs — a lost CAS ack
+      // may have persisted the new bound, so an assumed prior would restore
+      // chunks that bound intentionally pruned. Unreadable = untouched.
+      let governing: number | null;
+      try {
+        governing = await ledger.getStoredBound(config.ledger.runId);
+      } catch {
+        return { applied: false, indeterminate: true, reason: `apply failed (${(err as Error).message}) AND the governing bound could not be read — nothing was restored (fail closed); when MongoDB answers, read mig_run_config, then re-apply deliberately or Rebuild ledger from data` };
+      }
       const rollbackErrors: string[] = [];
-      const current = await ledger.getStoredBound(config.ledger.runId).catch(() => priorBound);
-      for (const r of restores.reverse()) await ledger.restorePrune(r, current).catch((e: Error) => rollbackErrors.push(e.message));
+      for (const r of restores.reverse()) await ledger.restorePrune(r, governing).catch((e: Error) => rollbackErrors.push(e.message));
       if (rollbackErrors.length > 0) {
         return { applied: false, indeterminate: true, reason: `apply failed (${(err as Error).message}) AND restoring pruned chunks failed (${rollbackErrors.join('; ')}) — grid state is INDETERMINATE: when MongoDB answers, Rebuild ledger from data or re-apply the intended bound` };
       }

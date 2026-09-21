@@ -254,11 +254,16 @@ export async function runFinalCheck(
 
     // ── Verdict ────────────────────────────────────────────────────────────
     out.verdict = out.problems.length > 0 ? 'FAIL' : out.notes.length > 0 ? 'PASS_WITH_NOTES' : 'PASS';
+    // Only the DEEP check may authorize teardown — quick mode deliberately
+    // skips the source recount, so a clean quick result is routine
+    // confidence, never a license to delete the source.
     out.headline = out.verdict === 'FAIL'
       ? `DO NOT decommission the old cluster yet — ${out.problems.length} problem(s) below need action first.`
-      : out.verdict === 'PASS_WITH_NOTES'
-        ? 'Safe to decommission the old cluster after reading the notes below.'
-        : 'ClickHouse verifiably holds everything the source holds — safe to decommission the old cluster.';
+      : !deep
+        ? 'No problems found at quick depth — routine confidence only. Decommissioning the source still requires the DEEP check (the pre-teardown gate).'
+        : out.verdict === 'PASS_WITH_NOTES'
+          ? 'Safe to decommission the old cluster after reading the notes below.'
+          : 'ClickHouse verifiably holds everything the source holds — safe to decommission the old cluster.';
     out.status = 'completed';
     out.phase = 'done';
     out.finishedAt = Date.now();

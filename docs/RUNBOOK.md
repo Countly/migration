@@ -103,7 +103,8 @@ Two tiers:
   verification (every migrated window's live count against the recorded
   count, plus duplicate attribution) + random content samples against the
   source. Catches everything that can happen AFTER reading. Capped at
-  PASS WITH NOTES — the note names what it did not re-prove.
+  PASS WITH NOTES, and its headline never authorizes teardown — the note
+  names what it did not re-prove.
 - **Deep** (opt-in — hours on large runs): additionally recounts EVERY
   window against the source with cd-checksum fingerprints and sampled
   identity coverage. It is not distrust of the ledger — chunk reads are
