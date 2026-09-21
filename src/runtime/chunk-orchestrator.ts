@@ -240,12 +240,28 @@ export class ChunkOrchestrator {
     }
     if (bound === null) return false;
     if (chunk.lower_cd >= bound) {
-      await this.d.ledger.supersede(chunk._id, this.podId).catch(() => {});
+      try {
+        await this.d.ledger.supersede(chunk._id, this.podId);
+      } catch {
+        // failing to persist the supersede must not process the chunk:
+        // release (or let the lease expire) — the next claimer re-runs
+        // this fence against durable state
+        await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+      }
       this.logger.warn({ chunk: chunk._id, bound }, 'Claimed chunk lies beyond the stored bound — superseded, never read');
       return true;
     }
     if (chunk.upper_cd > bound) {
-      await this.d.ledger.clampUpper(chunk._id, bound).catch(() => {});
+      try {
+        await this.d.ledger.clampUpper(chunk._id, bound);
+      } catch (err) {
+        // an in-memory-only clamp would let the chunk complete with counts
+        // for a range its durable document does not describe — release the
+        // claim instead and let the next claimer retry the clamp
+        this.logger.warn({ chunk: chunk._id, err: (err as Error).message }, 'Durable clamp failed — releasing the claim untouched');
+        await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+        return true;
+      }
       chunk.upper_cd = bound;
       this.logger.warn({ chunk: chunk._id, bound }, 'Claimed straddler clamped to the stored bound before reading');
     }

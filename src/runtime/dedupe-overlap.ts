@@ -176,17 +176,18 @@ export async function runDedupeOverlap(
           return;
         }
         if (opts.execute) {
-          // durable fence at the last moment: rows attached between this
-          // bucket's matched snapshot and its live count would be
-          // misclassified as native cover — if the run state moved AT ALL,
-          // abort before deleting under changed evidence
-          if (deps.ledger && fpBefore !== null) {
-            const fpNow = await deps.ledger.runFingerprint(config.ledger.runId);
-            if (fpNow !== fpBefore) {
-              throw new Error('run chunk state changed during execute — aborted before deleting under changed evidence; re-run the dry run with all pods idle');
-            }
-          }
+          // durable fence before EVERY delete page: rows attached after the
+          // matched/native snapshot would be misclassified as native cover —
+          // any run-state movement aborts BEFORE the next page deletes.
+          // (Within one page the exposure is milliseconds; an attach takes
+          // a chunk's full read-transform-insert-verify cycle.)
           for (let i = 0; i < ids.length; i += ID_BATCH) {
+            if (deps.ledger && fpBefore !== null) {
+              const fpNow = await deps.ledger.runFingerprint(config.ledger.runId);
+              if (fpNow !== fpBefore) {
+                throw new Error('run chunk state changed during execute — aborted before the next delete page; re-run the dry run with all pods idle');
+              }
+            }
             await staging.deleteMatchingIdsInWindow(ids.slice(i, i + ID_BATCH), loMs, hiMs, scope);
           }
           row.deleted += matched;

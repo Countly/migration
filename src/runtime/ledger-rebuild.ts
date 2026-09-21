@@ -371,9 +371,13 @@ export async function rebuildLedger(opts: {
           scope_a: scope?.a ?? null, scope_e: scope?.e ?? null, scope_n: scope?.n ?? null,
           idx, lower_cd: b.lowerCd, upper_cd: b.upperCd,
           status, pod_id: null, lease_until: null, staging_table: null,
-          docs_read: status === 'done' ? mongoCount : 0,
+          // the ACCEPTED expectation is what actually lives — a done window
+          // whose shortfall is its own waived/pending DLQ docs must not
+          // store the undiscounted source count, or every later strict
+          // verification fails on an explicitly accepted exclusion
+          docs_read: status === 'done' ? live : 0,
           docs_skipped: 0,
-          rows_expected: status === 'done' ? mongoCount : 0,
+          rows_expected: status === 'done' ? live : 0,
           partitions: [], attached: [],
           attach_method: null, attempts: 0,
           last_error: status === 'failed' ? `rebuilt from data: live=${live} mongo=${mongoCount} — retry purges and redoes this window` : null,
