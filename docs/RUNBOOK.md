@@ -59,6 +59,24 @@ once, for minutes, at cutover — never for the migration.
 6. **Finish** — all chunks done → Final check green → sign-off →
    revert Kafka retention → decommission old cluster.
 
+## Choose your scenario first
+
+The one decision that changes the configuration is whether a TEE mirrors
+the same requests into both stacks. Everything else is shared machinery.
+
+| # | Topology | LEDGER_CD_UPPER_BOUND | Ingestion switch | New data arriving in old Mongo | Sign-off |
+|---|---|---|---|---|---|
+| 1 | Two clusters, **no mirroring** (plain switch) | **UNSET** | Before the migration (cutover-first) or after the bulk (bulk-before-cutover + final drain) | **Migrated** — top-up passes chase it until the drain finds nothing | Verify + audits, DLQ = 0 |
+| 2 | Two clusters, **mirror old → new** (old primary) | **SET** = tee flip | At sign-off | **Never migrated past the bound** — it is the tee's copy (different _id/cd; duplicates would be undetectable) | Verify + audits for pre-bound; dashboard comparison + sync parity for post-bound |
+| 3 | Two clusters, **mirror new → old** (new primary, old = rollback net) | **SET** = the moment new became primary | Already happened at the flip | Same as 2 — post-flip old-side docs are mirror copies | Same as 2 |
+| 4 | **Single cluster, in-place upgrade** (drill mongo → ClickHouse in background) | **UNSET** | The upgrade itself is the switch; old drill collections freeze | Transition tail drained by top-up; no tee → nothing to duplicate | Verify + audits, DLQ = 0 (live-parallel path; backpressure protects prod CH) |
+
+Scenario is also selectable on the dashboard's **Migration Guide** tab —
+it renders the per-scenario checklist and states the bound requirement.
+For 2 and 3: use **Detect boundary** + **Apply this bound to the run**
+(one click covers all pods), verify the `bounded · cd < …` badge on every
+pod, and keep re-running sync parity during the validation window.
+
 ## Incident responses
 
 | Incident | What happens | Operator action |
@@ -162,30 +180,14 @@ incident.
 drill → optionally `bench/seed-failures.ts` for a full failure-scenario drill
 (breaker, DLQ, monitor, retry-failed).
 
-## Choose your scenario first
-
-The one decision that changes the configuration is whether a TEE mirrors
-the same requests into both stacks. Everything else is shared machinery.
-
-| # | Topology | LEDGER_CD_UPPER_BOUND | Ingestion switch | New data arriving in old Mongo | Sign-off |
-|---|---|---|---|---|---|
-| 1 | Two clusters, **no mirroring** (plain switch) | **UNSET** | Before the migration (cutover-first) or after the bulk (bulk-before-cutover + final drain) | **Migrated** — top-up passes chase it until the drain finds nothing | Verify + audits, DLQ = 0 |
-| 2 | Two clusters, **mirror old → new** (old primary) | **SET** = tee flip | At sign-off | **Never migrated past the bound** — it is the tee's copy (different _id/cd; duplicates would be undetectable) | Verify + audits for pre-bound; dashboard comparison + sync parity for post-bound |
-| 3 | Two clusters, **mirror new → old** (new primary, old = rollback net) | **SET** = the moment new became primary | Already happened at the flip | Same as 2 — post-flip old-side docs are mirror copies | Same as 2 |
-| 4 | **Single cluster, in-place upgrade** (drill mongo → ClickHouse in background) | **UNSET** | The upgrade itself is the switch; old drill collections freeze | Transition tail drained by top-up; no tee → nothing to duplicate | Verify + audits, DLQ = 0 (live-parallel path; backpressure protects prod CH) |
-
-Scenario is also selectable on the dashboard's **Migration Guide** tab —
-it renders the per-scenario checklist and states the bound requirement.
-For 2 and 3: use **Detect boundary** + **Apply this bound to the run**
-(one click covers all pods), verify the `bounded · cd < …` badge on every
-pod, and keep re-running sync parity during the validation window.
-
 ## Clone-source variant (migrate from a frozen copy)
 
-A robust pattern: pause old ingestion, clone the source MongoDB onto the
-new machine, then resume ingestion on the NEW stack (optionally mirroring
-back to the old one as the rollback net) and migrate from the clone. SDK
-offline queues absorb the pause. Properties worth knowing:
+An OPTIONAL variant of scenarios 1–3 — most migrations run against the
+LIVE source cluster, which is fully supported (in unbounded modes, top-up
+passes keep chasing data that arrives during the run). The variant: pause
+old ingestion, clone the source MongoDB, resume ingestion on the NEW stack
+(optionally mirroring back to the old one as the rollback net), and migrate
+from the clone. SDK offline queues absorb the pause. Properties:
 
 - The source is frozen at the clone moment, so no bound is needed and top-up
   finds nothing — the startup guard will still ask (the target ingests live
