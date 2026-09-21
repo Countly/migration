@@ -734,8 +734,12 @@ export class LedgerStore {
         { projection: { _id: 1, upper_cd: 1 } },
       )
       .toArray()).map((c) => ({ _id: String(c._id), upper_cd: c.upper_cd }));
+    // clamp ONLY the snapshotted ids: a straddler inserted after the
+    // snapshot must not be modified outside the receipt (a rollback would
+    // leave it truncated under a rejected bound) — the insert-path
+    // self-prune and the post-claim fence own anything newer
     const clamp = await this.c().updateMany(
-      { run_id: runId, lower_cd: { $gte: 0, $lt: boundMs }, upper_cd: { $gt: boundMs }, status: 'pending' },
+      { _id: { $in: clampedChunks.map((c) => c._id) }, status: 'pending' },
       { $set: { upper_cd: boundMs, updated_at: new Date() } },
     );
     return { deleted: del.deletedCount ?? 0, clamped: clamp.modifiedCount ?? 0, restore: { deletedChunks, clampedChunks } };

@@ -265,12 +265,13 @@ export class ChunkOrchestrator {
         if (live) return 'hold';
         // No RECENT rows is inconclusive on its own — a mirrored target that
         // has been idle for a day still holds mirror history that unbounded
-        // migration would duplicate. Only a target with NO rows at all
-        // proves no-mirror; that verdict is persisted cluster-wide (it is
-        // only provable BEFORE this run writes). Anything else holds for the
-        // operator's explicit answer.
-        const info = await this.d.staging.targetTableInfo();
-        if (!info.exists || info.rows === 0) {
+        // migration would duplicate. Only an AUTHORITATIVE zero-row (or
+        // absent-table) answer proves no-mirror; an operational failure of
+        // the count throws in liveRowCountStrict and is caught by the outer
+        // evaluate() handler, which HOLDS. The verdict is persisted
+        // cluster-wide (only provable BEFORE this run writes).
+        const totalRows = await this.d.staging.liveRowCountStrict();
+        if (totalRows === null || totalRows === 0) {
           await this.d.ledger.setUnboundedAck(this.runId, `${this.podId} auto:empty-target-at-start`);
           return 'proceed';
         }

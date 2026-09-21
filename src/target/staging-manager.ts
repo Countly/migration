@@ -488,6 +488,27 @@ export class StagingManager {
   }
 
 
+  /**
+   * STRICT live row count for the boundary guard: operational failures
+   * THROW (they must hold the guard, not read as empty); a genuinely absent
+   * table returns null — authoritatively nothing to duplicate.
+   */
+  async liveRowCountStrict(): Promise<number | null> {
+    try {
+      const res = await this.ch().query({
+        query: `SELECT count() AS c FROM ${this.fq(this.config.table)}`,
+        format: 'JSONEachRow',
+      });
+      const rows = await res.json<{ c: string }>();
+      return Number(rows[0]?.c ?? 0);
+    } catch (err) {
+      const msg = (err as Error).message ?? '';
+      const code = (err as { code?: string | number }).code;
+      if (String(code) === '60' || msg.includes('UNKNOWN_TABLE') || msg.includes("doesn't exist") || msg.includes('does not exist')) return null;
+      throw err;
+    }
+  }
+
   /** Does the live target table exist / how many rows does it hold? */
   async targetTableInfo(): Promise<{ exists: boolean; rows: number }> {
     try {
