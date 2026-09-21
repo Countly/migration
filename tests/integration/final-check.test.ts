@@ -261,6 +261,20 @@ describe('final check: the interpreted sign-off', () => {
     await ch.insert({ table: `${DB}.drill_events`, format: 'JSONEachRow', values: [chRow('m_70', START + 70 * 12_000), chRow('m_71', START + 71 * 12_000)] });
   });
 
+  it('a PARTIALLY swept null-cd sentinel surfaces as a mismatch and FAILS', async () => {
+    const ts = START + 100 * 12_000;
+    await mc.db(DB).collection(COLL).insertMany([
+      { _id: 'n_0', uid: 'u', did: 'd', ts, cd: null, sg: {}, c: 1 },
+      { _id: 'n_1', uid: 'u', did: 'd', ts: ts + 1_000, cd: null, sg: {}, c: 1 },
+    ] as never[]);
+    await ch.insert({ table: `${DB}.drill_events`, format: 'JSONEachRow', values: [chRow('n_0', ts)] }); // one of two swept
+    const out = await check({ cutoverMs: CUTOVER });
+    expect(out.verdict).toBe('FAIL');
+    expect(out.audit?.mismatchedWindows.some((w) => w.lowerCd === 'null-cd sweep')).toBe(true);
+    await mc.db(DB).collection(COLL).deleteMany({ _id: { $in: ['n_0', 'n_1'] } } as never);
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'n_0'` });
+  });
+
   it('a WHOLE window missing from the target → FAIL (the audit calls it pending, the check must not)', async () => {
     // stale ledger says done, but every row of the window is gone from CH
     await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id LIKE 'm\\_%'` });

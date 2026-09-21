@@ -71,8 +71,8 @@ export interface DedupeOverlapState {
   toMs: number | null;
   collections: DedupeCollectionRow[];
   totals: { mongoDocsInWindow: number; chMatched: number; deleted: number; unsafeMatched: number };
-  /** Window of the last COMPLETED dry run — the license to execute. */
-  lastDryRun: { fromMs: number; toMs: number; chMatched: number; at: number } | null;
+  /** Window + slack of the last COMPLETED dry run — the license to execute (same window AND same slack). */
+  lastDryRun: { fromMs: number; toMs: number; slackPct: number; chMatched: number; at: number } | null;
   error: string | null;
   startedAt: number | null;
   finishedAt: number | null;
@@ -85,6 +85,8 @@ export function newDedupeOverlapState(): DedupeOverlapState {
     lastDryRun: null, error: null, startedAt: null, finishedAt: null,
   };
 }
+
+export const effectiveSlackPct = (v: number | undefined): number => Math.min(5, Math.max(0, v ?? 0));
 
 const ID_BATCH = 50_000;
 const BUCKET_MS = 3_600_000;
@@ -136,7 +138,9 @@ export async function runDedupeOverlap(
         if (ids.length === 0) return;
         let matched = 0;
         for (let i = 0; i < ids.length; i += ID_BATCH) {
-          matched += await staging.countMatchingIdsInWindow(ids.slice(i, i + ID_BATCH), loMs, hiMs);
+          // scoped: a same-_id row in a SIBLING collection must neither count
+          // as this collection's match nor be touched by its delete
+          matched += await staging.countMatchingIdsInWindow(ids.slice(i, i + ID_BATCH), loMs, hiMs, scope);
         }
         row.chMatched += matched;
         state.totals.chMatched += matched;
@@ -158,7 +162,7 @@ export async function runDedupeOverlap(
         // its bucket. slackPct (operator-chosen, ≤5%) only absorbs
         // ingest-timing straddle at bucket edges; zero natives is the outage
         // signature outright and no slack ever waves it through
-        const slack = Math.ceil(matched * (Math.min(5, Math.max(0, opts.slackPct ?? 0)) / 100));
+        const slack = Math.ceil(matched * (effectiveSlackPct(opts.slackPct) / 100));
         if (native < matched - slack || native <= 0) {
           row.unsafe.push({ fromMs: loMs, toMs: hiMs, matched, native, reason: 'no-native-evidence' });
           state.totals.unsafeMatched += matched;
@@ -166,7 +170,7 @@ export async function runDedupeOverlap(
         }
         if (opts.execute) {
           for (let i = 0; i < ids.length; i += ID_BATCH) {
-            await staging.deleteMatchingIdsInWindow(ids.slice(i, i + ID_BATCH), loMs, hiMs);
+            await staging.deleteMatchingIdsInWindow(ids.slice(i, i + ID_BATCH), loMs, hiMs, scope);
           }
           row.deleted += matched;
           state.totals.deleted += matched;
@@ -202,7 +206,7 @@ export async function runDedupeOverlap(
     state.phase = 'done';
     state.finishedAt = Date.now();
     if (!opts.execute) {
-      state.lastDryRun = { fromMs: opts.fromMs, toMs: opts.toMs, chMatched: state.totals.chMatched, at: Date.now() };
+      state.lastDryRun = { fromMs: opts.fromMs, toMs: opts.toMs, slackPct: effectiveSlackPct(opts.slackPct), chMatched: state.totals.chMatched, at: Date.now() };
     }
     logger.info(
       { execute: opts.execute, ...state.totals, collections: state.collections.length },

@@ -100,6 +100,9 @@ describe('tee-overlap dedupe', () => {
     }
     // extra native rows with no mirror copy (mirror dropped them) — survive
     for (let i = 0; i < 10; i++) chRows.push(chRow(`native_only_${i}`, FLIP + 500_000 + i * 1_000));
+    // a SIBLING collection's row sharing an _id with a mirrored doc, in the
+    // window — scoped deletes must never touch it
+    chRows.push({ ...chRow('mirror_10', FLIP + 10 * 20_000 + 50), a: 'sibling_app' });
     await mc.db(DB).collection(COLL).insertMany(mongoDocs as never[]);
     await mc.db(DB).collection(COLL).createIndex({ cd: 1, _id: 1 });
     await ch.insert({ table: `${DB}.drill_events`, values: chRows, format: 'JSONEachRow' });
@@ -157,7 +160,7 @@ describe('tee-overlap dedupe', () => {
     await runDedupeOverlap({ config, logger, hashResolver }, state, { fromMs: FLIP, toMs: DONE, execute: false });
     expect(state.status).toBe('completed');
     expect(state.totals).toEqual({ mongoDocsInWindow: 150 + OUTAGE + BASE, chMatched: 150 + OUTAGE + BASE, deleted: 0, unsafeMatched: OUTAGE + BASE });
-    expect(state.lastDryRun).toMatchObject({ fromMs: FLIP, toMs: DONE, chMatched: 150 + OUTAGE + BASE });
+    expect(state.lastDryRun).toMatchObject({ fromMs: FLIP, toMs: DONE, slackPct: 0, chMatched: 150 + OUTAGE + BASE });
     const outageRow = state.collections.find((c) => c.collection === COLL2);
     expect(outageRow?.unsafe.length).toBeGreaterThan(0);
     expect(outageRow?.unsafe.reduce((a, u) => a + u.matched, 0)).toBe(OUTAGE);
@@ -166,7 +169,7 @@ describe('tee-overlap dedupe', () => {
     expect(baseRow?.scoped).toBe(false);
     expect(baseRow?.unsafe.every((u) => u.reason === 'no-scope')).toBe(true);
     expect(baseRow?.unsafe.reduce((a, u) => a + u.matched, 0)).toBe(BASE);
-    expect(await chCount()).toBe(200 + 150 + 150 + 10 + OUTAGE + BASE);
+    expect(await chCount()).toBe(200 + 150 + 150 + 10 + OUTAGE + BASE + 1);
   });
 
   it('execute deletes exactly the evidenced duplicates; unsafe buckets, native and pre-flip rows survive', async () => {
@@ -174,12 +177,15 @@ describe('tee-overlap dedupe', () => {
     await runDedupeOverlap({ config, logger, hashResolver }, state, { fromMs: FLIP, toMs: DONE, execute: true });
     expect(state.status).toBe('completed');
     expect(state.totals).toEqual({ mongoDocsInWindow: 150 + OUTAGE + BASE, chMatched: 150 + OUTAGE + BASE, deleted: 150, unsafeMatched: OUTAGE + BASE });
-    expect(await chCount("_id LIKE 'mirror_%'")).toBe(0);
+    expect(await chCount("_id LIKE 'mirror_%'")).toBe(1); // only the sibling collection's same-_id row remains
     expect(await chCount("_id LIKE 'native_%'")).toBe(160);
     expect(await chCount("_id LIKE 'hist_%'")).toBe(200);
     // the only-copy rows are untouched — the safety check protected them
     expect(await chCount("_id LIKE 'only_%'")).toBe(OUTAGE);
     // unscoped base-collection rows: sibling traffic is not evidence
     expect(await chCount("_id LIKE 'base_%'")).toBe(BASE);
+    // the sibling collection's same-_id row survives the scoped delete
+    expect(await chCount("_id = 'mirror_10' AND a = 'sibling_app'")).toBe(1);
+    expect(await chCount("_id = 'mirror_10'")).toBe(1);
   });
 });

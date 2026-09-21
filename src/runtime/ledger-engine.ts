@@ -22,7 +22,7 @@ import { ChunkOrchestrator } from './chunk-orchestrator.ts';
 import { wireExitOnComplete } from './exit-on-complete.ts';
 import { rebuildLedger, newRebuildProgress, type RebuildProgress } from './ledger-rebuild.ts';
 import { runFinalCheck, newFinalCheckResult, renderFinalCheckText, type FinalCheckResult } from './final-check.ts';
-import { runDedupeOverlap, newDedupeOverlapState, type DedupeOverlapState } from './dedupe-overlap.ts';
+import { runDedupeOverlap, newDedupeOverlapState, effectiveSlackPct, type DedupeOverlapState } from './dedupe-overlap.ts';
 
 export async function runLedgerEngine(config: Config, logger: Logger): Promise<void> {
   logger.info({ engine: 'ledger', runId: config.ledger.runId }, 'Starting ledger engine (no Redis)');
@@ -441,13 +441,13 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       return { started: false, reason: 'pass the overlap window as {fromMs, toMs} (epoch ms): fromMs = the tee flip / IP swap, toMs = migration completion' };
     }
     const execute = req.body?.execute === true;
+    const slackPct = typeof req.body?.slackPct === 'number' ? req.body.slackPct : undefined;
     if (execute) {
       const dry = dedupeState.lastDryRun;
-      if (!dry || dry.fromMs !== fromMs || dry.toMs !== toMs) {
-        return { started: false, reason: 'execute refused: run a DRY RUN over this exact window first (same call without "execute") and review the matched counts' };
+      if (!dry || dry.fromMs !== fromMs || dry.toMs !== toMs || dry.slackPct !== effectiveSlackPct(slackPct)) {
+        return { started: false, reason: 'execute refused: run a DRY RUN over this exact window WITH THE SAME slackPct first — execute may only delete what a reviewed dry run counted' };
       }
     }
-    const slackPct = typeof req.body?.slackPct === 'number' ? req.body.slackPct : undefined;
     void runDedupeOverlap({ config, logger, hashResolver }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct });
     return { started: true, execute, fromMs, toMs };
   });

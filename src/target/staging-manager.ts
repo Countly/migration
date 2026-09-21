@@ -584,38 +584,39 @@ export class StagingManager {
     return (await res.json<{ x: number }>()).length > 0;
   }
 
-  /** DISTINCT given ids present live in [fromMs, toMs) — duplicate rows of one id never vouch for another id's absence. */
-  async countDistinctMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number): Promise<number> {
+  /** DISTINCT given ids present live in [fromMs, toMs) — duplicate rows of one id never vouch for another id's absence. Scope keeps a same-_id row in a SIBLING collection from vouching either. */
+  async countDistinctMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
     let total = 0;
     for (let i = 0; i < ids.length; i += 50_000) {
       const page = ids.slice(i, i + 50_000);
       const res = await this.ch().query({
-        query: `SELECT uniqExact(_id) AS n FROM ${this.fq(this.config.table)}
+        // alias must not be 'n' — the scope filter references the real column n
+        query: `SELECT uniqExact(_id) AS cnt FROM ${this.fq(this.config.table)}
                 WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
-                  AND _id IN {ids:Array(String)}`,
-        query_params: { ids: page, lo: fromMs, hi: toMs },
+                  AND _id IN {ids:Array(String)} ${this.scopeSql(scope)}`,
+        query_params: { ids: page, lo: fromMs, hi: toMs, ...this.scopeParams(scope) },
         format: 'JSONEachRow',
       });
-      const rows = await res.json<{ n: string }>();
-      total += Number(rows[0]?.n ?? 0);
+      const rows = await res.json<{ cnt: string }>();
+      total += Number(rows[0]?.cnt ?? 0);
     }
     return total;
   }
 
-  /** Live rows in [fromMs, toMs) whose _id is one of the given ids. */
-  async countMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number): Promise<number> {
+  /** Live rows in [fromMs, toMs) whose _id is one of the given ids, scoped to a collection's (a,e,n) when known. */
+  async countMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
     let total = 0;
     for (let i = 0; i < ids.length; i += 50_000) {
       const page = ids.slice(i, i + 50_000);
       const res = await this.ch().query({
-        query: `SELECT count() AS n FROM ${this.fq(this.config.table)}
+        query: `SELECT count() AS cnt FROM ${this.fq(this.config.table)}
                 WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
-                  AND _id IN {ids:Array(String)}`,
-        query_params: { ids: page, lo: fromMs, hi: toMs },
+                  AND _id IN {ids:Array(String)} ${this.scopeSql(scope)}`,
+        query_params: { ids: page, lo: fromMs, hi: toMs, ...this.scopeParams(scope) },
         format: 'JSONEachRow',
       });
-      const rows = await res.json<{ n: string }>();
-      total += Number(rows[0]?.n ?? 0);
+      const rows = await res.json<{ cnt: string }>();
+      total += Number(rows[0]?.cnt ?? 0);
     }
     return total;
   }
@@ -626,14 +627,14 @@ export class StagingManager {
    * cluster that the mirror had already re-ingested natively. The cd window
    * keeps each DELETE partition-prunable on multi-billion-row tables.
    */
-  async deleteMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number): Promise<void> {
+  async deleteMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<void> {
     for (let i = 0; i < ids.length; i += 50_000) {
       const page = ids.slice(i, i + 50_000);
       await this.ch().command({
         query: `DELETE FROM ${this.fq(this.config.table)}
                 WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
-                  AND _id IN {ids:Array(String)}`,
-        query_params: { ids: page, lo: fromMs, hi: toMs },
+                  AND _id IN {ids:Array(String)} ${this.scopeSql(scope)}`,
+        query_params: { ids: page, lo: fromMs, hi: toMs, ...this.scopeParams(scope) },
       });
     }
   }

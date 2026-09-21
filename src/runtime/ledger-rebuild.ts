@@ -259,7 +259,7 @@ export async function rebuildLedger(opts: {
               .limit(5_000).toArray()).map((d) => String(d._id));
             // DISTINCT coverage: a duplicate row of one sampled id must not
             // vouch for another sampled id being absent
-            const present = await staging.countDistinctMatchingIdsInWindow(sampleIds, b.lowerCd, b.upperCd);
+            const present = await staging.countDistinctMatchingIdsInWindow(sampleIds, b.lowerCd, b.upperCd, scope);
             // DLQ'd docs are legitimately absent — but only the SAMPLED ids
             // that are themselves in the DLQ may be discounted; unrelated
             // unresolved docs elsewhere in the window explain nothing
@@ -312,6 +312,14 @@ export async function rebuildLedger(opts: {
         const status: ChunkDoc['status'] =
           swept === nullCdIds.length ? 'done' : swept === 0 ? 'pending' : 'failed';
         summary[status === 'done' ? 'done' : status === 'pending' ? 'pending' : 'failed']++;
+        // a PARTIALLY swept sentinel means rows are missing from the target —
+        // it must surface as a mismatch, not hide in a summary counter
+        if (checkOnly && status === 'failed' && progress.mismatchedWindows.length < 200) {
+          progress.mismatchedWindows.push({
+            collection, lowerCd: 'null-cd sweep', upperCd: 'null-cd sweep',
+            source: nullCdIds.length, live: swept,
+          });
+        }
         allDocs.push({
           _id: `${runId}:${collection}:${idx}`,
           run_id: runId, collection,
