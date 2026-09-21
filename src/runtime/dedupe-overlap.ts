@@ -124,6 +124,7 @@ export async function runDedupeOverlap(
     await mongo.connect();
     await staging.connect();
     const db = mongo.db(config.source.db);
+    const fpBefore = deps.ledger ? await deps.ledger.runFingerprint(config.ledger.runId).catch(() => null) : null;
 
     state.phase = 'discovering collections';
     const collections = await discoverCollections(db, config.source.collectionPrefix, logger);
@@ -209,11 +210,13 @@ export async function runDedupeOverlap(
     // snapshot, so if anyone re-opened work mid-scan (retry-failed, top-up
     // mapping) the counts above are stale — detect and say so rather than
     // hold a cluster-wide claim barrier for an operator-induced edge case.
-    if (deps.ledger) {
-      const claimsNow = await deps.ledger.activeClaims(config.ledger.runId).catch(() => []);
-      if (claimsNow.length > 0) {
+    if (deps.ledger && fpBefore !== null) {
+      // durable marker, not a claims poll: work that starts AND finishes
+      // during the scan still moves the fingerprint
+      const fpAfter = await deps.ledger.runFingerprint(config.ledger.runId).catch(() => null);
+      if (fpAfter !== fpBefore) {
         state.runStateChanged = true;
-        logger.warn({ pods: claimsNow.map((c) => c.pod) }, 'Run state changed during dedupe — counts are stale; re-run the dry run once the pods are idle');
+        logger.warn({ fpBefore, fpAfter }, 'Run chunk state changed during dedupe — counts are stale; re-run the dry run once the pods are idle');
       }
     }
     state.status = 'completed';

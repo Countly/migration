@@ -202,7 +202,7 @@ describe('tee-boundary detection + sync parity', () => {
     ], 'v2', null);
     const B = 150;
     const pruned = await ledger.pruneBeyondBound(AR, B);
-    expect(pruned).toEqual({ deleted: 2, clamped: 1 }); // #2,#3 gone; #1 clamped
+    expect(pruned).toMatchObject({ deleted: 2, clamped: 1 }); // #2,#3 gone; #1 clamped
     const left = await mc.db(DB).collection('mig_ranges')
       .find({ run_id: AR } as never).sort({ idx: 1 }).toArray();
     expect(left.map((c) => [c.lower_cd, c.upper_cd])).toEqual([[0, 100], [100, 150]]);
@@ -285,12 +285,12 @@ describe('tee-boundary detection + sync parity', () => {
 describe('set-boundary auto-apply decision', () => {
   const report = (detection: Record<string, unknown>) => ({ detection, sync: { status: 'ok' } }) as never;
   const M = 60_000;
-  const gapMinutes = (mongoPerMin: number, chPerMin: number) => {
+  const gapMinutes = (mongoPerMin: number, chPerMin: number, anchorMs = 22 * M) => {
     const gap = { fromMs: 20 * M, toMs: 22 * M };
     const minutes: Array<{ minuteMs: number; mongo: number; ch: number }> = [];
     for (let m = 5; m < 20; m++) minutes.push({ minuteMs: m * M, mongo: mongoPerMin, ch: 0 });
     for (let m = 22; m < 40; m++) minutes.push({ minuteMs: m * M, mongo: 0, ch: chPerMin });
-    return { gap, minutes, suggestedBoundMs: 21 * M };
+    return { gap, minutes, suggestedBoundMs: 21 * M, anchorMs };
   };
 
   it('a corroborated gap applies unattended', () => {
@@ -316,6 +316,18 @@ describe('set-boundary auto-apply decision', () => {
     expect(d.reason).toContain('42');
     expect(decideAutoApply(report({ status: 'ok', method: 'anchor', suggestedBoundMs: 123 }), true))
       .toEqual({ apply: true, boundMs: 123 });
+  });
+
+  it('a lull that does not abut the ClickHouse anchor is never auto-applied', () => {
+    // gap at minutes 20–22 but the first new-side data lands at minute 30:
+    // a quiet spell BEFORE the real tee start — applying it would exclude
+    // the old-side docs between the false gap and the anchor
+    const g = gapMinutes(5, 4, 30 * M);
+    const d = decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), false);
+    expect(d.apply).toBe(false);
+    expect(d.reason).toContain('abut');
+    expect(decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), true))
+      .toEqual({ apply: true, boundMs: 21 * M });
   });
 
   it('refused or empty detections never apply', () => {

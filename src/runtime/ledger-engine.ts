@@ -520,30 +520,40 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     } catch {
       return { applied: false, reason: 'could not read the current stored bound — retry when MongoDB answers' };
     }
+    // Raising an applied bound cannot resurrect the chunks the earlier bound
+    // pruned, and mapping never tops up while a bound is set — the interval
+    // between the two values would silently never migrate.
+    if (priorBound !== null && boundMs > priorBound) {
+      const gridSize = Object.values(await ledger.statusCounts(config.ledger.runId).catch(() => ({} as Record<string, number>))).reduce((a, b) => a + b, 0);
+      if (gridSize > 0) {
+        return { applied: false, reason: `raising an applied bound (${new Date(priorBound).toISOString()} → ${new Date(boundMs).toISOString()}) would leave the interval between them unmigrated — the earlier apply already pruned its chunks. Lowering is safe; to extend the range, restart the run's mapping under the new bound with the ledger rebuilt.` };
+      }
+    }
     try {
       const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
       await ledger.setStoredBound(config.ledger.runId, boundMs, source);
       // Post-store verification: a claim that raced the fence shows up as a
       // non-pending beyond-bound chunk (second prune throws) or a fresh
-      // active claim. Either way the stored bound is ROLLED BACK — apply
-      // never leaves a half-applied bound behind a racing worker.
+      // active claim. Either way EVERYTHING rolls back — the stored bound to
+      // its prior value, and the pruned/clamped chunks to their originals —
+      // so a raced apply leaves no half-applied state and no grid gaps.
       try {
         const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
         const claimsAfter = await ledger.activeClaims(config.ledger.runId);
         if (claimsAfter.length > 0) {
+          await ledger.restorePrune(pruned2.restore).catch(() => {});
           throw new Error(`pods claimed chunks during apply (${claimsAfter.map((c) => `${c.pod}×${c.count}`).join(', ')})`);
         }
         const total = { deleted: (pruned.deleted + pruned2.deleted), clamped: (pruned.clamped + pruned2.clamped) };
         logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), source, ...total }, 'Run bound applied — pods adopt it on their next map pass');
         // a guard-held engine has its answer now
-        if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume();
+        if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume(true);
         return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
       } catch (raceErr) {
-        // restore what was there before — an existing valid bound must
-        // survive a failed update, or pods that cached it drift from config
+        await ledger.restorePrune(pruned.restore).catch(() => {});
         if (priorBound !== null) await ledger.setStoredBound(config.ledger.runId, priorBound, `${source} rollback`).catch(() => {});
         else await ledger.clearStoredBound(config.ledger.runId).catch(() => {});
-        return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK to the previous state (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
+        return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (bound and pruned chunks restored) (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
       }
     } catch (err) {
       return { applied: false, reason: (err as Error).message };
@@ -582,7 +592,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // cluster-wide (stored in run config), releases every held pod.
   app.post('/control/allow-unbounded', async () => {
     await ledger.setUnboundedAck(config.ledger.runId, config.worker.podId);
-    if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume();
+    if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume(true);
     logger.warn('Operator declared no-mirror: unbounded run allowed — held pods release within seconds');
     return { allowed: true, note: 'held pods release within ~3s; the decision is stored cluster-wide in mig_run_config' };
   });

@@ -81,6 +81,17 @@ export function decideAutoApply(
         reason: `a gap was found but traffic around it is too sparse to trust a quiet minute as the seam (${before} old-side docs in the 10 min before, ${after} new-side docs in the 10 min after — need ${MIN_FLANK_DOCS} each). Review GET /api/boundary, then re-call with {"acceptAnchor": true} or pass an explicit {"boundMs": ...}.`,
       };
     }
+    // The real seam ends where the new side BEGINS: a trusted gap must
+    // contain or directly abut the ClickHouse anchor. A lull minutes before
+    // the true tee start can otherwise pass the flank check and exclude
+    // every old-side doc between the false gap and the anchor.
+    const anchor = d.anchorMs;
+    if (typeof anchor !== 'number' || anchor < gap.fromMs || anchor > gap.toMs + 2 * 60_000) {
+      return {
+        apply: false,
+        reason: `the gap (${new Date(gap.fromMs).toISOString()}–${new Date(gap.toMs).toISOString()}) does not abut the first new-side data (anchor ${typeof anchor === 'number' ? new Date(anchor).toISOString() : 'unknown'}) — likely a lull BEFORE the real tee start; applying it would exclude the old-side docs in between. Review GET /api/boundary, then re-call with {"acceptAnchor": true} or pass an explicit {"boundMs": ...}.`,
+      };
+    }
   }
   return { apply: true, boundMs: d.suggestedBoundMs };
 }

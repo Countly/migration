@@ -181,7 +181,14 @@ export class ChunkOrchestrator {
     if (this.status === 'running') this.status = 'paused';
   }
 
-  resume(): void {
+  resume(clearBoundaryHold = false): void {
+    // the boundary question is only answered by a bound or the explicit
+    // no-mirror ack — a plain Resume (API or UI) must not clear the hold,
+    // or the run migrates unbounded until the next 5-minute probe
+    if (this.paused && this.pauseReason === 'boundary-unset' && !clearBoundaryHold) {
+      this.logger.warn('Resume ignored while the boundary question is open — apply a bound (POST /control/set-boundary) or declare no-mirror (POST /control/allow-unbounded)');
+      return;
+    }
     this.paused = false;
     this.pauseReason = null;
     // clean slate: without this, one stray failure after resume re-trips
@@ -243,8 +250,8 @@ export class ChunkOrchestrator {
     while (!this.stopping) {
       await sleep(3_000);
       if ((await evaluate()) === 'proceed') {
-        this.logger.warn({ runId: this.runId }, 'Boundary guard released — a bound was applied, no-mirror was declared, or the run already has mapped state');
-        this.resume();
+        this.logger.warn({ runId: this.runId }, 'Boundary guard released — a bound was applied or no-mirror was declared');
+        this.resume(true);
         return;
       }
       if (!this.paused) {

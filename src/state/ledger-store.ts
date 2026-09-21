@@ -598,6 +598,23 @@ export class LedgerStore {
     );
   }
 
+  /**
+   * Durable change marker for a run's chunk state: any claim, completion,
+   * retry or remap moves it — including work that starts AND finishes
+   * between two snapshots (which an activeClaims poll would never see).
+   */
+  async runFingerprint(runId: string): Promise<string> {
+    const [row] = await this.c().aggregate<{ n: number; done: number; maxU: Date | null }>([
+      { $match: { run_id: runId } },
+      { $group: {
+        _id: null, n: { $sum: 1 },
+        done: { $sum: { $cond: [{ $eq: ['$status', 'done'] }, 1, 0] } },
+        maxU: { $max: '$updated_at' },
+      } },
+    ]).toArray();
+    return row ? `${row.n}:${row.done}:${row.maxU ? row.maxU.getTime() : 0}` : '0:0:0';
+  }
+
   /** Roll back a bound whose post-store verification failed — apply must never leave a half-applied bound behind. */
   async clearStoredBound(runId: string): Promise<void> {
     await this.rc().updateOne({ _id: runId }, { $unset: { cd_upper_bound_ms: '', set_at: '', set_by: '' } });
@@ -618,7 +635,11 @@ export class LedgerStore {
    * Refuses when any non-pending chunk reaches past the bound — that data
    * (possibly) already moved and needs purge tooling, not a config flip.
    */
-  async pruneBeyondBound(runId: string, boundMs: number): Promise<{ deleted: number; clamped: number }> {
+  async pruneBeyondBound(runId: string, boundMs: number): Promise<{
+    deleted: number; clamped: number;
+    /** What the prune changed, verbatim — a raced apply restores it. */
+    restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> };
+  }> {
     const busy = await this.c().countDocuments({
       run_id: runId, lower_cd: { $gte: 0 }, upper_cd: { $gt: boundMs },
       status: { $nin: ['pending'] },
@@ -626,14 +647,33 @@ export class LedgerStore {
     if (busy > 0) {
       throw new Error(`${busy} non-pending chunk(s) already reach past the bound — their windows may hold migrated post-bound data; purge/retry them first`);
     }
+    const deletedChunks = await this.c()
+      .find({ run_id: runId, lower_cd: { $gte: boundMs }, status: 'pending' })
+      .toArray();
     const del = await this.c().deleteMany({
-      run_id: runId, lower_cd: { $gte: boundMs }, status: 'pending',
+      _id: { $in: deletedChunks.map((c) => c._id) }, status: 'pending',
     });
+    const clampedChunks = (await this.c()
+      .find(
+        { run_id: runId, lower_cd: { $gte: 0, $lt: boundMs }, upper_cd: { $gt: boundMs }, status: 'pending' },
+        { projection: { _id: 1, upper_cd: 1 } },
+      )
+      .toArray()).map((c) => ({ _id: String(c._id), upper_cd: c.upper_cd }));
     const clamp = await this.c().updateMany(
       { run_id: runId, lower_cd: { $gte: 0, $lt: boundMs }, upper_cd: { $gt: boundMs }, status: 'pending' },
       { $set: { upper_cd: boundMs, updated_at: new Date() } },
     );
-    return { deleted: del.deletedCount ?? 0, clamped: clamp.modifiedCount ?? 0 };
+    return { deleted: del.deletedCount ?? 0, clamped: clamp.modifiedCount ?? 0, restore: { deletedChunks, clampedChunks } };
+  }
+
+  /** Undo a prune whose apply raced — re-insert deleted pending chunks, un-clamp straddlers (only while still pending). */
+  async restorePrune(restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }): Promise<void> {
+    if (restore.deletedChunks.length > 0) {
+      await this.c().insertMany(restore.deletedChunks, { ordered: false }).catch(() => {});
+    }
+    for (const c of restore.clampedChunks) {
+      await this.c().updateOne({ _id: c._id, status: 'pending' }, { $set: { upper_cd: c.upper_cd, updated_at: new Date() } });
+    }
   }
 
   /**
