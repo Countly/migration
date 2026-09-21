@@ -1641,6 +1641,7 @@ export class ChunkOrchestrator {
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }> {
     const { config, staging } = this.d;
+    if (!Number.isFinite(samplesPerCollection) || samplesPerCollection <= 0) samplesPerCollection = 500;
     const p = this.contentAuditProgress;
     p.running = true; p.sampled = 0; p.matched = 0; p.mismatches = [];
     try {

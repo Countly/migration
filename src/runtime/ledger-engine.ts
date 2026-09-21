@@ -372,7 +372,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — audit after completion or while paused' };
     const busyCnt = await ledger.activeClaims(config.ledger.runId, config.worker.podId);
     if (busyCnt.length > 0) return { started: false, reason: `other pods are actively migrating (${busyCnt.map((row) => row.pod).join(', ')}) — a mid-run audit reports false mismatches; audit after completion` };
-    const samples = Math.min(10_000, Math.max(50, req.body?.samples ?? 500));
+    const samples = Math.min(10_000, Math.max(50, typeof req.body?.samples === 'number' && Number.isFinite(req.body.samples) ? req.body.samples : 500));
     auditContentState.status = 'running'; auditContentState.result = null; auditContentState.error = null;
     void orchestrator.contentAudit(samples)
       .then((r) => { auditContentState.result = r as unknown as Record<string, unknown>; auditContentState.status = 'completed'; })
@@ -383,14 +383,6 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
 
   // ── Final check: the whole sign-off, interpreted (chunks + DLQ + source
   // recount + checksums + content samples → one PASS/NOTES/FAIL verdict) ──
-  // Epoch-ms sanity for operator-supplied timestamps: the classic mistake is
-  // epoch SECONDS (silently ~1970 in ms, which would gut the audited range).
-  const epochMsError = (v: unknown, name: string): string | null => {
-    if (typeof v !== 'number' || !Number.isFinite(v)) return `${name} (epoch ms) required`;
-    if (v < 1_000_000_000_000) return `${name}=${v} looks like epoch SECONDS — pass milliseconds (×1000)`;
-    if (v > Date.now() + 60_000) return `${name} is in the future`;
-    return null;
-  };
   const finalCheckState: FinalCheckResult = newFinalCheckResult();
   app.post<{ Body: { cutoverMs?: number; samples?: number; deep?: boolean } }>('/control/final-check', async (req) => {
     if (finalCheckState.status === 'running') return { started: false, reason: 'final check already running' };
@@ -410,7 +402,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         return { started: false, reason: `cutoverMs is EARLIER than the run's effective bound (${new Date(effectiveBound).toISOString()}) — that would silently exclude migrated data from the audit; pass the bound or later` };
       }
     }
-    const samples = Math.min(10_000, Math.max(50, req.body?.samples ?? 500));
+    const samples = Math.min(10_000, Math.max(50, typeof req.body?.samples === 'number' && Number.isFinite(req.body.samples) ? req.body.samples : 500));
     const deep = req.body?.deep === true;
     void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep });
     return { started: true, cutoverMs, samples, deep };
@@ -485,9 +477,20 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // the ConfigMap — two sources of truth with duplication at stake is how
   // operators get hurt.
   const envBoundAtBoot = config.ledger.cdUpperBoundMs;
+  // Epoch-ms sanity for operator-supplied timestamps: the classic mistake is
+  // epoch SECONDS (silently ~1970 in ms — a bound like that would prune every
+  // pending chunk and persist a nonsense cutover).
+  const epochMsError = (v: unknown, name: string): string | null => {
+    if (typeof v !== 'number' || !Number.isFinite(v)) return `${name} (epoch ms) required`;
+    if (v < 1_000_000_000_000) return `${name}=${v} looks like epoch SECONDS — pass milliseconds (×1000)`;
+    if (v > Date.now() + 60_000) return `${name} is in the future`;
+    return null;
+  };
+
   let boundaryApplied: Record<string, unknown> | null = null;
   const applyBoundNow = async (boundMs: number, source: string): Promise<Record<string, unknown>> => {
-    if (!Number.isFinite(boundMs) || boundMs <= 0) return { applied: false, reason: 'boundMs (epoch ms) required' };
+    const msErr = epochMsError(boundMs, 'boundMs');
+    if (msErr) return { applied: false, reason: msErr };
     if (config.ledger.dryRun) return { applied: false, reason: 'dry run — apply on the real run' };
     if (envBoundAtBoot !== null) {
       return { applied: false, reason: `bound already pinned via LEDGER_CD_UPPER_BOUND=${envBoundAtBoot} — change it in the deployment config, not here` };
