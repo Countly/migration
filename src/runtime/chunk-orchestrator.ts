@@ -1661,7 +1661,7 @@ export class ChunkOrchestrator {
    * pins the transform itself).
    */
   async contentAudit(samplesPerCollection = 500, upToMs: number | null = null, totalBudget: number | null = null): Promise<{
-    sampled: number; matched: number; missing: number; different: number;
+    sampled: number; matched: number; missing: number; different: number; dlqExcluded: number;
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }> {
     const { config, staging } = this.d;
@@ -1682,7 +1682,7 @@ export class ChunkOrchestrator {
         samplesPerCollection = Math.min(samplesPerCollection, Math.max(10, Math.ceil(totalBudget / collections.length)));
       }
 
-      let missing = 0, different = 0;
+      let missing = 0, different = 0, dlqExcluded = 0;
       for (const collection of collections) {
         const defaults = this.d.hashResolver.resolveCollectionName(collection, config.source.collectionPrefix) ?? undefined;
         const coll = db.collection(collection);
@@ -1723,10 +1723,23 @@ export class ChunkOrchestrator {
           { loMs: Math.min(...expCds), hiMs: Math.max(...expCds) },
         );
 
+        // Sampled docs the run DELIBERATELY did not migrate (pending or
+        // waived DLQ entries) are not "missing" — the DLQ layer already
+        // accounts for them; flagging them here would fail sign-off
+        // nondeterministically depending on which docs the probes hit.
+        const missCandidates: string[] = [];
+        for (const [id, exp] of expected) {
+          const got = live.get(id);
+          if (!got || String(got.cd_txt) !== exp.cd) missCandidates.push(id);
+        }
+        const dlqIds = missCandidates.length > 0
+          ? await this.d.dlq.unresolvedIdsAmong(this.runId, collection, missCandidates)
+          : new Set<string>();
         for (const [id, exp] of expected) {
           p.sampled++;
           const got = live.get(id);
           if (!got || String(got.cd_txt) !== exp.cd) {
+            if (dlqIds.has(id)) { dlqExcluded++; continue; }
             missing++;
             if (p.mismatches.length < 100) p.mismatches.push({ _id: id, collection, kind: 'missing (no live row with this (_id, cd))' });
             continue;
@@ -1758,7 +1771,7 @@ export class ChunkOrchestrator {
           }
         }
       }
-      return { sampled: p.sampled, matched: p.matched, missing, different, mismatches: p.mismatches };
+      return { sampled: p.sampled, matched: p.matched, missing, different, dlqExcluded, mismatches: p.mismatches };
     } finally {
       p.running = false;
     }

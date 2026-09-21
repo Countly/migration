@@ -126,6 +126,18 @@ export class DlqStore {
    * table is accounted for, not a disagreement. Entries written before the
    * cd_ms field (or with unparseable cd/ts) can't be attributed and count 0.
    */
+  /** Which of the GIVEN source ids sit unresolved (pending/waived) — sampled docs the run deliberately did not migrate. */
+  async unresolvedIdsAmong(runId: string, collection: string, ids: string[]): Promise<Set<string>> {
+    if (ids.length === 0) return new Set();
+    const rows = await this.c()
+      .find(
+        { run_id: runId, collection, source_id: { $in: ids }, status: { $in: ['pending', 'waived'] } },
+        { projection: { source_id: 1 } },
+      )
+      .toArray();
+    return new Set(rows.map((r) => r.source_id));
+  }
+
   /** How many of the GIVEN source ids sit unresolved (pending/waived) in the window — exact per-sample DLQ discount. */
   async countUnresolvedMatchingIds(runId: string, collection: string, ids: string[], lowerCdMs: number, upperCdMs: number): Promise<number> {
     if (ids.length === 0) return 0;

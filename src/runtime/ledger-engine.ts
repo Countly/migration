@@ -396,7 +396,12 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       const err = epochMsError(req.body.cutoverMs, 'cutoverMs');
       if (err) return { started: false, reason: err };
       cutoverMs = req.body.cutoverMs as number;
-      const storedFc = await ledger.getStoredBound(config.ledger.runId).catch(() => null);
+      let storedFc: number | null;
+      try {
+        storedFc = await ledger.getStoredBound(config.ledger.runId);
+      } catch {
+        return { started: false, reason: 'could not read the stored bound to validate cutoverMs against — retry when MongoDB answers' };
+      }
       const effectiveBound = storedFc ?? config.ledger.cdUpperBoundMs ?? null;
       if (effectiveBound !== null && cutoverMs < effectiveBound) {
         return { started: false, reason: `cutoverMs is EARLIER than the run's effective bound (${new Date(effectiveBound).toISOString()}) — that would silently exclude migrated data from the audit; pass the bound or later` };
@@ -439,8 +444,11 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       if (!dry || dry.fromMs !== fromMs || dry.toMs !== toMs || dry.slackPct !== effectiveSlackPct(slackPct)) {
         return { started: false, reason: 'execute refused: run a DRY RUN over this exact window WITH THE SAME slackPct first — execute may only delete what a reviewed dry run counted' };
       }
+      if (dedupeState.runStateChanged) {
+        return { started: false, reason: 'execute refused: the run state changed during the dry run (a pod claimed work mid-scan) — its counts are stale; re-run the dry run with all pods idle' };
+      }
     }
-    void runDedupeOverlap({ config, logger, hashResolver }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct });
+    void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct });
     return { started: true, execute, fromMs, toMs };
   });
   app.get('/api/dedupe-overlap', async () => dedupeState);
@@ -506,6 +514,12 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     if (claims.length > 0) {
       return { applied: false, reason: `pods hold active chunk claims (${claims.map((c) => `${c.pod}×${c.count}`).join(', ')}) — pause the pods, let in-flight chunks finish, then apply the bound` };
     }
+    let priorBound: number | null = null;
+    try {
+      priorBound = await ledger.getStoredBound(config.ledger.runId);
+    } catch {
+      return { applied: false, reason: 'could not read the current stored bound — retry when MongoDB answers' };
+    }
     try {
       const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
       await ledger.setStoredBound(config.ledger.runId, boundMs, source);
@@ -525,8 +539,11 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume();
         return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
       } catch (raceErr) {
-        await ledger.clearStoredBound(config.ledger.runId).catch(() => {});
-        return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
+        // restore what was there before — an existing valid bound must
+        // survive a failed update, or pods that cached it drift from config
+        if (priorBound !== null) await ledger.setStoredBound(config.ledger.runId, priorBound, `${source} rollback`).catch(() => {});
+        else await ledger.clearStoredBound(config.ledger.runId).catch(() => {});
+        return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK to the previous state (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
       }
     } catch (err) {
       return { applied: false, reason: (err as Error).message };

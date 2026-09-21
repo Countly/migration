@@ -39,6 +39,7 @@ import type { Logger } from 'pino';
 import { MongoClient } from 'mongodb';
 import type { Config } from '../config/schema.ts';
 import type { HashResolver } from '../transform/hash-resolver.ts';
+import type { LedgerStore } from '../state/ledger-store.ts';
 import { chScopeOf } from '../transform/hash-resolver.ts';
 import { StagingManager } from '../target/staging-manager.ts';
 import { discoverCollections } from '../source/discover-collections.ts';
@@ -73,6 +74,8 @@ export interface DedupeOverlapState {
   totals: { mongoDocsInWindow: number; chMatched: number; deleted: number; unsafeMatched: number };
   /** Window + slack of the last COMPLETED dry run — the license to execute (same window AND same slack). */
   lastDryRun: { fromMs: number; toMs: number; slackPct: number; chMatched: number; at: number } | null;
+  /** Set when the run's chunk state changed while dedupe scanned — counts are stale; re-run the dry run. */
+  runStateChanged: boolean;
   error: string | null;
   startedAt: number | null;
   finishedAt: number | null;
@@ -82,7 +85,7 @@ export function newDedupeOverlapState(): DedupeOverlapState {
   return {
     status: 'not_run', phase: '', execute: false, fromMs: null, toMs: null,
     collections: [], totals: { mongoDocsInWindow: 0, chMatched: 0, deleted: 0, unsafeMatched: 0 },
-    lastDryRun: null, error: null, startedAt: null, finishedAt: null,
+    lastDryRun: null, runStateChanged: false, error: null, startedAt: null, finishedAt: null,
   };
 }
 
@@ -94,7 +97,7 @@ const BUCKET_MS = 3_600_000;
 const MAX_BUCKET_IDS = 3_000_000;
 
 export async function runDedupeOverlap(
-  deps: { config: Config; logger: Logger; hashResolver: HashResolver },
+  deps: { config: Config; logger: Logger; hashResolver: HashResolver; ledger?: LedgerStore },
   state: DedupeOverlapState,
   opts: { fromMs: number; toMs: number; execute: boolean; slackPct?: number },
 ): Promise<void> {
@@ -202,6 +205,17 @@ export async function runDedupeOverlap(
       if (row.mongoDocsInWindow > 0 || row.chMatched > 0) state.collections.push(row);
     }
 
+    // Dedupe is a POST-COMPLETION tool: the claims fence at start is a
+    // snapshot, so if anyone re-opened work mid-scan (retry-failed, top-up
+    // mapping) the counts above are stale — detect and say so rather than
+    // hold a cluster-wide claim barrier for an operator-induced edge case.
+    if (deps.ledger) {
+      const claimsNow = await deps.ledger.activeClaims(config.ledger.runId).catch(() => []);
+      if (claimsNow.length > 0) {
+        state.runStateChanged = true;
+        logger.warn({ pods: claimsNow.map((c) => c.pod) }, 'Run state changed during dedupe — counts are stale; re-run the dry run once the pods are idle');
+      }
+    }
     state.status = 'completed';
     state.phase = 'done';
     state.finishedAt = Date.now();
