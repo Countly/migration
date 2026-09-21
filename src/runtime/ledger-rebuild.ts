@@ -65,6 +65,8 @@ export interface RebuildProgress {
   /** When a cutover clamp was applied: the clamp and how many source docs sit beyond it (out of scope). */
   cutoverMs?: number | null;
   excludedBeyondCutover?: number;
+  /** Drift windows (live > source) whose sampled source ids were NOT all found in the target — surplus rows were masking missing ones. */
+  driftSubsetMissing?: Array<{ collection: string; lowerCd: string; upperCd: string; sampled: number; missing: number }>;
   error: string | null;
   startedAt: number | null;
   finishedAt: number | null;
@@ -73,7 +75,7 @@ export interface RebuildProgress {
 export function newRebuildProgress(): RebuildProgress {
   return {
     status: 'not_run', phase: '', collectionsDone: 0, collectionsTotal: 0,
-    summary: [], mismatchedWindows: [], deletionDriftWindows: [], checksumMismatchWindows: [], error: null, startedAt: null, finishedAt: null,
+    summary: [], mismatchedWindows: [], deletionDriftWindows: [], checksumMismatchWindows: [], driftSubsetMissing: [], error: null, startedAt: null, finishedAt: null,
   };
 }
 
@@ -126,6 +128,7 @@ export async function rebuildLedger(opts: {
     await staging.connect();
     const db = mongo.db(config.source.db);
 
+    let driftChecks = 0;
     progress.phase = 'discovering collections';
     let collections = await discoverCollections(db, config.source.collectionPrefix, logger);
     const skipEventNames = new Set(['[CLY]_apm_device', '[CLY]_apm_network']);
@@ -183,13 +186,16 @@ export async function rebuildLedger(opts: {
       if (lowDoc && highDoc) {
         const lowerCd = (lowDoc.cd as Date).getTime();
         let upperCd = (highDoc.cd as Date).getTime();
+        let excludedHere = 0;
         if (upToMs !== null) {
-          progress.excludedBeyondCutover = (progress.excludedBeyondCutover ?? 0)
-            + await coll.countDocuments({ cd: { $gte: new Date(upToMs) } });
+          excludedHere = await coll.countDocuments({ cd: { $gte: new Date(upToMs) } });
+          progress.excludedBeyondCutover = (progress.excludedBeyondCutover ?? 0) + excludedHere;
           upperCd = Math.min(upperCd, upToMs - 1);
         }
         if (upperCd >= lowerCd) {
-          const estimated = await coll.estimatedDocumentCount();
+          // size the grid from the CLAMPED population — the excluded tail
+          // would otherwise inflate the window count for the remaining span
+          const estimated = Math.max(1, (await coll.estimatedDocumentCount()) - excludedHere);
           bounds = computeChunkBounds(lowerCd, upperCd, estimated, config.ledger.chunkDocsTarget, config.ledger.maxChunkDays);
         }
       }
@@ -235,12 +241,32 @@ export async function rebuildLedger(opts: {
           // live > source = the SOURCE shrank after migration (retention
           // TTL, GDPR purges) — report as drift, not as a defect; only
           // live < source means data is missing from the target.
-          const bucket = live + unresolved > mongoCount ? progress.deletionDriftWindows : progress.mismatchedWindows;
+          const isDrift = live + unresolved > mongoCount;
+          const bucket = isDrift ? progress.deletionDriftWindows : progress.mismatchedWindows;
           if (bucket.length < 200) {
             bucket.push({
               collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
               source: mongoCount, live,
             });
+          }
+          // A surplus count proves nothing about coverage: expired rows the
+          // target kept can MASK current source docs it is missing. Spot-check
+          // drift windows by id — sampled source ids must all exist live.
+          if (isDrift && driftChecks < 50 && mongoCount > 0) {
+            driftChecks++;
+            const sampleIds = (await coll
+              .find({ cd: { $gte: new Date(b.lowerCd), $lt: new Date(b.upperCd) } }, { projection: { _id: 1 } })
+              .limit(5_000).toArray()).map((d) => String(d._id));
+            const present = await staging.countMatchingIdsInWindow(sampleIds, b.lowerCd, b.upperCd);
+            // DLQ'd docs are legitimately absent — only a shortfall beyond
+            // the window's unresolved count is a real coverage gap
+            const missing = Math.max(0, sampleIds.length - present - unresolved);
+            if (missing > 0 && (progress.driftSubsetMissing ?? []).length < 200) {
+              (progress.driftSubsetMissing ?? (progress.driftSubsetMissing = [])).push({
+                collection, lowerCd: new Date(b.lowerCd).toISOString(), upperCd: new Date(b.upperCd).toISOString(),
+                sampled: sampleIds.length, missing,
+              });
+            }
           }
         }
         // Checksum: only meaningful on windows that are count-exact with no

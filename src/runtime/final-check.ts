@@ -152,8 +152,12 @@ export async function runFinalCheck(
     if (audit.checksumMismatchWindows.length > 0) {
       out.problems.push(`${fmt(audit.checksumMismatchWindows.length)} window(s) hold the right COUNT of the WRONG documents (checksum fingerprint differs) — escalate; do NOT decommission the old cluster.`);
     }
-    if (audit.deletionDriftWindows.length > 0) {
-      out.notes.push(`${fmt(audit.deletionDriftWindows.length)} window(s) now hold MORE docs in ClickHouse than the source — the source shrank after migration (retention TTL / deletions). Expected on deployments with retention; the migrated copy is the complete one.`);
+    if ((audit.driftSubsetMissing ?? []).length > 0) {
+      const missingN = (audit.driftSubsetMissing ?? []).reduce((a, w) => a + w.missing, 0);
+      out.problems.push(`${fmt((audit.driftSubsetMissing ?? []).length)} retention-drift window(s) are MISSING current source docs behind their surplus counts (${fmt(missingN)} sampled ids not found live) — surplus rows were masking gaps; do NOT decommission the old cluster.`);
+    }
+    if (audit.deletionDriftWindows.length > 0 && (audit.driftSubsetMissing ?? []).length === 0) {
+      out.notes.push(`${fmt(audit.deletionDriftWindows.length)} window(s) now hold MORE docs in ClickHouse than the source — the source shrank after migration (retention TTL / deletions). Sampled source ids in those windows were all found live, so the surplus is retained history, not masked gaps.`);
     }
     if (audit.mismatchedWindows.length === 0 && audit.checksumMismatchWindows.length === 0 && scopedPendingWindows === 0) {
       out.passes.push(`Recounted ${fmt(windows)} window(s) directly against the source: every count matches, every checksum fingerprint matches.`);

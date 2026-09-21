@@ -383,13 +383,32 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
 
   // ── Final check: the whole sign-off, interpreted (chunks + DLQ + source
   // recount + checksums + content samples → one PASS/NOTES/FAIL verdict) ──
+  // Epoch-ms sanity for operator-supplied timestamps: the classic mistake is
+  // epoch SECONDS (silently ~1970 in ms, which would gut the audited range).
+  const epochMsError = (v: unknown, name: string): string | null => {
+    if (typeof v !== 'number' || !Number.isFinite(v)) return `${name} (epoch ms) required`;
+    if (v < 1_000_000_000_000) return `${name}=${v} looks like epoch SECONDS — pass milliseconds (×1000)`;
+    if (v > Date.now() + 60_000) return `${name} is in the future`;
+    return null;
+  };
   const finalCheckState: FinalCheckResult = newFinalCheckResult();
   app.post<{ Body: { cutoverMs?: number; samples?: number } }>('/control/final-check', async (req) => {
     if (finalCheckState.status === 'running') return { started: false, reason: 'final check already running' };
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — run the final check after completion (or while paused)' };
-    const busyFc = await ledger.activeClaims(config.ledger.runId, config.worker.podId);
-    if (busyFc.length > 0) return { started: false, reason: `other pods are actively migrating (${busyFc.map((row) => row.pod).join(', ')}) — run the final check after completion` };
-    const cutoverMs = typeof req.body?.cutoverMs === 'number' && Number.isFinite(req.body.cutoverMs) ? req.body.cutoverMs : null;
+    // no exclusion: the SERVING pod's own live claims block the check too —
+    // a paused pod mid-chunk still owns half-written state
+    const busyFc = await ledger.activeClaims(config.ledger.runId);
+    if (busyFc.length > 0) return { started: false, reason: `pods still hold active chunk claims (${busyFc.map((row) => `${row.pod}×${row.count}`).join(', ')}) — the migration must be fully stopped/complete before the final check` };
+    let cutoverMs: number | null = null;
+    if (req.body?.cutoverMs !== undefined) {
+      const err = epochMsError(req.body.cutoverMs, 'cutoverMs');
+      if (err) return { started: false, reason: err };
+      cutoverMs = req.body.cutoverMs as number;
+      const storedFc = await ledger.getStoredBound(config.ledger.runId).catch(() => null);
+      if (storedFc !== null && cutoverMs < storedFc) {
+        return { started: false, reason: `cutoverMs is EARLIER than the run's stored bound (${new Date(storedFc).toISOString()}) — that would silently exclude migrated data from the audit; pass the bound or later` };
+      }
+    }
     const samples = Math.min(10_000, Math.max(50, req.body?.samples ?? 500));
     void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples });
     return { started: true, cutoverMs, samples };
@@ -403,12 +422,20 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // Dry-run by default; execute is licensed by a completed dry run over the
   // SAME window in this process — measure first, delete second.
   const dedupeState: DedupeOverlapState = newDedupeOverlapState();
-  app.post<{ Body: { fromMs?: number; toMs?: number; execute?: boolean } }>('/control/dedupe-overlap', async (req) => {
+  app.post<{ Body: { fromMs?: number; toMs?: number; execute?: boolean; slackPct?: number } }>('/control/dedupe-overlap', async (req) => {
     if (dedupeState.status === 'running') return { started: false, reason: 'dedupe already running' };
-    if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — dedupe only applies after completion' };
+    // destructive against the live table: the migration must be fully
+    // stopped — no pod (this one included) may hold an active chunk claim,
+    // dry run included, so the counts it licenses execute with are stable
+    if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — dedupe (even a dry run) requires the migration stopped or complete' };
+    const busyDd = await ledger.activeClaims(config.ledger.runId);
+    if (busyDd.length > 0) return { started: false, reason: `pods still hold active chunk claims (${busyDd.map((row) => `${row.pod}×${row.count}`).join(', ')}) — stop the migration everywhere before dedupe, even for a dry run` };
     const fromMs = req.body?.fromMs;
     const toMs = req.body?.toMs;
-    if (typeof fromMs !== 'number' || typeof toMs !== 'number' || !(fromMs < toMs)) {
+    const fromErr = epochMsError(fromMs, 'fromMs');
+    const toErr = fromErr ? null : epochMsError(toMs, 'toMs');
+    if (fromErr || toErr) return { started: false, reason: (fromErr ?? toErr) as string };
+    if (!((fromMs as number) < (toMs as number))) {
       return { started: false, reason: 'pass the overlap window as {fromMs, toMs} (epoch ms): fromMs = the tee flip / IP swap, toMs = migration completion' };
     }
     const execute = req.body?.execute === true;
@@ -418,7 +445,8 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         return { started: false, reason: 'execute refused: run a DRY RUN over this exact window first (same call without "execute") and review the matched counts' };
       }
     }
-    void runDedupeOverlap({ config, logger, hashResolver }, dedupeState, { fromMs, toMs, execute });
+    const slackPct = typeof req.body?.slackPct === 'number' ? req.body.slackPct : undefined;
+    void runDedupeOverlap({ config, logger, hashResolver }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct });
     return { started: true, execute, fromMs, toMs };
   });
   app.get('/api/dedupe-overlap', async () => dedupeState);

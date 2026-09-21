@@ -95,7 +95,13 @@ that event. Every hour bucket therefore needs count-evidence of native
 counterparts — `native = live − matched` must roughly cover `matched` —
 before anything in it is deleted. Buckets that fall short are skipped and
 reported (`unsafe` in the result); review those hours (tee outage? wrong
-start time?) instead of forcing them.
+start time?) instead of forcing them. The check is strict (zero slack) by
+default; `slackPct` (≤5) may be passed consciously to absorb ingest-timing
+straddle at bucket edges. Known limit: a loss exactly offset by
+mirror-dropped natives in the same hour is invisible to count evidence —
+an EMPTY dry run means no duplicates (skip the step; never widen the window
+to make it match something). Both dedupe (dry run included) and the Final
+check refuse while any pod still holds an active chunk claim.
 
 There is a dashboard card for this (Overview → **Tee-overlap dedupe**:
 enter the window, *Dry run* first — *Delete duplicates* unlocks only after

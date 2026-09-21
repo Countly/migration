@@ -218,6 +218,21 @@ describe('final check: the interpreted sign-off', () => {
     await mc.db(DB).collection('mig_ranges').updateOne({ _id: `${RUN}:${COLL}:0` } as never, { $set: { status: 'done' } });
   });
 
+  it('retention drift with masked missing docs → FAIL from the id spot-check', async () => {
+    // retention deleted 8 source docs (live > source = drift) while one
+    // MIGRATED row also vanished — the surplus count hides it from counting
+    await mc.db(DB).collection(COLL).deleteMany({ _id: { $in: ['m_50', 'm_51', 'm_52', 'm_53', 'm_54', 'm_55', 'm_56', 'm_57'] } } as never);
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'm_60'` });
+    const out = await check({ cutoverMs: CUTOVER });
+    expect(out.verdict).toBe('FAIL');
+    expect(out.problems.join(' ')).toContain('masking');
+    // clean drift (no masked gaps) stays a note
+    await ch.insert({ table: `${DB}.drill_events`, format: 'JSONEachRow', values: [chRow('m_60', START + 60 * 12_000)] });
+    const out2 = await check({ cutoverMs: CUTOVER });
+    expect(out2.verdict).toBe('PASS_WITH_NOTES');
+    expect(out2.notes.join(' ')).toContain('retained history');
+  });
+
   it('a WHOLE window missing from the target → FAIL (the audit calls it pending, the check must not)', async () => {
     // stale ledger says done, but every row of the window is gone from CH
     await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id LIKE 'm\\_%'` });

@@ -284,10 +284,29 @@ describe('tee-boundary detection + sync parity', () => {
 
 describe('set-boundary auto-apply decision', () => {
   const report = (detection: Record<string, unknown>) => ({ detection, sync: { status: 'ok' } }) as never;
+  const M = 60_000;
+  const gapMinutes = (mongoPerMin: number, chPerMin: number) => {
+    const gap = { fromMs: 20 * M, toMs: 22 * M };
+    const minutes: Array<{ minuteMs: number; mongo: number; ch: number }> = [];
+    for (let m = 5; m < 20; m++) minutes.push({ minuteMs: m * M, mongo: mongoPerMin, ch: 0 });
+    for (let m = 22; m < 40; m++) minutes.push({ minuteMs: m * M, mongo: 0, ch: chPerMin });
+    return { gap, minutes, suggestedBoundMs: 21 * M };
+  };
 
-  it('an exact gap applies unattended', () => {
-    expect(decideAutoApply(report({ status: 'ok', method: 'gap', suggestedBoundMs: 123 }), false))
-      .toEqual({ apply: true, boundMs: 123 });
+  it('a corroborated gap applies unattended', () => {
+    const g = gapMinutes(5, 4);
+    expect(decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), false))
+      .toEqual({ apply: true, boundMs: 21 * M });
+  });
+
+  it('a quiet minute on a sparse install is NOT taken as the seam', () => {
+    const g = gapMinutes(1, 1); // 10 docs per flank — any lull looks like this
+    const d = decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), false);
+    expect(d.apply).toBe(false);
+    expect(d.reason).toContain('sparse');
+    // …unless the operator explicitly accepts imperfect evidence
+    expect(decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), true))
+      .toEqual({ apply: true, boundMs: 21 * M });
   });
 
   it('an anchor needs the explicit acceptAnchor', () => {

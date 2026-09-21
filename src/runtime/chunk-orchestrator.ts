@@ -109,6 +109,8 @@ class ClaimLostError extends Error {
 }
 
 const MAX_CHUNK_ATTEMPTS = 3;
+/** Liveness lookback for the boundary guard: a full day, so quiet spells on low-volume deployments cannot slip a mirrored target past the probe. */
+const GUARD_LIVE_LOOKBACK_MS = 24 * 3_600_000;
 const BISECT_LOG_THRESHOLD = 1;
 
 function shortHash(s: string): string {
@@ -210,27 +212,36 @@ export class ChunkOrchestrator {
   private async boundaryGuard(): Promise<void> {
     const { config } = this.d;
     if (config.ledger.cdUpperBoundMs != null || config.ledger.unboundedOk) return;
-    if (await this.d.ledger.getStoredBound(this.runId).catch(() => null)) return;
-    if (await this.d.ledger.getUnboundedAck(this.runId).catch(() => false)) return;
-    // only a FRESH run: a resumed run already made this decision
-    const counts = await this.d.ledger.statusCounts(this.runId).catch(() => null);
-    if (counts === null || Object.values(counts).reduce((a, b) => a + b, 0) > 0) return;
-    const live = await this.d.staging.hasLiveCdSince(Date.now() - 30 * 60_000).catch(() => false);
-    if (!live) return;
 
+    // 'proceed' | 'hold'. Evidence failures HOLD: absence of evidence is not
+    // evidence of a mirror-free topology — proceeding unbounded on a probe
+    // error is exactly the silent-duplication path this guard closes. The
+    // liveness lookback is a full day so a low-volume deployment's quiet
+    // spells cannot slip a mirrored target past the probe.
+    const evaluate = async (): Promise<'proceed' | 'hold'> => {
+      try {
+        if ((await this.d.ledger.getStoredBound(this.runId)) !== null) return 'proceed';
+        if (await this.d.ledger.getUnboundedAck(this.runId)) return 'proceed';
+        const counts = await this.d.ledger.statusCounts(this.runId);
+        if (Object.values(counts).reduce((a, b) => a + b, 0) > 0) return 'proceed'; // resumed run: decided already
+        const live = await this.d.staging.hasLiveCdSince(Date.now() - GUARD_LIVE_LOOKBACK_MS);
+        return live ? 'hold' : 'proceed';
+      } catch (err) {
+        this.logger.warn({ err: (err as Error).message }, 'Boundary guard: evidence probe failed — holding until the stores answer');
+        return 'hold';
+      }
+    };
+
+    if ((await evaluate()) === 'proceed') return;
     this.pause('boundary-unset');
     this.logger.warn(
       { runId: this.runId },
-      'GUARD: target ClickHouse is receiving live data and no cd upper bound is set — if a mirror re-ingests the same requests on both sides, running unbounded WILL duplicate the overlap window. Apply a bound (POST /control/set-boundary) or declare no-mirror (POST /control/allow-unbounded).',
+      'GUARD: target ClickHouse holds recent live data and no cd upper bound is set — if a mirror re-ingests the same requests on both sides, running unbounded WILL duplicate the overlap window. Apply a bound (POST /control/set-boundary) or declare no-mirror (POST /control/allow-unbounded).',
     );
     while (!this.stopping) {
-      if ((await this.d.ledger.getStoredBound(this.runId).catch(() => null)) !== null) {
-        this.logger.info({ runId: this.runId }, 'Boundary guard released: a cd bound was applied');
-        this.resume();
-        return;
-      }
-      if (await this.d.ledger.getUnboundedAck(this.runId).catch(() => false)) {
-        this.logger.warn({ runId: this.runId }, 'Boundary guard released: operator declared no-mirror — running unbounded');
+      await sleep(3_000);
+      if ((await evaluate()) === 'proceed') {
+        this.logger.warn({ runId: this.runId }, 'Boundary guard released — a bound was applied, no-mirror was declared, or the run already has mapped state');
         this.resume();
         return;
       }
@@ -239,7 +250,6 @@ export class ChunkOrchestrator {
         this.pause('boundary-unset');
         this.logger.warn('Resume ignored while the boundary question is open — apply a bound or POST /control/allow-unbounded');
       }
-      await sleep(3_000);
     }
   }
 

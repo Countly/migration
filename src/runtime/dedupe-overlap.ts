@@ -21,7 +21,13 @@
  * In a healthy tee every matched row duplicates a native one, so native is
  * at least matched (plus mirror losses only ever shrink matched). A bucket
  * where native falls short holds migrated rows WITHOUT counterparts —
- * those are skipped, reported, and never deleted.
+ * those are skipped, reported, and never deleted. Strictness is default:
+ * ZERO slack, so even one uncovered matched row marks the bucket unsafe;
+ * ingest-timing straddle at bucket edges can flag a few healthy buckets,
+ * and the operator may consciously allow it with slackPct (≤5%). Known
+ * limit of count evidence: a loss exactly offset by mirror-dropped natives
+ * in the SAME hour is invisible — which is why unsafe hours must be taken
+ * seriously, not overridden casually.
  *
  * Safety: dry-run by default (counts only); execute is refused until a dry
  * run over the SAME window has completed in this process, and the old
@@ -86,7 +92,7 @@ const MAX_BUCKET_IDS = 3_000_000;
 export async function runDedupeOverlap(
   deps: { config: Config; logger: Logger; hashResolver: HashResolver },
   state: DedupeOverlapState,
-  opts: { fromMs: number; toMs: number; execute: boolean },
+  opts: { fromMs: number; toMs: number; execute: boolean; slackPct?: number },
 ): Promise<void> {
   const { config, hashResolver } = deps;
   const logger = deps.logger.child({ component: 'DedupeOverlap' });
@@ -138,10 +144,11 @@ export async function runDedupeOverlap(
         // migrated rows are the ONLY copy of their event — never delete those.
         const liveTotal = await staging.countLiveInCdRange(loMs, hiMs, scope);
         const native = liveTotal - matched;
-        // slack absorbs ingest-timing straddle at bucket edges, but a bucket
-        // with NO native rows at all is the outage signature outright — the
-        // slack floor must never wave those through
-        const slack = Math.max(10, Math.ceil(matched * 0.02));
+        // strict by default: every matched row needs a native counterpart in
+        // its bucket. slackPct (operator-chosen, ≤5%) only absorbs
+        // ingest-timing straddle at bucket edges; zero natives is the outage
+        // signature outright and no slack ever waves it through
+        const slack = Math.ceil(matched * (Math.min(5, Math.max(0, opts.slackPct ?? 0)) / 100));
         if (native < matched - slack || native <= 0) {
           row.unsafe.push({ fromMs: loMs, toMs: hiMs, matched, native });
           state.totals.unsafeMatched += matched;

@@ -64,6 +64,24 @@ export function decideAutoApply(
       reason: `detected an ANCHOR, not an exact gap — ${d.ambiguousMongoDocs ?? '?'} old-side docs sit inside the ambiguity band. Review GET /api/boundary, then re-call with {"acceptAnchor": true} to take it, or pass an explicit {"boundMs": ...}.`,
     };
   }
+  // A quiet minute only proves a seam when there was traffic to go quiet
+  // FROM: on low-volume installs every other minute is silent, and the
+  // first lull would be taken as the flip. Require corroborating volume on
+  // both flanks before applying a gap unattended.
+  if (d.method === 'gap' && !acceptAnchor) {
+    const gap = d.gap;
+    const mins = d.minutes ?? [];
+    const FLANK_MS = 10 * 60_000;
+    const MIN_FLANK_DOCS = 25;
+    const before = gap ? mins.filter((m) => m.minuteMs >= gap.fromMs - FLANK_MS && m.minuteMs < gap.fromMs).reduce((a, m) => a + m.mongo, 0) : 0;
+    const after = gap ? mins.filter((m) => m.minuteMs >= gap.toMs && m.minuteMs < gap.toMs + FLANK_MS).reduce((a, m) => a + m.ch, 0) : 0;
+    if (!gap || before < MIN_FLANK_DOCS || after < MIN_FLANK_DOCS) {
+      return {
+        apply: false,
+        reason: `a gap was found but traffic around it is too sparse to trust a quiet minute as the seam (${before} old-side docs in the 10 min before, ${after} new-side docs in the 10 min after — need ${MIN_FLANK_DOCS} each). Review GET /api/boundary, then re-call with {"acceptAnchor": true} or pass an explicit {"boundMs": ...}.`,
+      };
+    }
+  }
   return { apply: true, boundMs: d.suggestedBoundMs };
 }
 
