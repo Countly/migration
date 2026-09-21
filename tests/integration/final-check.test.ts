@@ -272,6 +272,18 @@ describe('final check: the interpreted sign-off', () => {
     const out = await check({ cutoverMs: CUTOVER });
     expect(out.verdict).toBe('FAIL');
     expect(out.audit?.mismatchedWindows.some((w) => w.lowerCd === 'null-cd sweep')).toBe(true);
+
+    // waiving the missing null-cd doc is an ACCEPTED exclusion — the sweep
+    // expectation must discount it, exactly like regular windows do
+    await dlq.add([{
+      run_id: RUN, collection: COLL, chunk_id: `${RUN}:${COLL}:sweep`, source_id: 'n_1',
+      raw_doc: { _id: 'n_1' }, reason: 'skipped', error: 'skip:missing_uid',
+      transform_version: config.transform.version, cd_ms: null,
+    }]);
+    await dlq.waive(RUN);
+    const out2 = await check({ cutoverMs: CUTOVER });
+    expect(out2.audit?.mismatchedWindows.some((w) => w.lowerCd === 'null-cd sweep')).toBe(false);
+
     await mc.db(DB).collection(COLL).deleteMany({ _id: { $in: ['n_0', 'n_1'] } } as never);
     await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'n_0'` });
   });

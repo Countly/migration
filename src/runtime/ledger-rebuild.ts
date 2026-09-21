@@ -361,15 +361,19 @@ export async function rebuildLedger(opts: {
       // Sentinel sweep chunk for the null-cd outliers
       if (nullCdIds.length > 0) {
         const swept = liveNullCd.size;
+        // waived/pending null-cd docs are DELIBERATELY absent — the sweep
+        // expectation discounts them, exactly as regular windows discount
+        // their unresolved DLQ docs
+        const unresolvedNull = await dlq.countUnresolvedAmong(runId, collection, nullCdIds);
         const status: ChunkDoc['status'] =
-          swept === nullCdIds.length ? 'done' : swept === 0 ? 'pending' : 'failed';
+          swept + unresolvedNull >= nullCdIds.length ? 'done' : swept === 0 ? 'pending' : 'failed';
         summary[status === 'done' ? 'done' : status === 'pending' ? 'pending' : 'failed']++;
         // a PARTIALLY swept sentinel means rows are missing from the target —
         // it must surface as a mismatch, not hide in a summary counter
         if (checkOnly && status === 'failed' && progress.mismatchedWindows.length < 200) {
           progress.mismatchedWindows.push({
             collection, lowerCd: 'null-cd sweep', upperCd: 'null-cd sweep',
-            source: nullCdIds.length, live: swept,
+            source: nullCdIds.length - unresolvedNull, live: swept,
           });
         }
         allDocs.push({

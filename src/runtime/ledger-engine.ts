@@ -564,14 +564,23 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume(true);
         return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
       } catch (raceErr) {
-        if (priorBound !== null) await ledger.setStoredBound(config.ledger.runId, priorBound, `${source} rollback`).catch(() => {});
-        else await ledger.clearStoredBound(config.ledger.runId).catch(() => {});
-        for (const r of restores.reverse()) await ledger.restorePrune(r, priorBound).catch(() => {});
+        const rollbackErrors: string[] = [];
+        if (priorBound !== null) await ledger.setStoredBound(config.ledger.runId, priorBound, `${source} rollback`).catch((e: Error) => rollbackErrors.push(`bound: ${e.message}`));
+        else await ledger.clearStoredBound(config.ledger.runId).catch((e: Error) => rollbackErrors.push(`bound: ${e.message}`));
+        for (const r of restores.reverse()) await ledger.restorePrune(r, priorBound).catch((e: Error) => rollbackErrors.push(`chunks: ${e.message}`));
+        if (rollbackErrors.length > 0) {
+          // an unverified rollback must never claim restoration
+          return { applied: false, indeterminate: true, reason: `apply failed (${(raceErr as Error).message}) AND the rollback itself failed (${rollbackErrors.join('; ')}) — bound/grid state is INDETERMINATE: when MongoDB answers, read GET /api/boundary and mig_run_config, then re-apply the intended bound or Rebuild ledger from data` };
+        }
         return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (bound and pruned chunks restored) (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
       }
     } catch (err) {
+      const rollbackErrors: string[] = [];
       const current = await ledger.getStoredBound(config.ledger.runId).catch(() => priorBound);
-      for (const r of restores.reverse()) await ledger.restorePrune(r, current).catch(() => {});
+      for (const r of restores.reverse()) await ledger.restorePrune(r, current).catch((e: Error) => rollbackErrors.push(e.message));
+      if (rollbackErrors.length > 0) {
+        return { applied: false, indeterminate: true, reason: `apply failed (${(err as Error).message}) AND restoring pruned chunks failed (${rollbackErrors.join('; ')}) — grid state is INDETERMINATE: when MongoDB answers, Rebuild ledger from data or re-apply the intended bound` };
+      }
       return { applied: false, reason: (err as Error).message };
     }
   };

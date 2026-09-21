@@ -126,6 +126,19 @@ export class DlqStore {
    * table is accounted for, not a disagreement. Entries written before the
    * cd_ms field (or with unparseable cd/ts) can't be attributed and count 0.
    */
+  /** Unresolved (pending/waived) count among arbitrarily many ids — batched $in, constant memory. */
+  async countUnresolvedAmong(runId: string, collection: string, ids: string[]): Promise<number> {
+    let total = 0;
+    for (let i = 0; i < ids.length; i += 100_000) {
+      total += await this.c().countDocuments({
+        run_id: runId, collection,
+        source_id: { $in: ids.slice(i, i + 100_000) },
+        status: { $in: ['pending', 'waived'] },
+      });
+    }
+    return total;
+  }
+
   /** Which of the GIVEN source ids sit unresolved (pending/waived) — sampled docs the run deliberately did not migrate. */
   async unresolvedIdsAmong(runId: string, collection: string, ids: string[]): Promise<Set<string>> {
     if (ids.length === 0) return new Set();

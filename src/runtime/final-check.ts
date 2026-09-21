@@ -86,6 +86,10 @@ export async function runFinalCheck(
 
   Object.assign(out, newFinalCheckResult(), { status: 'running', mode: deep ? 'deep' : 'quick', startedAt: Date.now(), phase: 'starting' });
   try {
+    // Bracket the whole check with a durable state marker: a deep run takes
+    // hours, and a retry/top-up landing mid-check invalidates everything the
+    // earlier layers measured — a stale PASS must be impossible.
+    const fpBefore = await ledger.runFingerprint(runId);
     // ── Cutover: explicit param > stored bound > env bound > none ─────────
     // fail CLOSED: if the bound cannot be read, the check errors out rather
     // than silently auditing a different range
@@ -222,6 +226,13 @@ export async function runFinalCheck(
       // value-level fidelity is pinned by the transform's differential
       // harness, not by this sampler)
       out.passes.push(`Sampled ${fmt(content.sampled)} random docs against the source — every scalar field exact, every JSON field's key set matched.`);
+    }
+
+    // ── Staleness: did the run's chunk state move while we measured? ──────
+    out.phase = 'confirming the run state did not change during the check';
+    const fpAfter = await ledger.runFingerprint(runId);
+    if (fpAfter !== fpBefore) {
+      out.problems.push('The run\'s chunk state CHANGED while this check ran (a retry, top-up or remap landed mid-check) — every layer above measured a moving target. Let the run settle, then run this check again.');
     }
 
     // ── Verdict ────────────────────────────────────────────────────────────
