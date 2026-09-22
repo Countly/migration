@@ -40,6 +40,10 @@ const APP3 = 'app_dd_sweep';
 const COLL3 = `drill_events${createHash('sha1').update('views' + APP3).digest('hex')}`;
 const SWEEPM = 30;
 const SWEEPN = 35;
+// fourth app: a native retry reused a migrated doc's _id at a DIFFERENT cd
+// in the same hour — pair-exact deletion must spare it
+const APP4 = 'app_dd_retry';
+const COLL4 = `drill_events${createHash('sha1').update('views' + APP4).digest('hex')}`;
 // base collection: no per-collection (a,e,n) scope resolvable — its matches
 // must never be deleted, even though sibling native traffic fills the table
 const BASE = 20;
@@ -70,9 +74,9 @@ describe('tee-overlap dedupe', () => {
     await mc.connect();
     await mc.db(DB).dropDatabase();
     await mc.db(`${DB}_countly`).dropDatabase();
-    await mc.db(`${DB}_countly`).collection('apps').insertMany([{ _id: APP }, { _id: APP2 }, { _id: APP3 }] as never[]);
+    await mc.db(`${DB}_countly`).collection('apps').insertMany([{ _id: APP }, { _id: APP2 }, { _id: APP3 }, { _id: APP4 }] as never[]);
     await mc.db(`${DB}_countly`).collection('events').insertMany([
-      { _id: APP, list: ['views'] }, { _id: APP2, list: ['views'] }, { _id: APP3, list: ['views'] },
+      { _id: APP, list: ['views'] }, { _id: APP2, list: ['views'] }, { _id: APP3, list: ['views'] }, { _id: APP4, list: ['views'] },
     ] as never[]);
 
     ch = createClient({ url: CH_URL, password: CH_PASSWORD });
@@ -239,6 +243,36 @@ describe('tee-overlap dedupe', () => {
     // every row survived — mirrors AND sweep rows
     expect(await chCount("_id LIKE 'sw_mirror_%'")).toBe(SWEEPM);
     expect(await chCount("_id LIKE 'sw_null_%'")).toBe(SWEEPN);
+  });
+
+  it('pair-exact delete spares a native retry that reused the _id at a different cd in the same hour', async () => {
+    // 10 mirrored docs, each with a native counterpart (different ids) —
+    // plus rt_0's native RETRY at the SAME _id, 5s later. An id-in-window
+    // delete would kill both copies of rt_0's event; the pair delete must
+    // remove only the migrated (rt_0, cd) row.
+    const docs: Record<string, unknown>[] = [];
+    const rows: Record<string, unknown>[] = [];
+    for (let i = 0; i < 10; i++) {
+      const cd = FLIP + i * 1_000;
+      docs.push({ _id: `rt_${i}`, uid: 'u', did: 'd', ts: cd, cd: new Date(cd), sg: {}, c: 1 });
+      rows.push({ ...chRow(`rt_${i}`, cd), a: APP4 });               // migrated copy
+      rows.push({ ...chRow(`rt_native_${i}`, cd + 300), a: APP4 }); // native original
+    }
+    rows.push({ ...chRow('rt_0', FLIP + 5_000), a: APP4 });          // native RETRY, same _id, different cd
+    await mc.db(DB).collection(COLL4).insertMany(docs as never[]);
+    await mc.db(DB).collection(COLL4).createIndex({ cd: 1, _id: 1 });
+    await ch.insert({ table: `${DB}.drill_events`, values: rows, format: 'JSONEachRow' });
+
+    const state = newDedupeOverlapState();
+    await runDedupeOverlap({ config, logger, hashResolver }, state, { fromMs: FLIP, toMs: DONE, execute: true });
+    expect(state.status).toBe('completed');
+    const r = state.collections.find((c) => c.collection === COLL4);
+    expect(r?.chMatched).toBe(10); // pair-exact: the retry row is NOT a match
+    expect(r?.deleted).toBe(10);
+    // the retry survived — and it is the ONLY remaining rt_0 row
+    expect(await chCount("_id = 'rt_0'")).toBe(1);
+    expect(await chCount(`_id = 'rt_0' AND toUnixTimestamp64Milli(cd) = ${FLIP + 5_000}`)).toBe(1);
+    expect(await chCount("_id LIKE 'rt_native_%'")).toBe(10);
   });
 
   it('duplicateStats counts migration-duplicate groups exactly, beyond the display-sample cap', async () => {

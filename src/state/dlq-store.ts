@@ -236,6 +236,20 @@ export class DlqStore {
     });
   }
 
+  /**
+   * A cd-window purge (chunk retry) deleted any replay-inserted rows inside
+   * it — clear the flag so verification does not discount rows the redone
+   * chunk now supplies from source (or re-DLQs). Without this, a stale
+   * pre-insert intent whose chunk was later redone would over-expect the
+   * window forever.
+   */
+  async clearReplayInserted(runId: string, collection: string, lowerCdMs: number, upperCdMs: number): Promise<void> {
+    await this.c().updateMany(
+      { run_id: runId, collection, replay_inserted: true, cd_ms: { $gte: lowerCdMs, $lt: upperCdMs } },
+      { $unset: { replay_inserted: '' }, $set: { updated_at: new Date() } },
+    );
+  }
+
   async markResolved(ids: string[], version: string): Promise<void> {
     if (ids.length === 0) return;
     await this.c().updateMany(

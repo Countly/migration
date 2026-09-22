@@ -1721,6 +1721,10 @@ export class ChunkOrchestrator {
         } else {
           await this.purgeWindowByIds(chunk.collection, chunk.lower_cd, chunk.upper_cd);
         }
+        // the purge also deleted any replay-inserted rows in this window —
+        // the redone chunk supplies (or re-DLQs) those docs itself, so the
+        // discount flag must not survive it
+        await this.d.dlq.clearReplayInserted(this.runId, chunk.collection, chunk.lower_cd, chunk.upper_cd);
         collectionsNeedingSweepReset.add(chunk.collection);
       }
       const reset = await ledger.transition(chunk._id, 'failed', 'pending', {

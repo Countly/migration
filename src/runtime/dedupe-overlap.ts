@@ -91,7 +91,6 @@ export function newDedupeOverlapState(): DedupeOverlapState {
 
 export const effectiveSlackPct = (v: number | undefined): number => Math.min(5, Math.max(0, v ?? 0));
 
-const ID_BATCH = 50_000;
 // same shape cap as the rebuild: null-cd docs are outliers by construction
 const MAX_NULLCD_IDS = 1_000_000;
 const BUCKET_MS = 3_600_000;
@@ -178,14 +177,15 @@ export async function runDedupeOverlap(
         }
       }
 
-      const processBucket = async (ids: string[], loMs: number, hiMs: number): Promise<void> => {
-        if (ids.length === 0) return;
-        let matched = 0;
-        for (let i = 0; i < ids.length; i += ID_BATCH) {
-          // scoped: a same-_id row in a SIBLING collection must neither count
-          // as this collection's match nor be touched by its delete
-          matched += await staging.countMatchingIdsInWindow(ids.slice(i, i + ID_BATCH), loMs, hiMs, scope);
-        }
+      const processBucket = async (pairs: Array<{ id: string; cdMs: number }>, loMs: number, hiMs: number): Promise<void> => {
+        if (pairs.length === 0) return;
+        // PAIR-exact matching, never id-in-window: a native retry that
+        // reused a migrated doc's _id at a slightly different cd in the
+        // same hour is native traffic — counting or deleting it as the
+        // migrated copy would lose the only surviving copy of its event.
+        // (Scope still guards the coincidence of a sibling collection's row
+        // sharing the exact same pair.)
+        const matched = await staging.countMatchingPairs(pairs, scope);
         row.chMatched += matched;
         state.totals.chMatched += matched;
         if (matched === 0) return;
@@ -220,23 +220,23 @@ export async function runDedupeOverlap(
           // drift), meaning each fenced call issues exactly one command.
           // Within one command the exposure is milliseconds; an attach takes
           // a chunk's full read-transform-insert-verify cycle.
-          for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+          for (let i = 0; i < pairs.length; i += StagingManager.ID_PARAM_PAGE) {
             if (deps.ledger && fpBefore !== null) {
               const fpNow = await deps.ledger.runFingerprint(config.ledger.runId);
               if (fpNow !== fpBefore) {
                 throw new Error('run chunk state changed during execute — aborted before the next delete page; re-run the dry run with all pods idle');
               }
             }
-            await staging.deleteMatchingIdsInWindow(ids.slice(i, i + StagingManager.ID_PARAM_PAGE), loMs, hiMs, scope);
+            await staging.deleteLiveByPairs(pairs.slice(i, i + StagingManager.ID_PARAM_PAGE), scope);
           }
           row.deleted += matched;
           state.totals.deleted += matched;
         }
       };
 
-      // Old-Mongo ids in the window (cd order → contiguous hour buckets)
+      // Old-Mongo (_id, cd) pairs in the window (cd order → contiguous hour buckets)
       let bucketStart = -1;
-      let ids: string[] = [];
+      let pairs: Array<{ id: string; cdMs: number }> = [];
       const cursor = coll.find({ cd: { $gte: from, $lt: to } }, { projection: { _id: 1, cd: 1 } })
         .sort({ cd: 1 }).batchSize(10_000);
       for await (const doc of cursor) {
@@ -245,16 +245,16 @@ export async function runDedupeOverlap(
         const cdMs = (doc.cd as Date).getTime();
         const bucket = Math.floor(cdMs / BUCKET_MS) * BUCKET_MS;
         if (bucket !== bucketStart) {
-          await processBucket(ids, Math.max(bucketStart, opts.fromMs), Math.min(bucketStart + BUCKET_MS, opts.toMs));
+          await processBucket(pairs, Math.max(bucketStart, opts.fromMs), Math.min(bucketStart + BUCKET_MS, opts.toMs));
           bucketStart = bucket;
-          ids = [];
+          pairs = [];
         }
-        ids.push(String(doc._id));
-        if (ids.length > MAX_BUCKET_IDS) {
+        pairs.push({ id: String(doc._id), cdMs });
+        if (pairs.length > MAX_BUCKET_IDS) {
           throw new Error(`${collection}: more than ${MAX_BUCKET_IDS.toLocaleString('en-US')} docs in one hour bucket — run the dedupe over a smaller {fromMs, toMs} window`);
         }
       }
-      await processBucket(ids, Math.max(bucketStart, opts.fromMs), Math.min(bucketStart + BUCKET_MS, opts.toMs));
+      await processBucket(pairs, Math.max(bucketStart, opts.fromMs), Math.min(bucketStart + BUCKET_MS, opts.toMs));
 
       if (row.mongoDocsInWindow > 0 || row.chMatched > 0) state.collections.push(row);
     }

@@ -524,22 +524,51 @@ export class StagingManager {
    * null-cd sweep) or the collection is unresolvable. Pair matching means a
    * live cross-cutover retry copy (same _id, post-cutover cd) is untouchable.
    */
-  async deleteLiveByPairs(pairs: Array<{ id: string; cdMs: number }>): Promise<void> {
-    if (pairs.length === 0) return;
+  async deleteLiveByPairs(pairs: Array<{ id: string; cdMs: number }>, scope?: { a: string; e: string; n?: string } | null): Promise<void> {
     // Two parallel arrays zipped server-side — the HTTP interface cannot
     // parse a JS array-of-arrays as Array(Tuple(...)). The cd min/max bound
     // lets the mutation prune to the pairs' partitions instead of scanning
-    // the whole table.
-    const lo = Math.min(...pairs.map((p) => p.cdMs));
-    const hi = Math.max(...pairs.map((p) => p.cdMs));
-    await this.ch().command({
-      query: `DELETE FROM ${this.fq(this.config.table)}
-              WHERE cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})
-                AND (_id, toUnixTimestamp64Milli(cd)) IN (
-                SELECT arrayJoin(arrayZip({ids:Array(String)}, {cds:Array(Int64)}))
-              )`,
-      query_params: { ids: pairs.map((p) => p.id), cds: pairs.map((p) => p.cdMs), blo: lo, bhi: hi },
-    });
+    // the whole table. Paged at ID_PARAM_PAGE like every id-parameter query:
+    // a larger batch overruns ClickHouse's ~128KiB HTTP form-field limit.
+    for (let i = 0; i < pairs.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = pairs.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      const lo = Math.min(...page.map((p) => p.cdMs));
+      const hi = Math.max(...page.map((p) => p.cdMs));
+      await this.ch().command({
+        query: `DELETE FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})
+                  AND (_id, toUnixTimestamp64Milli(cd)) IN (
+                  SELECT arrayJoin(arrayZip({ids:Array(String)}, {cds:Array(Int64)}))
+                ) ${this.scopeSql(scope)}`,
+        query_params: { ids: page.map((p) => p.id), cds: page.map((p) => p.cdMs), blo: lo, bhi: hi, ...this.scopeParams(scope) },
+      });
+    }
+  }
+
+  /**
+   * Count live rows equal to EXACT (_id, cd) pairs — pair-exact so a native
+   * retry that reused a migrated doc's _id at a DIFFERENT cd is never
+   * counted (or deleted) as the migrated copy.
+   */
+  async countMatchingPairs(pairs: Array<{ id: string; cdMs: number }>, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
+    let total = 0;
+    for (let i = 0; i < pairs.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = pairs.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      const lo = Math.min(...page.map((p) => p.cdMs));
+      const hi = Math.max(...page.map((p) => p.cdMs));
+      const res = await this.ch().query({
+        query: `SELECT count() AS cnt FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})
+                  AND (_id, toUnixTimestamp64Milli(cd)) IN (
+                  SELECT arrayJoin(arrayZip({ids:Array(String)}, {cds:Array(Int64)}))
+                ) ${this.scopeSql(scope)}`,
+        query_params: { ids: page.map((p) => p.id), cds: page.map((p) => p.cdMs), blo: lo, bhi: hi, ...this.scopeParams(scope) },
+        format: 'JSONEachRow',
+      });
+      const rows = await res.json<{ cnt: string }>();
+      total += Number(rows[0]?.cnt ?? 0);
+    }
+    return total;
   }
 
   /** Staging tables left behind by crashes (crash between done and drop). */
