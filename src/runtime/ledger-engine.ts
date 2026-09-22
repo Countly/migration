@@ -445,8 +445,15 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     const deep = req.body?.deep === true;
     const acceptUnscoped = req.body?.acceptUnscoped === true;
     const tokenFc = mtTokenFc;
-    const hbFc = setInterval(() => { void ledger.renewMaintenance(config.ledger.runId, tokenFc).catch(() => {}); }, 60_000);
-    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep, acceptUnscoped })
+    // a renewal that finds the token GONE means the lease expired and was
+    // taken over — the check must not publish a verdict from its reads
+    const leaseFc = { lost: false };
+    const hbFc = setInterval(() => {
+      void ledger.renewMaintenance(config.ledger.runId, tokenFc)
+        .then((ok) => { if (!ok) leaseFc.lost = true; })
+        .catch(() => { /* transient — the next beat retries; a real takeover returns false once MongoDB answers */ });
+    }, 60_000);
+    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep, acceptUnscoped, leaseLost: () => leaseFc.lost })
       .finally(() => { clearInterval(hbFc); maintenanceOp = null; void ledger.releaseMaintenance(config.ledger.runId, tokenFc).catch(() => {}); });
     launchedFc = true;
     return { started: true, cutoverMs, samples, deep, acceptUnscoped };
@@ -495,6 +502,11 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     }
     const execute = req.body?.execute === true;
     const slackPct = typeof req.body?.slackPct === 'number' ? req.body.slackPct : undefined;
+    if (execute && config.ledger.dryRun) {
+      // the rehearsal service must never delete live rows — same guard as
+      // the bound-apply route
+      return { started: false, reason: 'dry run service — execute deletes LIVE rows; run it on the real deployment' };
+    }
     if (execute) {
       const dry = dedupeState.lastDryRun;
       if (!dry || dry.fromMs !== fromMs || dry.toMs !== toMs || dry.slackPct !== effectiveSlackPct(slackPct)) {
@@ -516,8 +528,13 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       }
     }
     const tokenDd = mtTokenDd;
-    const hbDd = setInterval(() => { void ledger.renewMaintenance(config.ledger.runId, tokenDd).catch(() => {}); }, 60_000);
-    void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct, expectedFingerprint: execute ? dedupeState.lastDryRun?.fingerprint ?? null : null })
+    const leaseDd = { lost: false };
+    const hbDd = setInterval(() => {
+      void ledger.renewMaintenance(config.ledger.runId, tokenDd)
+        .then((ok) => { if (!ok) leaseDd.lost = true; })
+        .catch(() => { /* transient — the next beat retries; a real takeover returns false once MongoDB answers */ });
+    }, 60_000);
+    void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct, expectedFingerprint: execute ? dedupeState.lastDryRun?.fingerprint ?? null : null, leaseLost: () => leaseDd.lost })
       .finally(() => { clearInterval(hbDd); maintenanceOp = null; void ledger.releaseMaintenance(config.ledger.runId, tokenDd).catch(() => {}); });
     launchedDd = true;
     return { started: true, execute, fromMs, toMs };

@@ -92,7 +92,7 @@ export async function runFinalCheck(
     orchestrator: ContentAuditRunner;
   },
   out: FinalCheckResult,
-  opts: { cutoverMs: number | null; samples: number; deep?: boolean; acceptUnscoped?: boolean },
+  opts: { cutoverMs: number | null; samples: number; deep?: boolean; acceptUnscoped?: boolean; leaseLost?: () => boolean },
 ): Promise<void> {
   const { config, ledger, dlq, hashResolver } = deps;
   const logger = deps.logger.child({ component: 'FinalCheck' });
@@ -293,6 +293,14 @@ export async function runFinalCheck(
     const fpAfter = await ledger.runFingerprint(runId);
     if (fpAfter !== fpBefore) {
       out.problems.push('The run\'s chunk state CHANGED while this check ran (a retry, top-up or remap landed mid-check) — every layer above measured a moving target. Let the run settle, then run this check again.');
+    }
+
+    // ── Reservation: did this pod keep the cluster-wide lease throughout? ─
+    // A lost lease means another maintenance operation (a dedupe EXECUTE
+    // deletes target rows the ledger fingerprint cannot see) may have run
+    // under this check's reads — no verdict computed from them may stand.
+    if (opts.leaseLost?.()) {
+      out.problems.push('This check LOST the cluster-wide maintenance reservation while running (the pod stalled past the lease expiry) — another maintenance operation may have changed the target under its reads. Run the check again.');
     }
 
     // ── Verdict ────────────────────────────────────────────────────────────

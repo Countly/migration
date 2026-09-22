@@ -61,12 +61,12 @@ describe('final check: the interpreted sign-off', () => {
   let hashResolver: HashResolver;
   let config: Config;
 
-  const check = async (opts?: { cutoverMs?: number | null; orchestrator?: typeof contentClean; deep?: boolean }) => {
+  const check = async (opts?: { cutoverMs?: number | null; orchestrator?: typeof contentClean; deep?: boolean; leaseLost?: () => boolean }) => {
     const out = newFinalCheckResult();
     await runFinalCheck(
       { config, logger, ledger, dlq, hashResolver, orchestrator: opts?.orchestrator ?? contentClean },
       out,
-      { cutoverMs: opts?.cutoverMs ?? null, samples: 100, deep: opts?.deep ?? true },
+      { cutoverMs: opts?.cutoverMs ?? null, samples: 100, deep: opts?.deep ?? true, leaseLost: opts?.leaseLost },
     );
     expect(out.status).toBe('completed');
     return out;
@@ -221,6 +221,12 @@ describe('final check: the interpreted sign-off', () => {
     const out2 = await check({ cutoverMs: CUTOVER, deep: false, orchestrator: badVerify });
     expect(out2.verdict).toBe('FAIL');
     expect(out2.problems.join(' ')).toContain('different live row count');
+  });
+
+  it('a check that lost the cluster-wide maintenance lease can never publish a PASS', async () => {
+    const out = await check({ cutoverMs: CUTOVER, deep: false, leaseLost: () => true });
+    expect(out.verdict).toBe('FAIL');
+    expect(out.problems.join(' ')).toContain('LOST the cluster-wide maintenance reservation');
   });
 
   it('an unbounded deep check FAILS when the source advances during it (frozen-source bracket)', async () => {

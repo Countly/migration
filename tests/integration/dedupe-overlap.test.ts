@@ -314,6 +314,16 @@ describe('tee-overlap dedupe', () => {
     await ch.insert({ table: `${DB}.drill_events`, values: [{ ...chRow('dsw_n_0', FLIP + 20_000), a: APP5 }], format: 'JSONEachRow' });
   });
 
+  it('a run that lost the cluster-wide maintenance lease fails and grants no license', async () => {
+    const state = newDedupeOverlapState();
+    await runDedupeOverlap({ config, logger, hashResolver }, state, {
+      fromMs: FLIP, toMs: DONE, execute: false, leaseLost: () => true,
+    });
+    expect(state.status).toBe('failed');
+    expect(state.error).toContain('maintenance reservation was LOST');
+    expect(state.lastDryRun).toBeNull();
+  });
+
   it('duplicateStats counts migration-duplicate groups exactly, beyond the display-sample cap', async () => {
     // 25 duplicated ids below the boundary — more than the 20-group sample
     const rows: Record<string, unknown>[] = [];
