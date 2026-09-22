@@ -2365,24 +2365,22 @@ export class ChunkOrchestrator {
         const idDocs = await db.collection(chunk.collection)
           .find({ cd: null }, { projection: { _id: 1, ts: 1 } }).limit(1_000_000).toArray();
         if (idDocs.length === 0) continue;
-        let lo = Infinity, hi = -Infinity;
-        const sweepIds: string[] = [];
+        // PAIR-exact: each sweep row must exist at its doc's own ts-derived
+        // cd — an id-in-range lookup would let a same-_id native retry stand
+        // in for a missing sweep row AND be subtracted from a regular window
+        // it does not belong to
+        const sweepPairs: Array<{ id: string; cdMs: number }> = [];
         for (const d of idDocs) {
-          sweepIds.push(String(d._id));
           const tsMs = toEpochMillis(d.ts);
-          if (tsMs !== null && tsMs > 0) {
-            const c = clampDateTime64(tsMs);
-            if (c < lo) lo = c;
-            if (c > hi) hi = c;
-          }
+          if (tsMs !== null && tsMs > 0) sweepPairs.push({ id: String(d._id), cdMs: clampDateTime64(tsMs) });
         }
         const scope = this.scopeOf(chunk as ChunkDoc);
-        const liveSweep = await this.d.staging.fetchLiveCdByIds(sweepIds, lo <= hi ? { loMs: lo, hiMs: hi } : undefined, scope);
+        const livePairs = sweepPairs.length > 0 ? await this.d.staging.filterLivePairs(sweepPairs, scope) : [];
         checked++;
-        if (liveSweep.size < chunk.rows_expected) {
-          mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live: liveSweep.size });
+        if (livePairs.length < chunk.rows_expected) {
+          mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live: livePairs.length });
         }
-        sweptCdsByCollection.set(chunk.collection, [...liveSweep.values()].sort((a, b) => a - b));
+        sweptCdsByCollection.set(chunk.collection, livePairs.map((p) => p.cdMs).sort((a, b) => a - b));
       }
 
       // Replay-inserted rows: live in their windows, excluded from

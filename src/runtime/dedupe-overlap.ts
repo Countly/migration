@@ -169,11 +169,10 @@ export async function runDedupeOverlap(
           }
         }
         if (nullCdIds.length > 0) {
-          const liveNullCd = await staging.fetchLiveCdByIds(nullCdIds, { loMs: opts.fromMs, hiMs: opts.toMs - 1 }, scope);
-          for (const cdMs of liveNullCd.values()) {
-            const b = Math.floor(cdMs / BUCKET_MS) * BUCKET_MS;
-            sweepByBucket.set(b, (sweepByBucket.get(b) ?? 0) + 1);
-          }
+          // ROW counts, not distinct ids: duplicate sweep copies (ambiguous
+          // insert retries) are in liveTotal too and must all be subtracted
+          const counted = await staging.countRowsByHourBucket(nullCdIds, opts.fromMs, opts.toMs, scope);
+          for (const [b, n] of counted) sweepByBucket.set(b, (sweepByBucket.get(b) ?? 0) + n);
         }
       }
 

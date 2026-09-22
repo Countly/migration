@@ -410,8 +410,17 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     if (maintenanceOp !== null) return { started: false, reason: `${maintenanceOp} is starting — retry in a moment` };
     maintenanceOp = 'final-check'; // synchronous acquire — released in the finally below unless the run launched
     let launchedFc = false;
+    let mtTokenFc: string | null = null;
     try {
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — run the final check after completion (or while paused)' };
+    // CLUSTER-WIDE reservation: another pod's dedupe execute deletes target
+    // rows the ledger fingerprint cannot see — the local lock above only
+    // serializes THIS pod's routes
+    mtTokenFc = `final-check:${config.worker.podId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const acq = await ledger.acquireMaintenance(config.ledger.runId, 'final-check', mtTokenFc);
+      if (!acq.acquired) { mtTokenFc = null; return { started: false, reason: `another maintenance operation (${acq.holder}) holds the cluster-wide reservation — wait for it to finish` }; }
+    } catch { mtTokenFc = null; return { started: false, reason: 'could not acquire the cluster-wide maintenance reservation — retry when MongoDB answers' }; }
     // no exclusion: the SERVING pod's own live claims block the check too —
     // a paused pod mid-chunk still owns half-written state
     const busyFc = await ledger.activeClaims(config.ledger.runId);
@@ -435,12 +444,17 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     const samples = Math.min(10_000, Math.max(50, typeof req.body?.samples === 'number' && Number.isFinite(req.body.samples) ? req.body.samples : 500));
     const deep = req.body?.deep === true;
     const acceptUnscoped = req.body?.acceptUnscoped === true;
+    const tokenFc = mtTokenFc;
+    const hbFc = setInterval(() => { void ledger.renewMaintenance(config.ledger.runId, tokenFc).catch(() => {}); }, 60_000);
     void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep, acceptUnscoped })
-      .finally(() => { maintenanceOp = null; });
+      .finally(() => { clearInterval(hbFc); maintenanceOp = null; void ledger.releaseMaintenance(config.ledger.runId, tokenFc).catch(() => {}); });
     launchedFc = true;
     return { started: true, cutoverMs, samples, deep, acceptUnscoped };
     } finally {
-      if (!launchedFc) maintenanceOp = null;
+      if (!launchedFc) {
+        maintenanceOp = null;
+        if (mtTokenFc !== null) void ledger.releaseMaintenance(config.ledger.runId, mtTokenFc).catch(() => {});
+      }
     }
   });
   app.get('/api/final-check', async () => finalCheckState);
@@ -457,7 +471,14 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     if (maintenanceOp !== null) return { started: false, reason: `${maintenanceOp} is starting — retry in a moment` };
     maintenanceOp = 'dedupe'; // synchronous acquire — released in the finally below unless the run launched
     let launchedDd = false;
+    let mtTokenDd: string | null = null;
     try {
+    // CLUSTER-WIDE reservation (see the final-check route)
+    mtTokenDd = `dedupe:${config.worker.podId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const acq = await ledger.acquireMaintenance(config.ledger.runId, 'dedupe', mtTokenDd);
+      if (!acq.acquired) { mtTokenDd = null; return { started: false, reason: `another maintenance operation (${acq.holder}) holds the cluster-wide reservation — wait for it to finish` }; }
+    } catch { mtTokenDd = null; return { started: false, reason: 'could not acquire the cluster-wide maintenance reservation — retry when MongoDB answers' }; }
     // destructive against the live table: the migration must be fully
     // stopped — no pod (this one included) may hold an active chunk claim,
     // dry run included, so the counts it licenses execute with are stable
@@ -494,12 +515,17 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         return { started: false, reason: 'execute refused: the run state changed since the dry run — its counts no longer describe the grid; re-run the dry run with all pods idle' };
       }
     }
+    const tokenDd = mtTokenDd;
+    const hbDd = setInterval(() => { void ledger.renewMaintenance(config.ledger.runId, tokenDd).catch(() => {}); }, 60_000);
     void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct, expectedFingerprint: execute ? dedupeState.lastDryRun?.fingerprint ?? null : null })
-      .finally(() => { maintenanceOp = null; });
+      .finally(() => { clearInterval(hbDd); maintenanceOp = null; void ledger.releaseMaintenance(config.ledger.runId, tokenDd).catch(() => {}); });
     launchedDd = true;
     return { started: true, execute, fromMs, toMs };
     } finally {
-      if (!launchedDd) maintenanceOp = null;
+      if (!launchedDd) {
+        maintenanceOp = null;
+        if (mtTokenDd !== null) void ledger.releaseMaintenance(config.ledger.runId, mtTokenDd).catch(() => {});
+      }
     }
   });
   app.get('/api/dedupe-overlap', async () => dedupeState);
@@ -600,6 +626,18 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     } catch {
       return { applied: false, reason: 'could not acquire the apply marker — retry when MongoDB answers' };
     }
+    // Heartbeat: a LEGITIMATE long apply (huge-grid prune pages, MongoDB
+    // stalls) must not expire mid-flight — expiry would let claimers restore
+    // its journal and a second apply take over while it still prunes. A
+    // renewal that finds the token GONE means a takeover already happened
+    // (this process stalled past expiry): abort before the next destructive
+    // step rather than fight the takeover.
+    let markerLost = false;
+    const markerHeartbeat = setInterval(() => {
+      void ledger.renewApplyMarker(config.ledger.runId, applyToken)
+        .then((ok) => { if (!ok) markerLost = true; })
+        .catch(() => { /* transient — the next beat retries; only a lost token aborts */ });
+    }, 60_000);
     try {
       // an earlier apply that died mid-flight left journal receipts — restore
       // them (under the governing bound, so a committed apply's leftovers are
@@ -613,6 +651,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         restores.push(r);
       };
       const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, journalSink);
+      if (markerLost) throw new Error('the apply marker was taken over mid-apply (this process stalled past the marker expiry) — aborted before storing the bound; the takeover governs now');
       // Compare-and-set against the prior bound this call validated: two
       // concurrent applies cannot both win — the loser rolls its prune back.
       storeAttempted = true;
@@ -640,6 +679,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       // active claim. EVERY receipt collected so far rolls back on failure —
       // no half-applied state and no grid gaps, whichever step failed.
       try {
+        if (markerLost) throw new Error('the apply marker was taken over mid-apply (this process stalled past the marker expiry) — rolling back; the takeover governs now');
         const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, journalSink);
         const claimsAfter = await ledger.activeClaims(config.ledger.runId);
         if (claimsAfter.length > 0) {
@@ -714,6 +754,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       await ledger.clearPruneJournal(config.ledger.runId, applyToken).catch(() => {});
       return { applied: false, reason: (err as Error).message };
     } finally {
+      clearInterval(markerHeartbeat);
       // best-effort: a clear that fails leaves the marker to its 10-minute
       // expiry — claims release (visibly, safely) until then
       await ledger.clearApplyMarker(config.ledger.runId, applyToken).catch(() => {});

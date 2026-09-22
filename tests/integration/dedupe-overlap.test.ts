@@ -44,6 +44,9 @@ const SWEEPN = 35;
 // in the same hour — pair-exact deletion must spare it
 const APP4 = 'app_dd_retry';
 const COLL4 = `drill_events${createHash('sha1').update('views' + APP4).digest('hex')}`;
+// fifth app: DUPLICATE sweep copies must all subtract from native evidence
+const APP5 = 'app_dd_dupsweep';
+const COLL5 = `drill_events${createHash('sha1').update('views' + APP5).digest('hex')}`;
 // base collection: no per-collection (a,e,n) scope resolvable — its matches
 // must never be deleted, even though sibling native traffic fills the table
 const BASE = 20;
@@ -74,9 +77,9 @@ describe('tee-overlap dedupe', () => {
     await mc.connect();
     await mc.db(DB).dropDatabase();
     await mc.db(`${DB}_countly`).dropDatabase();
-    await mc.db(`${DB}_countly`).collection('apps').insertMany([{ _id: APP }, { _id: APP2 }, { _id: APP3 }, { _id: APP4 }] as never[]);
+    await mc.db(`${DB}_countly`).collection('apps').insertMany([{ _id: APP }, { _id: APP2 }, { _id: APP3 }, { _id: APP4 }, { _id: APP5 }] as never[]);
     await mc.db(`${DB}_countly`).collection('events').insertMany([
-      { _id: APP, list: ['views'] }, { _id: APP2, list: ['views'] }, { _id: APP3, list: ['views'] }, { _id: APP4, list: ['views'] },
+      { _id: APP, list: ['views'] }, { _id: APP2, list: ['views'] }, { _id: APP3, list: ['views'] }, { _id: APP4, list: ['views'] }, { _id: APP5, list: ['views'] },
     ] as never[]);
 
     ch = createClient({ url: CH_URL, password: CH_PASSWORD });
@@ -273,6 +276,42 @@ describe('tee-overlap dedupe', () => {
     expect(await chCount("_id = 'rt_0'")).toBe(1);
     expect(await chCount(`_id = 'rt_0' AND toUnixTimestamp64Milli(cd) = ${FLIP + 5_000}`)).toBe(1);
     expect(await chCount("_id LIKE 'rt_native_%'")).toBe(10);
+  });
+
+  it('duplicate sweep copies all subtract from native evidence — extras never masquerade as natives', async () => {
+    // 5 migrated only-copies, 3 sweep rows, one of which has 5 duplicate
+    // copies (ambiguous insert retries): liveTotal = 13, matched = 5.
+    // Distinct-id subtraction would leave native = 13-5-3 = 5 >= 5 and
+    // DELETE the only copies; row-count subtraction gives 13-5-8 = 0.
+    const docs: Record<string, unknown>[] = [];
+    const rows: Record<string, unknown>[] = [];
+    for (let i = 0; i < 5; i++) {
+      const cd = FLIP + i * 1_000;
+      docs.push({ _id: `dsw_m_${i}`, uid: 'u', did: 'd', ts: cd, cd: new Date(cd), sg: {}, c: 1 });
+      rows.push({ ...chRow(`dsw_m_${i}`, cd), a: APP5 });
+    }
+    for (let i = 0; i < 3; i++) {
+      const cd = FLIP + 20_000 + i * 100;
+      docs.push({ _id: `dsw_n_${i}`, uid: 'u', did: 'd', ts: cd, cd: null, sg: {}, c: 1 });
+      rows.push({ ...chRow(`dsw_n_${i}`, cd), a: APP5 });
+    }
+    for (let k = 0; k < 5; k++) rows.push({ ...chRow('dsw_n_0', FLIP + 20_000), a: APP5 }); // duplicate sweep copies
+    await mc.db(DB).collection(COLL5).insertMany(docs as never[]);
+    await mc.db(DB).collection(COLL5).createIndex({ cd: 1, _id: 1 });
+    await ch.insert({ table: `${DB}.drill_events`, values: rows, format: 'JSONEachRow' });
+
+    const state = newDedupeOverlapState();
+    await runDedupeOverlap({ config, logger, hashResolver }, state, { fromMs: FLIP, toMs: DONE, execute: true });
+    expect(state.status).toBe('completed');
+    const r = state.collections.find((c) => c.collection === COLL5);
+    expect(r?.deleted).toBe(0);
+    expect(r?.unsafe.every((u) => u.reason === 'no-native-evidence')).toBe(true);
+    expect(await chCount("_id LIKE 'dsw_m_%'")).toBe(5); // only-copies survived
+
+    // collapse the duplicate copies again — the duplicateStats test below
+    // counts duplicate groups exactly
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'dsw_n_0'` });
+    await ch.insert({ table: `${DB}.drill_events`, values: [{ ...chRow('dsw_n_0', FLIP + 20_000), a: APP5 }], format: 'JSONEachRow' });
   });
 
   it('duplicateStats counts migration-duplicate groups exactly, beyond the display-sample cap', async () => {

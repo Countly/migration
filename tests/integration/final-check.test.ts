@@ -291,6 +291,15 @@ describe('final check: the interpreted sign-off', () => {
     expect(out.verdict).toBe('FAIL');
     expect(out.audit?.mismatchedWindows.some((w) => w.lowerCd === 'null-cd sweep')).toBe(true);
 
+    // a native retry that reused n_1's _id at a DIFFERENT cd inside the
+    // derived range must NOT stand in for the missing sweep row — matching
+    // is pair-exact against each doc's own ts-derived cd
+    await ch.insert({ table: `${DB}.drill_events`, format: 'JSONEachRow', values: [chRow('n_1', ts + 400)] });
+    const outRetry = await check({ cutoverMs: CUTOVER });
+    expect(outRetry.verdict).toBe('FAIL');
+    expect(outRetry.audit?.mismatchedWindows.some((w) => w.lowerCd === 'null-cd sweep')).toBe(true);
+    await ch.command({ query: `DELETE FROM ${DB}.drill_events WHERE _id = 'n_1'` });
+
     // waiving the missing null-cd doc is an ACCEPTED exclusion — the sweep
     // expectation must discount it, exactly like regular windows do
     await dlq.add([{

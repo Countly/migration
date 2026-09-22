@@ -491,6 +491,7 @@ export class LedgerStore {
     apply_in_progress_token?: string; apply_in_progress_at?: Date;
     start_gate_open?: boolean; start_gate_opened_at?: Date; start_gate_opened_by?: string;
     unbounded_ok?: boolean; unbounded_ok_by?: string; unbounded_ok_at?: Date;
+    maintenance_op?: string; maintenance_token?: string; maintenance_at?: Date;
   }> {
     if (!this.coll) throw new Error('LedgerStore not connected');
     return this.client.db(this.dbName).collection('mig_run_config');
@@ -606,6 +607,61 @@ export class LedgerStore {
     const applying = !!doc?.apply_in_progress_token
       && (doc.apply_in_progress_at?.getTime() ?? 0) > Date.now() - 600_000;
     return { boundMs: doc?.cd_upper_bound_ms ?? null, token: doc?.bound_token ?? null, applying };
+  }
+
+  /** Token-scoped heartbeat: keep a LEGITIMATE long apply's marker alive (huge-grid prunes, MongoDB stalls). False = the token was taken over — the apply must abort. */
+  async renewApplyMarker(runId: string, token: string): Promise<boolean> {
+    const res = await this.rc().updateOne(
+      { _id: runId, apply_in_progress_token: token },
+      { $set: { apply_in_progress_at: new Date() } },
+    );
+    return res.matchedCount > 0;
+  }
+
+  /**
+   * CAS-acquire the CLUSTER-WIDE maintenance reservation: final check and
+   * dedupe are destructive-vs-audit exclusive, and pods route their HTTP
+   * requests independently — a process-local lock cannot see the other
+   * pod's operation. Stale after 10 min without renewal (running ops
+   * heartbeat); a crashed holder's reservation is taken over then.
+   */
+  async acquireMaintenance(runId: string, op: string, token: string): Promise<{ acquired: boolean; holder?: string }> {
+    const staleBefore = new Date(Date.now() - 600_000);
+    try {
+      const res = await this.rc().updateOne(
+        {
+          _id: runId,
+          $or: [
+            { maintenance_token: { $exists: false } },
+            { maintenance_at: { $lt: staleBefore } },
+          ],
+        },
+        { $set: { maintenance_op: op, maintenance_token: token, maintenance_at: new Date() } },
+        { upsert: true },
+      );
+      if (res.matchedCount > 0 || (res.upsertedCount ?? 0) === 1) return { acquired: true };
+    } catch (err) {
+      if ((err as { code?: number }).code !== 11000) throw err;
+    }
+    const doc = await this.rc().findOne({ _id: runId });
+    return { acquired: false, holder: doc?.maintenance_op ?? 'unknown' };
+  }
+
+  /** Token-scoped heartbeat for the maintenance reservation. */
+  async renewMaintenance(runId: string, token: string): Promise<boolean> {
+    const res = await this.rc().updateOne(
+      { _id: runId, maintenance_token: token },
+      { $set: { maintenance_at: new Date() } },
+    );
+    return res.matchedCount > 0;
+  }
+
+  /** Release the maintenance reservation — only its own token can. */
+  async releaseMaintenance(runId: string, token: string): Promise<void> {
+    await this.rc().updateOne(
+      { _id: runId, maintenance_token: token },
+      { $unset: { maintenance_op: '', maintenance_token: '', maintenance_at: '' } },
+    );
   }
 
   /**

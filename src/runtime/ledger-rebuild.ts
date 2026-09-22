@@ -207,26 +207,27 @@ export async function rebuildLedger(opts: {
       // Null-cd outliers: fetch ids + live cd values so sweep rows can be
       // subtracted from the regular windows their ts-derived cd landed in.
       const nullCdIds: string[] = [];
-      let derivedLo = Infinity, derivedHi = -Infinity;
+      // PAIR-exact presence: each doc's row must exist at its own ts-DERIVED
+      // cd — an id-anywhere-in-range lookup would let a native retry that
+      // reused the _id at a different cd stand in for the missing sweep row
+      // (and be subtracted from a regular window it does not belong to).
+      const nullCdPairs: Array<{ id: string; cdMs: number }> = [];
       const idCursor = coll.find({ cd: null }, { projection: { _id: 1, ts: 1 } }).batchSize(10_000);
       for await (const doc of idCursor) {
         nullCdIds.push(String(doc._id));
         const tsMs = toEpochMillis(doc.ts);
         if (tsMs !== null && tsMs > 0) {
-          const d = clampDateTime64(tsMs); // the sweep's derived cd
-          if (d < derivedLo) derivedLo = d;
-          if (d > derivedHi) derivedHi = d;
+          nullCdPairs.push({ id: String(doc._id), cdMs: clampDateTime64(tsMs) }); // the sweep's derived cd
         }
         if (nullCdIds.length >= MAX_NULLCD_IDS) {
           throw new Error(`${collection}: more than ${MAX_NULLCD_IDS.toLocaleString('en-US')} null-cd documents — not outliers; rebuild does not support this shape`);
         }
       }
       summary.nullCdDocs = nullCdIds.length;
-      const liveNullCd = nullCdIds.length > 0
-        ? await staging.fetchLiveCdByIds(nullCdIds, derivedLo <= derivedHi ? { loMs: derivedLo, hiMs: derivedHi } : undefined, scope)
-        : new Map<string, number>();
+      const livePairs = nullCdPairs.length > 0 ? await staging.filterLivePairs(nullCdPairs, scope) : [];
+      const liveNullCd = new Set(livePairs.map((p) => p.id));
       summary.nullCdSwept = liveNullCd.size;
-      const sweptCds = [...liveNullCd.values()].sort((a, b) => a - b);
+      const sweptCds = livePairs.map((p) => p.cdMs).sort((a, b) => a - b);
 
       let bounds: Array<{ lowerCd: number; upperCd: number }> = [];
       if (lowDoc && highDoc) {

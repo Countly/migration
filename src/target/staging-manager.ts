@@ -546,6 +546,61 @@ export class StagingManager {
   }
 
   /**
+   * Live ROW count per hour bucket for the given ids — counts every copy,
+   * unlike fetchLiveCdByIds's Map which collapses duplicates of an id to
+   * one entry. Dedupe subtracts sweep rows from native evidence with this,
+   * so duplicate sweep copies can never masquerade as native counterparts.
+   */
+  async countRowsByHourBucket(ids: string[], loMs: number, hiMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<Map<number, number>> {
+    const out = new Map<number, number>();
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      const res = await this.ch().query({
+        query: `SELECT intDiv(toUnixTimestamp64Milli(cd), 3600000) AS b, count() AS cnt
+                FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
+                  AND _id IN {ids:Array(String)} ${this.scopeSql(scope)}
+                GROUP BY b`,
+        query_params: { ids: page, lo: loMs, hi: hiMs, ...this.scopeParams(scope) },
+        format: 'JSONEachRow',
+      });
+      for (const row of await res.json<{ b: string; cnt: string }>()) {
+        const bucket = Number(row.b) * 3_600_000;
+        out.set(bucket, (out.get(bucket) ?? 0) + Number(row.cnt));
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The subset of EXACT (_id, cd) pairs that exist live (distinct pairs).
+   * Pair-exact presence for null-cd sweep audits: an id-in-range lookup
+   * would let a native retry that reused the _id at a different cd stand in
+   * for the missing transformed sweep row.
+   */
+  async filterLivePairs(pairs: Array<{ id: string; cdMs: number }>, scope?: { a: string; e: string; n?: string } | null): Promise<Array<{ id: string; cdMs: number }>> {
+    const out: Array<{ id: string; cdMs: number }> = [];
+    for (let i = 0; i < pairs.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = pairs.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      const lo = Math.min(...page.map((p) => p.cdMs));
+      const hi = Math.max(...page.map((p) => p.cdMs));
+      const res = await this.ch().query({
+        query: `SELECT DISTINCT _id, toUnixTimestamp64Milli(cd) AS cd_ms FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})
+                  AND (_id, toUnixTimestamp64Milli(cd)) IN (
+                  SELECT arrayJoin(arrayZip({ids:Array(String)}, {cds:Array(Int64)}))
+                ) ${this.scopeSql(scope)}`,
+        query_params: { ids: page.map((p) => p.id), cds: page.map((p) => p.cdMs), blo: lo, bhi: hi, ...this.scopeParams(scope) },
+        format: 'JSONEachRow',
+      });
+      for (const row of await res.json<{ _id: string; cd_ms: string }>()) {
+        out.push({ id: row._id, cdMs: Number(row.cd_ms) });
+      }
+    }
+    return out;
+  }
+
+  /**
    * Count live rows equal to EXACT (_id, cd) pairs — pair-exact so a native
    * retry that reused a migrated doc's _id at a DIFFERENT cd is never
    * counted (or deleted) as the migrated copy.

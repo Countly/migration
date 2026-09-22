@@ -198,6 +198,26 @@ describe('tee-boundary detection + sync parity', () => {
     expect(await ledger.getStoredBound(RUN2)).toBe(1_000_000_000_000);
   });
 
+  it('apply-marker renewal is token-scoped; the maintenance reservation is a cluster-wide CAS', async () => {
+    const RM = 'marker-renew-1';
+    expect(await ledger.acquireApplyMarker(RM, 'hb1')).toBe(true);
+    expect(await ledger.renewApplyMarker(RM, 'hb1')).toBe(true);
+    expect(await ledger.renewApplyMarker(RM, 'OTHER')).toBe(false);
+    expect(await ledger.clearApplyMarker(RM, 'hb1')).toBe(true);
+    expect(await ledger.renewApplyMarker(RM, 'hb1')).toBe(false); // cleared = gone
+
+    const RMM = 'maint-1';
+    expect((await ledger.acquireMaintenance(RMM, 'final-check', 't1')).acquired).toBe(true);
+    expect(await ledger.acquireMaintenance(RMM, 'dedupe', 't2')).toEqual({ acquired: false, holder: 'final-check' });
+    expect(await ledger.renewMaintenance(RMM, 't1')).toBe(true);
+    expect(await ledger.renewMaintenance(RMM, 't2')).toBe(false);
+    await ledger.releaseMaintenance(RMM, 't2'); // wrong token — must be a no-op
+    expect((await ledger.acquireMaintenance(RMM, 'dedupe', 't3')).acquired).toBe(false);
+    await ledger.releaseMaintenance(RMM, 't1');
+    expect((await ledger.acquireMaintenance(RMM, 'dedupe', 't4')).acquired).toBe(true);
+    await ledger.releaseMaintenance(RMM, 't4');
+  });
+
   it('prune journal: orphaned receipts restore under the governing bound; live applies are skipped', async () => {
     const mk = (run: string, id: string, lo: number, up: number) => ({
       _id: id, run_id: run, collection: 'c', idx: 0, lower_cd: lo, upper_cd: up,
