@@ -327,6 +327,9 @@ describe('tee-overlap dedupe', () => {
   it('duplicateStats counts migration-duplicate groups exactly, beyond the display-sample cap', async () => {
     // 25 duplicated ids below the boundary — more than the 20-group sample
     const rows: Record<string, unknown>[] = [];
+    // two SIBLING-scope rows sharing an _id below the boundary: a legitimate
+    // cross-collection id reuse, never a migration duplicate
+    rows.push(chRow('xdup_scope', FLIP - 3_600_000), { ...chRow('xdup_scope', FLIP - 3_500_000), a: 'other_scope_app' });
     for (let i = 0; i < 25; i++) {
       const cd = FLIP - 7_200_000 + i * 1_000;
       rows.push(chRow(`dupg_${i}`, cd), chRow(`dupg_${i}`, cd + 1));

@@ -470,8 +470,8 @@ export class StagingManager {
                        toUnixTimestamp64Milli(min(cd)) AS lo, toUnixTimestamp64Milli(max(cd)) AS hi,
                        sum(c - 1) OVER () AS excess,
                        sum(mc >= 2) OVER () AS mg
-                FROM (SELECT _id, cd FROM ${this.fq(this.config.table)} WHERE _partition_id = {p:String})
-                GROUP BY _id HAVING c > 1
+                FROM (SELECT _id, a, e, n, cd FROM ${this.fq(this.config.table)} WHERE _partition_id = {p:String})
+                GROUP BY _id, a, e, n HAVING c > 1
                 ORDER BY mc DESC, c DESC LIMIT {lim:UInt32}`,
         query_params: { b: boundaryMs, p: p.partition, lim: sampleLimit },
         format: 'JSONEachRow',
