@@ -109,6 +109,8 @@ class ClaimLostError extends Error {
 }
 
 const MAX_CHUNK_ATTEMPTS = 3;
+/** Liveness lookback for the boundary guard: a full day, so quiet spells on low-volume deployments cannot slip a mirrored target past the probe. */
+const GUARD_LIVE_LOOKBACK_MS = 24 * 3_600_000;
 const BISECT_LOG_THRESHOLD = 1;
 
 function shortHash(s: string): string {
@@ -138,7 +140,7 @@ export class ChunkOrchestrator {
   private consecutiveFailed = 0;
   private sourceShrankChunks = 0;
   private streakHadPermanent = false;
-  private pauseReason: 'operator' | 'not-started' | 'breaker-transient' | 'breaker-data' | null = null;
+  private pauseReason: 'operator' | 'not-started' | 'boundary-unset' | 'breaker-transient' | 'breaker-data' | null = null;
   private probeOkStreak = 0;
   private autoResuming = false;
   private resumeProbeTimer: NodeJS.Timeout | null = null;
@@ -159,12 +161,16 @@ export class ChunkOrchestrator {
 
   private lastPressure: { state: PressureState; at: number } | null = null;
 
+  /** The env-pinned bound as of process start — immutable, unlike config.ledger.cdUpperBoundMs which map-pass ADOPTION overwrites with the (mutable) stored bound. */
+  private readonly envBoundMs: number | null;
+
   constructor(deps: ChunkOrchestratorDeps) {
     this.d = deps;
     this.logger = deps.logger.child({ component: 'ChunkOrchestrator' });
     this.dryRun = deps.config.ledger.dryRun;
     this.runId = this.dryRun ? `${deps.config.ledger.runId}-dry` : deps.config.ledger.runId;
     this.podId = deps.config.worker.podId;
+    this.envBoundMs = deps.config.ledger.cdUpperBoundMs ?? null;
   }
 
   // -------------------------------------------------------------------------
@@ -172,13 +178,20 @@ export class ChunkOrchestrator {
   // -------------------------------------------------------------------------
 
   stopAfterChunk(): void { this.stopping = true; }
-  pause(reason: 'operator' | 'not-started' | 'breaker-transient' | 'breaker-data' = 'operator'): void {
+  pause(reason: 'operator' | 'not-started' | 'boundary-unset' | 'breaker-transient' | 'breaker-data' = 'operator'): void {
     this.paused = true;
     this.pauseReason = reason;
     if (this.status === 'running') this.status = 'paused';
   }
 
-  resume(): void {
+  resume(clearBoundaryHold = false): void {
+    // the boundary question is only answered by a bound or the explicit
+    // no-mirror ack — a plain Resume (API or UI) must not clear the hold,
+    // or the run migrates unbounded until the next 5-minute probe
+    if (this.paused && this.pauseReason === 'boundary-unset' && !clearBoundaryHold) {
+      this.logger.warn('Resume ignored while the boundary question is open — apply a bound (POST /control/set-boundary) or declare no-mirror (POST /control/allow-unbounded)');
+      return;
+    }
     this.paused = false;
     this.pauseReason = null;
     // clean slate: without this, one stray failure after resume re-trips
@@ -206,6 +219,157 @@ export class ChunkOrchestrator {
   // -------------------------------------------------------------------------
   // Main
   // -------------------------------------------------------------------------
+
+  /**
+   * The last line of the map-vs-apply defense: if a stored bound exists and
+   * the freshly claimed chunk lies at/beyond it, the chunk is superseded
+   * (never read); a straddler is clamped in place before processing.
+   */
+  /**
+   * True while orphaned prune-journal receipts exist, after attempting to
+   * recover them. Non-empty means a bound apply died mid-flight and the grid
+   * may be MUTILATED: a clamped straddler processed now would permanently
+   * lose its truncated range (the restore only touches pending chunks).
+   * Entries owned by a live apply marker stay (that apply settles them).
+   */
+  private async pruneJournalHolds(): Promise<boolean> {
+    if (await this.d.ledger.countPruneJournal(this.runId) === 0) return false;
+    const rec = await this.d.ledger.recoverPruneJournal(this.runId, this.envBoundMs);
+    if (rec.recovered > 0) this.logger.warn(rec, 'Restored prune-journal receipts from a bound apply that died mid-flight');
+    return (await this.d.ledger.countPruneJournal(this.runId)) > 0;
+  }
+
+  private async supersedeIfBeyondBound(chunk: ChunkDoc): Promise<boolean> {
+    if (chunk.lower_cd < 0) return false; // sentinel sweep — no cd semantics
+    // Orphaned prune journal: no chunk is processed until it drains — this
+    // is also the RETRY site for receipts skipped at startup because their
+    // apply marker was still live (nothing else re-runs recovery after the
+    // marker expires).
+    try {
+      if (await this.pruneJournalHolds()) {
+        await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+        this.logger.info({ chunk: chunk._id }, 'Orphaned prune journal present — claim released until it drains');
+        await sleep(1_000);
+        return true;
+      }
+    } catch {
+      // unreadable journal = unknown grid provenance — do not process
+      await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+      return true;
+    }
+    let bound: number | null = null;
+    let boundToken: string | null = null;
+    try {
+      // env bound is immutable; the config value is NOT (adoption overwrites
+      // it with the stored bound, which the dashboard may have LOWERED since)
+      // — so absent an env pin, the CURRENT stored value is always re-read
+      if (this.envBoundMs !== null) {
+        bound = this.envBoundMs; // immutable — never rolls back, no token
+      } else {
+        const state = await this.d.ledger.getBoundState(this.runId);
+        if (state.applying) {
+          // an apply is mid-flight: the grid is PROVISIONAL (pruned/clamped
+          // chunks may still roll back) — hold nothing until it settles
+          await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+          this.logger.info({ chunk: chunk._id }, 'Bound apply in flight — claim released until the grid settles');
+          await sleep(1_000);
+          return true;
+        }
+        bound = state.boundMs;
+        boundToken = state.token;
+      }
+    } catch {
+      // cannot read the bound — do not process on unknown configuration
+      await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+      return true;
+    }
+    if (bound === null) return false;
+    if (chunk.lower_cd >= bound) {
+      try {
+        await this.d.ledger.supersede(chunk._id, this.podId, boundToken);
+      } catch {
+        // failing to persist the supersede must not process the chunk:
+        // release (or let the lease expire) — the next claimer re-runs
+        // this fence against durable state
+        await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+      }
+      this.logger.warn({ chunk: chunk._id, bound }, 'Claimed chunk lies beyond the stored bound — superseded, never read');
+      return true;
+    }
+    if (chunk.upper_cd > bound) {
+      try {
+        await this.d.ledger.clampUpper(chunk._id, bound);
+      } catch (err) {
+        // an in-memory-only clamp would let the chunk complete with counts
+        // for a range its durable document does not describe — release the
+        // claim instead and let the next claimer retry the clamp
+        this.logger.warn({ chunk: chunk._id, err: (err as Error).message }, 'Durable clamp failed — releasing the claim untouched');
+        await this.d.ledger.releaseClaim(chunk._id, this.podId).catch(() => {});
+        return true;
+      }
+      chunk.upper_cd = bound;
+      this.logger.warn({ chunk: chunk._id, bound }, 'Claimed straddler clamped to the stored bound before reading');
+    }
+    return false;
+  }
+
+  private async boundaryGuard(): Promise<void> {
+    const { config } = this.d;
+    if (config.ledger.cdUpperBoundMs != null || config.ledger.unboundedOk) return;
+
+    // 'proceed' | 'hold'. Evidence failures HOLD: absence of evidence is not
+    // evidence of a mirror-free topology — proceeding unbounded on a probe
+    // error is exactly the silent-duplication path this guard closes. The
+    // liveness lookback is a full day so a low-volume deployment's quiet
+    // spells cannot slip a mirrored target past the probe.
+    const evaluate = async (): Promise<'proceed' | 'hold'> => {
+      try {
+        if ((await this.d.ledger.getStoredBound(this.runId)) !== null) return 'proceed';
+        if (await this.d.ledger.getUnboundedAck(this.runId)) return 'proceed';
+        // no shortcut for runs with mapped state: only a bound or an explicit
+        // no-mirror answer settles the question — restarts re-ask it when
+        // the target is live (one click; the ack persists cluster-wide)
+        // NO automatic verdict exists: even an authoritative zero-row count
+        // proves only CURRENT emptiness — a tee that is enabled but has not
+        // carried its first request yet looks identical to no-mirror, and
+        // mirroring status is simply not observable from data. The question
+        // is answered exactly once per run, by the operator (Proceed
+        // unbounded / a bound) or declaratively (LEDGER_UNBOUNDED_OK for
+        // topologies known to have no mirror, e.g. fire-and-forget Jobs).
+        return 'hold';
+      } catch (err) {
+        this.logger.warn({ err: (err as Error).message }, 'Boundary guard: evidence probe failed — holding until the stores answer');
+        return 'hold';
+      }
+    };
+
+    if ((await evaluate()) === 'proceed') return;
+    this.pause('boundary-unset');
+    // best-effort target description for the log — the DECISION never
+    // depends on it (mirroring status is not observable from data)
+    let targetDesc = 'state unknown';
+    try {
+      const rows = await this.d.staging.liveRowCountStrict();
+      targetDesc = rows === null ? 'table absent' : rows === 0 ? 'currently empty' : `${rows} rows`;
+    } catch { /* description only */ }
+    this.logger.warn(
+      { runId: this.runId, target: targetDesc },
+      'GUARD: no cd upper bound is set and no no-mirror declaration exists — if a mirror re-ingests the same requests on both sides, running unbounded WILL duplicate the overlap. Apply a bound (POST /control/set-boundary), declare no-mirror (POST /control/allow-unbounded), or deploy with LEDGER_UNBOUNDED_OK=1 for topologies known to have no mirror.',
+    );
+    while (!this.stopping) {
+      await sleep(3_000);
+      if ((await evaluate()) === 'proceed') {
+        this.logger.warn({ runId: this.runId }, 'Boundary guard released — a bound was applied or no-mirror was declared');
+        this.resume(true);
+        return;
+      }
+      if (!this.paused) {
+        // a plain Resume does not answer the mirror question — re-hold
+        this.pause('boundary-unset');
+        this.logger.warn('Resume ignored while the boundary question is open — apply a bound or POST /control/allow-unbounded');
+      }
+    }
+  }
 
   async run(): Promise<void> {
     this.status = 'running';
@@ -242,6 +406,18 @@ export class ChunkOrchestrator {
       }
     }
 
+    // ── UNBOUNDED-WITH-LIVE-TARGET GUARD ──────────────────────────────────
+    // The one mistake the tool cannot detect afterwards (seen in the field): a
+    // mirrored cutover migrated without LEDGER_CD_UPPER_BOUND duplicates the
+    // whole overlap window. The condition IS detectable up front — a fresh
+    // run whose target ClickHouse is already receiving live data — so the
+    // run holds there until the operator answers the mirror question: apply
+    // a bound (set-boundary), or declare no-mirror (allow-unbounded).
+    if (!this.dryRun) {
+      await this.boundaryGuard();
+      if (this.stopping) { this.status = 'stopped'; return; }
+    }
+
     // Transient-outage self-healing: only acts while paused with reason
     // 'breaker-transient' (backend outage tripped the failure breaker) —
     // every other pause stays owned by the operator.
@@ -249,6 +425,15 @@ export class ChunkOrchestrator {
       void this.autoResumeProbe();
     }, 15_000);
     this.resumeProbeTimer.unref?.();
+
+    // NOTE deliberately NO mid-run liveness probe: once this run attaches
+    // rows, recent cds in the target are indistinguishable from live
+    // ingestion — an unbounded run migrating recent data would satisfy such
+    // a probe with its own output and false-pause every long scenario-1/4
+    // run. The boundary question is asked where the evidence is clean: at
+    // every pod start (before this run writes) — a mirror enabled mid-run
+    // is caught at the next restart and by the sync-parity card, which the
+    // runbook prescribes when enabling any mirror.
 
     if (this.dryRun) {
       await this.d.staging.createDryRunTable();
@@ -297,7 +482,17 @@ export class ChunkOrchestrator {
       // mapping or top-up pass is not observed until claiming begins.
       while (this.paused && !this.stopping) await sleep(1_000);
       if (this.stopping) break;
-      const storedBound = await this.d.ledger.getStoredBound(this.runId).catch(() => null);
+      const boundState = await this.d.ledger.getBoundState(this.runId)
+        .catch(() => ({ boundMs: null, token: null, applying: true }));
+      if (boundState.applying) {
+        // an apply is mid-flight (or the state is unreadable): the stored
+        // bound may be provisional — adopt/drop/prune decisions wait for a
+        // settled read on the next pass; nothing here may act on it
+        this.logger.info('Bound apply in flight — deferring bound adoption to the next map pass');
+        await sleep(1_000);
+        continue;
+      }
+      const storedBound = boundState.boundMs;
       if (storedBound !== null) {
         if (envBound !== null && envBound !== storedBound) {
           const msg = `bound conflict: LEDGER_CD_UPPER_BOUND=${envBound} but the run stores ${storedBound} — refusing to guess with duplication at stake`;
@@ -322,6 +517,14 @@ export class ChunkOrchestrator {
         }).catch((err) => {
           this.logger.error({ err: (err as Error).message }, 'Chunks BEYOND the bound have already executed — post-bound data may be duplicated; purge/retry those chunks');
         });
+      } else if (envBound === null && config.ledger.cdUpperBoundMs !== null) {
+        // The stored bound this pod adopted on an earlier pass was ROLLED
+        // BACK (its apply raced and unwound). A stale in-memory copy would
+        // silently skip top-ups beyond it and let the run complete with
+        // newer source documents unmigrated — drop it so this and every
+        // later pass derive the effective bound from current stored state.
+        this.logger.warn({ dropped: new Date(config.ledger.cdUpperBoundMs).toISOString() }, 'Stored run bound was rolled back — dropping the adopted in-memory bound');
+        config.ledger.cdUpperBoundMs = null;
       }
       let newChunks = 0;
       if (mapPass > 0) {
@@ -356,9 +559,22 @@ export class ChunkOrchestrator {
       await this.reclaimExpiredLeases(null, this.logger);
 
       const chunk = await this.d.ledger.claimNextGlobal(this.runId, this.podId, config.ledger.leaseSec);
+      // Post-claim bound fence: however a beyond-bound chunk slipped into
+      // the grid (map pass racing a bound apply), it must never be READ —
+      // the fence sits after the claim, where no further race can exist.
+      if (chunk && await this.supersedeIfBeyondBound(chunk as ChunkDoc)) continue;
       if (!chunk) {
         const remaining = await this.d.ledger.countRegularNonTerminal(this.runId);
-        if (remaining === 0) break;
+        if (remaining === 0) {
+          // an orphaned prune journal may be about to bring deleted chunks
+          // back — the run must not advance past regulars until it drains
+          // (a fully pruned grid has no claims, so the post-claim fence
+          // never fires; this gate is the recovery site for that shape)
+          let holds = true;
+          try { holds = await this.pruneJournalHolds(); } catch { /* unreadable = hold */ }
+          if (holds) { await sleep(5_000); continue; }
+          break;
+        }
         if (!config.worker.enabled) {
           const orphans = await this.d.ledger.findRecoverable(this.runId, null, true);
           for (const orphan of orphans) await this.recoverOne(orphan, this.logger, true);
@@ -543,9 +759,20 @@ export class ChunkOrchestrator {
       await this.reclaimExpiredLeases(null, this.logger);
 
       const chunk = await this.d.ledger.claimNextGlobal(this.runId, this.podId, config.ledger.leaseSec);
+      // Post-claim bound fence: however a beyond-bound chunk slipped into
+      // the grid (map pass racing a bound apply), it must never be READ —
+      // the fence sits after the claim, where no further race can exist.
+      if (chunk && await this.supersedeIfBeyondBound(chunk as ChunkDoc)) continue;
       if (!chunk) {
         const remaining = await this.d.ledger.countRegularNonTerminal(this.runId);
-        if (remaining === 0) return;
+        if (remaining === 0) {
+          // same gate as the finish loop: a fully pruned grid must not read
+          // as drained while orphaned prune receipts await restoration
+          let holds = true;
+          try { holds = await this.pruneJournalHolds(); } catch { /* unreadable = hold */ }
+          if (holds) { await sleep(5_000); continue; }
+          return;
+        }
         if (!config.worker.enabled) {
           const orphans = await this.d.ledger.findRecoverable(this.runId, null, true);
           for (const orphan of orphans) await this.recoverOne(orphan, this.logger, true);
@@ -1308,6 +1535,113 @@ export class ChunkOrchestrator {
     return { frozen: grew.length === 0, grew, probeMs };
   }
 
+  /**
+   * One source snapshot (per-collection newest cd + estimated count). The
+   * final check brackets its deep phase with two of these: an unbounded
+   * deep recount only proves anything if the source stayed FROZEN across
+   * it, and a snapshot the recount took at its start cannot see documents
+   * accepted afterwards.
+   */
+  async snapshotSourceState(upToMs: number | null = null): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }>> {
+    // PRIMARY reads: the recount audits the primary's view — a bracket read
+    // from a lagging secondary could miss the very mutation it exists to
+    // catch and compare equal across the check
+    const db = this.d.mongoReader.getPrimaryDatabase();
+    const collections = await discoverCollections(db, this.d.config.source.collectionPrefix, this.logger);
+    const out: Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }> = [];
+    // A bounded check audits only cd < upToMs — its bracket must watch that
+    // same prefix (a backdated pre-cutover repair is exactly as invisible to
+    // an already-finished recount as an unbounded append). Null-cd docs are
+    // audited in both modes, so they are always in the snapshot.
+    const prefix = upToMs !== null
+      ? { $or: [{ cd: { $lt: new Date(upToMs) } }, { cd: null }] }
+      : {};
+    for (const name of collections) {
+      const [top] = await db.collection(name)
+        .find(upToMs !== null ? { cd: { $type: 'date', $lt: new Date(upToMs) } } : { cd: { $type: 'date' } })
+        .sort({ cd: -1 }).limit(1).project({ cd: 1 }).toArray();
+      // EXACT count + TWO order-free checksums: a time checksum over
+      // cd-else-ts (null-cd docs contribute their ts, not zero), and an
+      // IDENTITY checksum over hashed _ids — a delete+insert swap of two
+      // null-cd docs with equal ts moves the identity sum even when count,
+      // max-cd and the time sum all stay put. Inputs are reduced mod 2^26 so
+      // the accumulating $sum stays an EXACT Long even on 10B-row
+      // collections (a raw or 2^32-residue sum promotes to double past ~4e9
+      // docs and Number() would round low bits away); the final $mod happens
+      // server-side, like the window checksums. $toHashedIndexKey needs
+      // MongoDB 4.4+ — on older servers the aggregation errors and the deep
+      // check FAILS loudly instead of skipping the bracket (fail closed).
+      const [agg] = await db.collection(name).aggregate([
+        ...(upToMs !== null ? [{ $match: prefix }] : []),
+        {
+          $group: {
+            _id: null,
+            n: { $sum: 1 },
+            cdSum: { $sum: { $mod: [{ $convert: { input: { $ifNull: ['$cd', '$ts'] }, to: 'long', onError: 0, onNull: 0 } }, 67108864] } },
+            idSum: { $sum: { $mod: [{ $abs: { $toHashedIndexKey: { $toString: '$_id' } } }, 67108864] } },
+          },
+        },
+        { $project: { n: 1, cdSum: { $mod: ['$cdSum', 4294967296] }, idSum: { $mod: ['$idSum', 4294967296] } } },
+      ]).toArray();
+      out.push({
+        collection: name,
+        maxCd: top?.cd instanceof Date ? top.cd.getTime() : 0,
+        n: Number(agg?.n ?? 0),
+        cdSum: Number(agg?.cdSum ?? 0),
+        idSum: Number(agg?.idSum ?? 0),
+      });
+    }
+    return out;
+  }
+
+  /** Highest chunk upper_cd across the run — the audited region's ceiling when no cutover is given. */
+  async ledgerMaxUpperCd(): Promise<number> {
+    const all = await this.d.ledger.listAll(this.runId);
+    return all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
+  }
+
+  /**
+   * One TARGET snapshot: row count + order-free cd checksum over the audited
+   * cd range, table-wide. The final check brackets itself with two of these:
+   * a mutation of audited target rows mid-check (a zombie dedupe delete
+   * surviving a lease takeover, a stray replay, any external write) cannot
+   * be fenced at the ClickHouse level, but it CANNOT escape this bracket
+   * either — whoever wrote, the count or checksum moves and the verdict
+   * refuses to stand.
+   */
+  async snapshotTargetState(upToMs: number): Promise<{ n: number; sumCd: number }> {
+    return this.d.staging.countAndSumLiveCdRange(0, upToMs, null);
+  }
+
+  /**
+   * The LIVE audited sweep pairs, as sorted keys: null-cd documents land at
+   * ts-derived cds that can lie BEYOND the cutover / ledger ceiling, so the
+   * range-bounded target bracket cannot see them — this companion bracket
+   * compares the exact live pair set instead, without admitting unrelated
+   * post-cutover traffic.
+   */
+  async snapshotSweepTargetPairs(): Promise<string[]> {
+    const db = this.d.mongoReader.getPrimaryDatabase();
+    const collections = await discoverCollections(db, this.d.config.source.collectionPrefix, this.logger);
+    const keys: string[] = [];
+    for (const name of collections) {
+      const pairs: Array<{ id: string; cdMs: number }> = [];
+      const cursor = db.collection(name).find({ cd: null }, { projection: { _id: 1, ts: 1 } }).batchSize(10_000);
+      for await (const doc of cursor) {
+        const tsMs = toEpochMillis(doc.ts);
+        if (tsMs !== null && tsMs > 0) pairs.push({ id: String(doc._id), cdMs: clampDateTime64(tsMs) });
+        if (pairs.length > 1_000_000) throw new Error(`${name}: more than 1,000,000 null-cd documents — not outliers`);
+      }
+      if (pairs.length === 0) continue;
+      const defs = this.d.hashResolver.resolveCollectionName(name, this.d.config.source.collectionPrefix);
+      const scope = defs ? chScopeOf(defs) : null;
+      for (const p of await this.d.staging.filterLivePairs(pairs, scope)) {
+        keys.push(`${name}\u0000${p.id}\u0000${p.cdMs}`);
+      }
+    }
+    return keys.sort();
+  }
+
   /** Drop staging tables orphaned by crash-between-done-and-drop. */
   private async sweepOrphanStaging(collection: string): Promise<void> {
     if (this.dryRun) return;
@@ -1494,6 +1828,10 @@ export class ChunkOrchestrator {
         } else {
           await this.purgeWindowByIds(chunk.collection, chunk.lower_cd, chunk.upper_cd);
         }
+        // the purge also deleted any replay-inserted rows in this window —
+        // the redone chunk supplies (or re-DLQs) those docs itself, so the
+        // discount flag must not survive it
+        await this.d.dlq.clearReplayInserted(this.runId, chunk.collection, chunk.lower_cd, chunk.upper_cd);
         collectionsNeedingSweepReset.add(chunk.collection);
       }
       const reset = await ledger.transition(chunk._id, 'failed', 'pending', {
@@ -1578,11 +1916,12 @@ export class ChunkOrchestrator {
    * so value-level equality there belongs to the differential harness, which
    * pins the transform itself).
    */
-  async contentAudit(samplesPerCollection = 500): Promise<{
-    sampled: number; matched: number; missing: number; different: number;
+  async contentAudit(samplesPerCollection = 500, upToMs: number | null = null, totalBudget: number | null = null): Promise<{
+    sampled: number; matched: number; missing: number; different: number; dlqExcluded: number;
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }> {
     const { config, staging } = this.d;
+    if (!Number.isFinite(samplesPerCollection) || samplesPerCollection <= 0) samplesPerCollection = 500;
     const p = this.contentAuditProgress;
     p.running = true; p.sampled = 0; p.matched = 0; p.mismatches = [];
     try {
@@ -1593,15 +1932,27 @@ export class ChunkOrchestrator {
         const defaults = this.d.hashResolver.resolveCollectionName(name, config.source.collectionPrefix);
         return !(defaults && skipEventNames.has(defaults.e));
       });
+      // a TOTAL budget keeps many-collection deployments sane: 2,500
+      // collections × 500 samples each is a million-doc audit nobody asked for
+      if (totalBudget !== null && collections.length > 0) {
+        samplesPerCollection = Math.min(samplesPerCollection, Math.max(10, Math.ceil(totalBudget / collections.length)));
+      }
 
-      let missing = 0, different = 0;
+      let missing = 0, different = 0, dlqExcluded = 0;
       for (const collection of collections) {
         const defaults = this.d.hashResolver.resolveCollectionName(collection, config.source.collectionPrefix) ?? undefined;
         const coll = db.collection(collection);
         const [lowDoc] = await coll.find({ cd: { $type: 'date' } }).sort({ cd: 1 }).limit(1).project({ cd: 1 }).toArray();
         const [highDoc] = await coll.find({ cd: { $type: 'date' } }).sort({ cd: -1 }).limit(1).project({ cd: 1 }).toArray();
         if (!lowDoc || !highDoc) continue;
-        const lo = (lowDoc.cd as Date).getTime(), hi = (highDoc.cd as Date).getTime();
+        const lo = (lowDoc.cd as Date).getTime();
+        let hi = (highDoc.cd as Date).getTime();
+        // tee/cutover clamp: post-cutover old-side docs were deliberately
+        // never migrated — sampling them reports phantom "missing" rows
+        if (upToMs !== null) {
+          if (lo >= upToMs) continue;
+          hi = Math.min(hi, upToMs - 1);
+        }
 
         // K random cd probe points, a small run of docs from each — cheap
         // index-served sampling without $sample's whole-collection scan.
@@ -1610,7 +1961,9 @@ export class ChunkOrchestrator {
         const docs: Record<string, unknown>[] = [];
         for (let k = 0; k < probes; k++) {
           const at = new Date(lo + Math.floor(((k + 0.5) / probes) * (hi - lo)));
-          const page = await coll.find({ cd: { $gte: at } }).sort({ cd: 1, _id: 1 }).limit(RUN_LEN).toArray();
+          const cdQ: Record<string, Date> = { $gte: at } as never;
+          if (upToMs !== null) (cdQ as Record<string, Date>).$lt = new Date(upToMs);
+          const page = await coll.find({ cd: cdQ }).sort({ cd: 1, _id: 1 }).limit(RUN_LEN).toArray();
           docs.push(...(page as Record<string, unknown>[]));
         }
 
@@ -1626,10 +1979,23 @@ export class ChunkOrchestrator {
           { loMs: Math.min(...expCds), hiMs: Math.max(...expCds) },
         );
 
+        // Sampled docs the run DELIBERATELY did not migrate (pending or
+        // waived DLQ entries) are not "missing" — the DLQ layer already
+        // accounts for them; flagging them here would fail sign-off
+        // nondeterministically depending on which docs the probes hit.
+        const missCandidates: string[] = [];
+        for (const [id, exp] of expected) {
+          const got = live.get(id);
+          if (!got || String(got.cd_txt) !== exp.cd) missCandidates.push(id);
+        }
+        const dlqIds = missCandidates.length > 0
+          ? await this.d.dlq.unresolvedIdsAmong(this.runId, collection, missCandidates)
+          : new Set<string>();
         for (const [id, exp] of expected) {
           p.sampled++;
           const got = live.get(id);
           if (!got || String(got.cd_txt) !== exp.cd) {
+            if (dlqIds.has(id)) { dlqExcluded++; continue; }
             missing++;
             if (p.mismatches.length < 100) p.mismatches.push({ _id: id, collection, kind: 'missing (no live row with this (_id, cd))' });
             continue;
@@ -1661,7 +2027,7 @@ export class ChunkOrchestrator {
           }
         }
       }
-      return { sampled: p.sampled, matched: p.matched, missing, different, mismatches: p.mismatches };
+      return { sampled: p.sampled, matched: p.matched, missing, different, dlqExcluded, mismatches: p.mismatches };
     } finally {
       p.running = false;
     }
@@ -1678,8 +2044,8 @@ export class ChunkOrchestrator {
    * them from the source first) are marked resolved without inserting, so
    * redo-then-replay cannot duplicate.
    */
-  async replayDlq(): Promise<{ replayed: number; stillFailing: number; alreadyLive: number }> {
-    const { dlq, staging, retryPolicy, config } = this.d;
+  async replayDlq(leaseLost?: () => boolean | Promise<boolean>): Promise<{ replayed: number; stillFailing: number; alreadyLive: number }> {
+    const { dlq, staging, config } = this.d;
     // Dry run must never write the live table: replay rehearses against the
     // Null-engine table (full parse/type validation, nothing stored) —
     // field bug: a dry-run replay wrote real rows that the actual run would
@@ -1689,6 +2055,7 @@ export class ChunkOrchestrator {
     let replayed = 0;
     let stillFailing = 0;
     let alreadyLive = 0;
+    const cdMsOf = (r: OutputRow): number => Date.parse(r.cd.replace(' ', 'T') + 'Z');
     this.replayProgress.running = true;
     Object.assign(this.replayProgress, { processed: 0, replayed: 0, stillFailing: 0, alreadyLive: 0 });
     try {
@@ -1699,6 +2066,9 @@ export class ChunkOrchestrator {
     // cursor, so the loop always terminates.
     let afterId: string | null = null;
     for (;;) {
+      if (await leaseLost?.()) {
+        throw new Error('the cluster-wide maintenance reservation was LOST mid-replay (this pod stalled past its expiry) — aborted before the next batch; re-run the replay');
+      }
       const batch = await dlq.listPendingAfter(this.runId, afterId, 500);
       if (batch.length === 0) break;
       afterId = batch[batch.length - 1]._id;
@@ -1706,33 +2076,79 @@ export class ChunkOrchestrator {
       this.replayProgress.processed += batch.length;
       const rows: OutputRow[] = [];
       const ids: string[] = [];
+      const colls: string[] = [];
       for (const entry of batch) {
         const defaults = this.d.hashResolver.resolveCollectionName(entry.collection, config.source.collectionPrefix) ?? undefined;
         const { row } = transformDocument(entry.raw_doc as SourceDocument, defaults, this.coercions);
-        if (row) { rows.push(row); ids.push(entry._id); }
+        if (row) { rows.push(row); ids.push(entry._id); colls.push(entry.collection); }
         else {
           await dlq.recordRetryError(entry._id, 'still fails transform under ' + config.transform.version);
           stillFailing++;
         }
       }
 
+      // SCOPED, PAIR-EXACT live lookup per collection: a SIBLING collection's
+      // row must never stand in for this collection's, and a native retry
+      // sharing the _id at ANOTHER cd must never shadow the exact pair (an
+      // id-to-single-cd map keeps one arbitrary row per id — the correct
+      // pair could read absent and be inserted twice). Unscopable
+      // collections keep the table-wide check (same reduced evidence the
+      // audits document for them).
+      const livePairSet = async (subRows: OutputRow[], subColls: string[]): Promise<Set<string>> => {
+        const live = new Set<string>();
+        const rowsByColl = new Map<string, number[]>();
+        for (let j = 0; j < subRows.length; j++) {
+          const a = rowsByColl.get(subColls[j]) ?? [];
+          a.push(j);
+          rowsByColl.set(subColls[j], a);
+        }
+        for (const [collName, idxs] of rowsByColl) {
+          const defs = this.d.hashResolver.resolveCollectionName(collName, config.source.collectionPrefix);
+          const scope = defs ? chScopeOf(defs) : null;
+          const pairs = idxs.map((j) => ({ id: subRows[j]._id, cdMs: cdMsOf(subRows[j]) }));
+          for (const p of await staging.filterLivePairs(pairs, scope)) {
+            live.add(`${collName}\u0000${p.id}\u0000${p.cdMs}`);
+          }
+        }
+        return live;
+      };
+
+      // Idempotent-by-reconciliation insert: an acknowledgement-ambiguous
+      // insert is never blindly re-sent to the live table — every retry
+      // first re-reads which (_id, cd) pairs are already live (scoped) and
+      // sends only the absent remainder, so a lost ack cannot double-store
+      // a batch even where insert deduplication is inert.
+      const insertAbsent = async (subRows: OutputRow[], subColls: string[], tag: string, reconcileFirst = false): Promise<void> => {
+        if (this.dryRun) { await staging.insertIntoLive(subRows, tag, replayTarget); return; }
+        let pending = subRows.map((r, j) => ({ r, c: subColls[j] }));
+        let lastErr: unknown = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          if (attempt > 0 || reconcileFirst) {
+            const live = await livePairSet(pending.map((x) => x.r), pending.map((x) => x.c));
+            pending = pending.filter(({ r, c }) => !live.has(`${c}\u0000${r._id}\u0000${cdMsOf(r)}`));
+            if (pending.length === 0) return; // the "failed" insert actually landed
+            await sleep(1_000 * attempt);
+          }
+          try {
+            await staging.insertIntoLive(pending.map((x) => x.r), `${tag}:a${attempt}`, replayTarget);
+            return;
+          } catch (err) { lastErr = err; }
+        }
+        throw lastErr;
+      };
+
       // Skip rows already live as (_id, cd) pairs — a chunk redo with a
       // fixed transform migrates DLQ'd docs from the source; replaying them
       // on top would duplicate. Marked resolved: the doc IS migrated.
       if (rows.length > 0 && !this.dryRun) {
-        const cdMsOf = (r: OutputRow): number => Date.parse(r.cd.replace(' ', 'T') + 'Z');
-        const cdVals = rows.map(cdMsOf);
-        const liveCd = await staging.fetchLiveCdByIds(
-          rows.map((r) => r._id),
-          { loMs: Math.min(...cdVals), hiMs: Math.max(...cdVals) },
-        );
+        const live = await livePairSet(rows, colls);
         const keep: OutputRow[] = [];
         const keepIds: string[] = [];
+        const keepColls: string[] = [];
         const resolvedIds: string[] = [];
         for (let j = 0; j < rows.length; j++) {
-          const cdMs = Date.parse(rows[j].cd.replace(' ', 'T') + 'Z');
-          if (liveCd.get(rows[j]._id) === cdMs) { resolvedIds.push(ids[j]); }
-          else { keep.push(rows[j]); keepIds.push(ids[j]); }
+          if (live.has(`${colls[j]}\u0000${rows[j]._id}\u0000${cdMsOf(rows[j])}`)) { resolvedIds.push(ids[j]); }
+          else { keep.push(rows[j]); keepIds.push(ids[j]); keepColls.push(colls[j]); }
         }
         if (resolvedIds.length > 0) {
           await dlq.markResolved(resolvedIds, config.transform.version + ' (already live — no insert)');
@@ -1740,23 +2156,28 @@ export class ChunkOrchestrator {
         }
         rows.length = 0; rows.push(...keep);
         ids.length = 0; ids.push(...keepIds);
+        colls.length = 0; colls.push(...keepColls);
       }
       if (rows.length === 0) { this.syncReplayProgress(replayed, stillFailing, alreadyLive); continue; }
+      // Durable INTENT before any insert: a replayed row's window will be
+      // over-expected by the strict verification unless it can tell the row
+      // apart from chunk-migrated ones. The flag is written while the entry
+      // is still pending, so every failure ordering converges: crash before
+      // insert = a plain retry; crash after insert = the retry's already-live
+      // path resolves the entry WITH the flag, and verification discounts it.
+      // A failed intent write aborts the batch untouched (fail closed).
+      if (!this.dryRun) await dlq.markReplayIntent(ids);
+      let batchInserted = false;
       try {
-        await retryPolicy.execute(
-          () => staging.insertIntoLive(rows, `dlqreplay:${batchKey}`, replayTarget),
-          `dlq-replay-${batchKey}`,
-          this.logger,
-          undefined,
-          classifyError,
-        );
-        await dlq.markResolved(ids, config.transform.version);
-        replayed += rows.length;
+        await insertAbsent(rows, colls, `dlqreplay:${batchKey}`);
+        batchInserted = true;
       } catch (err) {
-        // Isolate row-level failures within the replay batch too.
+        // Isolate row-level failures within the replay batch — each row goes
+        // through the same idempotent insert, RECONCILING BEFORE its first
+        // attempt too: a partial batch failure may have landed some rows.
         for (let j = 0; j < rows.length; j++) {
           try {
-            await staging.insertIntoLive([rows[j]], `dlqreplay:${batchKey}:${j}`, replayTarget);
+            await insertAbsent([rows[j]], [colls[j]], `dlqreplay:${batchKey}:${j}`, true);
             await dlq.markResolved([ids[j]], config.transform.version);
             replayed++;
           } catch (rowErr) {
@@ -1765,6 +2186,15 @@ export class ChunkOrchestrator {
           }
         }
         void err;
+      }
+      if (batchInserted) {
+        // OUTSIDE the insert catch: a transient MongoDB status-write failure
+        // must never re-trigger target inserts. It propagates and fails the
+        // replay run — the rows are live, the entries stay pending WITH the
+        // intent flag, and the next replay's already-live filter resolves
+        // them without inserting.
+        await dlq.markResolved(ids, config.transform.version);
+        replayed += rows.length;
       }
       this.syncReplayProgress(replayed, stillFailing, alreadyLive);
     }
@@ -2049,24 +2479,60 @@ export class ChunkOrchestrator {
    * against its verified expectation, plus table totals. Exact, minutes at
    * most — run before sign-off or any time trust is in question.
    */
-  async verifyMigration(): Promise<Record<string, unknown>> {
+  async verifyMigration(upToMs: number | null = null): Promise<Record<string, unknown>> {
     const { ledger, staging } = this.d;
     const all = await ledger.listAll(this.runId);
-    const byCollection = new Map<string, boolean>();
-    for (const c of all) {
-      if (this.isNullCdChunk(c as ChunkDoc)) byCollection.set(c.collection, true);
-    }
 
     let checked = 0;
     let unscopedSkipped = 0;
+    let pastCutoverSkipped = 0;
     const collectionCount = new Set(all.map((c) => c.collection)).size;
     const mismatches: Array<{ chunk: string; expected: number; live: number }> = [];
     const targets = all.filter((chunk) => chunk.status === 'done' && !this.isNullCdChunk(chunk as ChunkDoc));
     this.verifyProgress.running = true;
     this.verifyProgress.total = targets.length;
     this.verifyProgress.checked = 0;
-    this.verifyProgress.phase = 'recounting chunk windows';
     try {
+      // Null-cd sweep rows live INSIDE regular windows at ts-derived cds.
+      // Index them FIRST (and verify them directly by id): the window loop
+      // subtracts them so a sweep surplus can never mask the loss of regular
+      // rows, and the comparison stays STRICT for every collection.
+      this.verifyProgress.phase = 'verifying null-cd sweep rows';
+      const db = this.d.mongoReader.getDatabase();
+      const sweptCdsByCollection = new Map<string, number[]>();
+      for (const chunk of all) {
+        if (!this.isNullCdChunk(chunk as ChunkDoc) || chunk.status !== 'done' || chunk.rows_expected <= 0) continue;
+        const idDocs = await db.collection(chunk.collection)
+          .find({ cd: null }, { projection: { _id: 1, ts: 1 } }).limit(1_000_000).toArray();
+        if (idDocs.length === 0) continue;
+        // PAIR-exact: each sweep row must exist at its doc's own ts-derived
+        // cd — an id-in-range lookup would let a same-_id native retry stand
+        // in for a missing sweep row AND be subtracted from a regular window
+        // it does not belong to
+        const sweepPairs: Array<{ id: string; cdMs: number }> = [];
+        for (const d of idDocs) {
+          const tsMs = toEpochMillis(d.ts);
+          if (tsMs !== null && tsMs > 0) sweepPairs.push({ id: String(d._id), cdMs: clampDateTime64(tsMs) });
+        }
+        const scope = this.scopeOf(chunk as ChunkDoc);
+        const livePairs = sweepPairs.length > 0 ? await this.d.staging.filterLivePairs(sweepPairs, scope) : [];
+        checked++;
+        if (livePairs.length < chunk.rows_expected) {
+          mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live: livePairs.length });
+        }
+        sweptCdsByCollection.set(chunk.collection, livePairs.map((p) => p.cdMs).sort((a, b) => a - b));
+      }
+
+      // Replay-inserted rows: live in their windows, excluded from
+      // rows_expected (computed when the doc was DLQ'd). One count per
+      // collection decides whether per-window discounts are needed at all.
+      const replayInsByCollection = new Map<string, number>();
+      for (const collection of new Set(targets.map((c) => c.collection))) {
+        const n = await this.d.dlq.countReplayInserted(this.runId, collection);
+        if (n > 0) replayInsByCollection.set(collection, n);
+      }
+
+      this.verifyProgress.phase = 'recounting chunk windows';
       // Bounded concurrency: each window count is minmax-pruned and cheap,
       // but a 10TB run has tens of thousands of them — sequential would take
       // hours, unbounded would hammer ClickHouse.
@@ -2079,12 +2545,27 @@ export class ChunkOrchestrator {
           const chunk = targets[i];
           const scope = this.scopeOf(chunk as ChunkDoc);
           if (!scope && collectionCount > 1) { unscopedSkipped++; continue; }
-          const live = await staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd, scope);
-          const relaxed = byCollection.get(chunk.collection) === true;
-          const bad = relaxed ? live < chunk.rows_expected : live !== chunk.rows_expected;
+          // Chunks past the cutover cannot be count-compared at all: their
+          // windows mix natively-ingested rows into the same (a,e,n) scope,
+          // and after a tee-overlap dedupe their migrated rows were deleted
+          // on purpose. Skip and report them — the cutover-scoped region is
+          // what this verification vouches for.
+          if (upToMs !== null && chunk.upper_cd > upToMs) { pastCutoverSkipped++; continue; }
+          let live = await staging.countLiveInCdRange(chunk.lower_cd, chunk.upper_cd, scope);
+          const swept = sweptCdsByCollection.get(chunk.collection);
+          if (swept) {
+            let sLo = 0, sHi = swept.length;
+            while (sLo < sHi) { const m = (sLo + sHi) >> 1; if (swept[m] < chunk.lower_cd) sLo = m + 1; else sHi = m; }
+            for (let k = sLo; k < swept.length && swept[k] < chunk.upper_cd; k++) live--;
+          }
+          let expected = chunk.rows_expected;
+          if (replayInsByCollection.has(chunk.collection)) {
+            expected += await this.d.dlq.countReplayInsertedInWindow(this.runId, chunk.collection, chunk.lower_cd, chunk.upper_cd);
+          }
+          const bad = live !== expected;
           checked++;
           this.verifyProgress.checked = checked;
-          if (bad) mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live });
+          if (bad) mismatches.push({ chunk: chunk._id, expected, live });
         }
       }));
 
@@ -2098,11 +2579,17 @@ export class ChunkOrchestrator {
     //   0 copies below → live at-least-once artifact (nightly job cleans)
     //   1 copy below   → cross-cutover SDK retry (benign, reported)
     //   2+ copies below → migration defect; verification fails.
-    const boundaryMs = all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
+    // duplicate attribution stops at the requested cutover when one is
+    // given: native retry copies PAST it are the live path's business, not
+    // migration defects (post-dedupe sign-off false-failed on them)
+    const ledgerMax = all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
+    const boundaryMs = upToMs !== null ? Math.min(ledgerMax, upToMs) : ledgerMax;
     const dup = await staging.duplicateStats(boundaryMs);
-    let migrationDuplicates = 0;
+    // the verdict uses the EXACT per-partition count — the display sample is
+    // capped and early partitions full of benign live dups could crowd a
+    // real migration duplicate out of it
+    const migrationDuplicates = dup.migrationDuplicateGroups;
     const duplicateSample = dup.sample.map((d) => {
-      if (d.migratedCopies >= 2) migrationDuplicates++;
       return {
         _id: d._id,
         copies: d.copies,
@@ -2121,6 +2608,7 @@ export class ChunkOrchestrator {
       ok: mismatches.length === 0 && migrationDuplicates === 0,
       checkedChunks: checked,
       unscopedSkipped,
+      pastCutoverSkipped,
       mismatches,
       table: { rows: dup.rows, distinctIds: dup.rows - dup.duplicates, duplicates: dup.duplicates },
       duplicateSample,

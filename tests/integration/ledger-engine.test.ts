@@ -357,6 +357,7 @@ describe('ledger engine end-to-end', () => {
     process.env.LEDGER_CHUNK_DOCS_TARGET = '500';
     process.env.LEDGER_MONITOR_INTERVAL_MS = '0';
     process.env.BACKPRESSURE_ENABLED = 'false';
+    process.env.LEDGER_UNBOUNDED_OK = 'true'; // no-mirror declaration for the e2e harness
     const config = loadConfig();
 
     const mongoReader = new MongoReader({

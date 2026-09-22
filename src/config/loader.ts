@@ -26,6 +26,7 @@ function envToRawConfig(env: NodeJS.ProcessEnv) {
             cdUpperBoundMs: env.LEDGER_CD_UPPER_BOUND,
             captureTransformErrors: env.LEDGER_CAPTURE_TRANSFORM_ERRORS,
             startPaused: env.LEDGER_START_PAUSED,
+            unboundedOk: env.LEDGER_UNBOUNDED_OK,
             dryRun: env.DRY_RUN,
             dryRunSamplePct: env.DRY_RUN_SAMPLE_PCT,
         },

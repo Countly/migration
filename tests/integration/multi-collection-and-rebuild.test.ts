@@ -125,6 +125,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     process.env.LEDGER_CHUNK_DOCS_TARGET = '250';
     process.env.LEDGER_MONITOR_INTERVAL_MS = '0';
     process.env.BACKPRESSURE_ENABLED = 'false';
+    process.env.LEDGER_UNBOUNDED_OK = 'true'; // no-mirror declaration — the top-up tests migrate recent-cd docs
     config = loadConfig();
 
     const mongoReader = new MongoReader({
@@ -470,6 +471,36 @@ describe('multi-collection scoping + ledger rebuild', () => {
     const clean = newProgress();
     await rebuild({ config, logger, ledger, dlq: dlqStore, hashResolver, progress: clean, checkOnly: true });
     expect(clean.mismatchedWindows.length).toBe(0);
+  }, 60_000);
+
+  it('a replayed DLQ row carries a durable replay_inserted flag — strict verify discounts it and stays green', async () => {
+    const srcTs = BASE + 55 * 60_000 + 30_000; // inside a migrated window, between existing docs
+    const rawDoc = { _id: 'rp_replay', uid: 'r1', did: 'dr', ts: srcTs, cd: new Date(srcTs), sg: { v: 1 }, c: 1 };
+    // the doc failed during migration: present in the source, absent in CH
+    await mc.db(DB).collection(COLL1).insertOne(rawDoc as never);
+    await dlqStore.add([{
+      run_id: RUN, source_id: 'rp_replay', collection: COLL1, reason: 'insert_rejected',
+      error: 'transient insert failure', transform_version: 'v-old', raw_doc: rawDoc,
+    } as never]);
+
+    const chunkFilter = { run_id: RUN, collection: COLL1, status: 'done', lower_cd: { $gte: 0, $lte: srcTs }, upper_cd: { $gt: srcTs } };
+    const chunkBefore = await mc.db(DB).collection('mig_ranges').findOne(chunkFilter as never);
+    const verifyBefore = await orchestrator.verifyMigration();
+
+    const res = await orchestrator.replayDlq();
+    expect(res.replayed).toBe(1);
+
+    // the ledger is untouched — verification derives the discount from the
+    // resolved entry's durable replay_inserted flag instead
+    const chunkAfter = await mc.db(DB).collection('mig_ranges').findOne({ _id: chunkBefore!._id } as never);
+    expect(chunkAfter!.rows_expected).toBe(chunkBefore!.rows_expected as number);
+    const entry = await mc.db(DB).collection('mig_dlq_docs').findOne({ _id: `${RUN}:rp_replay` } as never);
+    expect(entry!.status).toBe('resolved');
+    expect(entry!.replay_inserted).toBe(true);
+    // the repaired window is NOT reported as an over-count
+    const verifyAfter = await orchestrator.verifyMigration();
+    expect((verifyAfter.mismatches as Array<{ chunk: string }>).map((m) => m.chunk))
+      .toEqual((verifyBefore.mismatches as Array<{ chunk: string }>).map((m) => m.chunk));
   }, 60_000);
 
   it('dry-run replay writes to the Null table, never live (field bug)', async () => {
@@ -890,7 +921,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
       SERVICE_NAME: 'skiponly', MONGO_URI, MONGO_DB: DB, MONGO_COUNTLY_DB: `${DB}_countly`,
       MANIFEST_DB: DB, CLICKHOUSE_URL: CH_URL, CLICKHOUSE_PASSWORD: CH_PASSWORD, CLICKHOUSE_DB: DB,
       LEDGER_RUN_ID: SK, LEDGER_CHUNK_DOCS_TARGET: '5000', MONGO_PAGE_SIZE: '500',
-      LEDGER_MONITOR_INTERVAL_MS: '0', BACKPRESSURE_ENABLED: 'false', MULTI_POD_ENABLED: 'false',
+      LEDGER_MONITOR_INTERVAL_MS: '0', BACKPRESSURE_ENABLED: 'false', MULTI_POD_ENABLED: 'false', LEDGER_UNBOUNDED_OK: 'true',
       POD_ID: 'skip-pod',
     });
     delete process.env.LEDGER_CD_UPPER_BOUND;

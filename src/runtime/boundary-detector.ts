@@ -45,6 +45,63 @@ export interface BoundaryProgress {
   report: BoundaryReport | null;
 }
 
+/**
+ * One-call boundary setting: decide whether a detection is safe to apply
+ * unattended. An exact ingestion-pause GAP is; an ANCHOR carries quantified
+ * ambiguity and needs a human (or an explicit acceptAnchor).
+ */
+export function decideAutoApply(
+  report: BoundaryReport | null | undefined,
+  acceptAnchor: boolean,
+): { apply: boolean; boundMs?: number; reason?: string } {
+  const d = report?.detection;
+  if (!d || d.status !== 'ok' || !d.suggestedBoundMs) {
+    return { apply: false, reason: `no boundary detected${d?.reason ? ` — ${d.reason}` : d?.status ? ` (${d.status})` : ''}` };
+  }
+  if (d.method !== 'gap' && !acceptAnchor) {
+    return {
+      apply: false,
+      reason: `detected an ANCHOR, not an exact gap — ${d.ambiguousMongoDocs ?? '?'} old-side docs sit inside the ambiguity band. Review GET /api/boundary, then re-call with {"acceptAnchor": true} to take it, or pass an explicit {"boundMs": ...}.`,
+    };
+  }
+  // A quiet minute only proves a seam when there was traffic to go quiet
+  // FROM: on low-volume installs every other minute is silent, and the
+  // first lull would be taken as the flip. Require corroborating volume on
+  // both flanks before applying a gap unattended.
+  if (d.method === 'gap' && !acceptAnchor) {
+    const gap = d.gap;
+    const mins = d.minutes ?? [];
+    const FLANK_MS = 10 * 60_000;
+    const MIN_FLANK_DOCS = 25;
+    const before = gap ? mins.filter((m) => m.minuteMs >= gap.fromMs - FLANK_MS && m.minuteMs < gap.fromMs).reduce((a, m) => a + m.mongo, 0) : 0;
+    const after = gap ? mins.filter((m) => m.minuteMs >= gap.toMs && m.minuteMs < gap.toMs + FLANK_MS).reduce((a, m) => a + m.ch, 0) : 0;
+    if (!gap || before < MIN_FLANK_DOCS || after < MIN_FLANK_DOCS) {
+      return {
+        apply: false,
+        reason: `a gap was found but traffic around it is too sparse to trust a quiet minute as the seam (${before} old-side docs in the 10 min before, ${after} new-side docs in the 10 min after — need ${MIN_FLANK_DOCS} each). Review GET /api/boundary, then re-call with {"acceptAnchor": true} or pass an explicit {"boundMs": ...}.`,
+      };
+    }
+    // The real seam ends where the new side BEGINS: a trusted gap must
+    // contain or directly abut the ClickHouse anchor. A lull minutes before
+    // the true tee start can otherwise pass the flank check and exclude
+    // every old-side doc between the false gap and the anchor.
+    const anchor = d.anchorMs;
+    // the 2-min allowance is for ingest latency, not for RESUMED old-side
+    // traffic: any Mongo docs between the gap end and the anchor would land
+    // beyond the bound and never migrate
+    const resumedBetween = mins
+      .filter((m) => m.minuteMs >= gap.toMs && typeof anchor === 'number' && m.minuteMs < anchor)
+      .reduce((a, m) => a + m.mongo, 0);
+    if (typeof anchor !== 'number' || anchor < gap.fromMs || anchor > gap.toMs + 2 * 60_000 || resumedBetween > 0) {
+      return {
+        apply: false,
+        reason: `the gap (${new Date(gap.fromMs).toISOString()}–${new Date(gap.toMs).toISOString()}) does not cleanly abut the first new-side data (anchor ${typeof anchor === 'number' ? new Date(anchor).toISOString() : 'unknown'}${resumedBetween > 0 ? `; ${resumedBetween} old-side docs resumed in between` : ''}) — likely a lull BEFORE the real tee start; applying it would exclude the old-side docs in between. Review GET /api/boundary, then re-call with {"acceptAnchor": true} or pass an explicit {"boundMs": ...}.`,
+      };
+    }
+  }
+  return { apply: true, boundMs: d.suggestedBoundMs };
+}
+
 export interface BoundaryReport {
   detection: {
     status: 'ok' | 'refused' | 'no_data';

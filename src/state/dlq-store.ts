@@ -32,6 +32,8 @@ export interface DlqDoc {
    * land in any window anyway).
    */
   cd_ms: number | null;
+  /** Set (while still pending) right before a REPLAY inserts this entry's row — verification discounts resolved replay-inserted rows from window expectations, which chunk-computed rows_expected excludes. */
+  replay_inserted?: boolean;
   status: DlqStatus;
   resolved_by_version: string | null;
   created_at: Date;
@@ -126,6 +128,53 @@ export class DlqStore {
    * table is accounted for, not a disagreement. Entries written before the
    * cd_ms field (or with unparseable cd/ts) can't be attributed and count 0.
    */
+  /** The window's unresolved (pending/waived) source ids — for absent-intersection at window level. Capped; ids beyond the cap get NO discount (strict direction). */
+  async listUnresolvedIdsInWindow(runId: string, collection: string, lowerCdMs: number, upperCdMs: number, cap = 200_000): Promise<string[]> {
+    const rows = await this.c()
+      .find(
+        { run_id: runId, collection, status: { $in: ['pending', 'waived'] }, cd_ms: { $gte: lowerCdMs, $lt: upperCdMs } },
+        { projection: { source_id: 1 }, limit: cap },
+      )
+      .toArray();
+    return rows.map((r) => r.source_id);
+  }
+
+  /** Unresolved (pending/waived) count among arbitrarily many ids — batched $in, constant memory. */
+  async countUnresolvedAmong(runId: string, collection: string, ids: string[]): Promise<number> {
+    let total = 0;
+    for (let i = 0; i < ids.length; i += 100_000) {
+      total += await this.c().countDocuments({
+        run_id: runId, collection,
+        source_id: { $in: ids.slice(i, i + 100_000) },
+        status: { $in: ['pending', 'waived'] },
+      });
+    }
+    return total;
+  }
+
+  /** Which of the GIVEN source ids sit unresolved (pending/waived) — sampled docs the run deliberately did not migrate. */
+  async unresolvedIdsAmong(runId: string, collection: string, ids: string[]): Promise<Set<string>> {
+    if (ids.length === 0) return new Set();
+    const rows = await this.c()
+      .find(
+        { run_id: runId, collection, source_id: { $in: ids }, status: { $in: ['pending', 'waived'] } },
+        { projection: { source_id: 1 } },
+      )
+      .toArray();
+    return new Set(rows.map((r) => r.source_id));
+  }
+
+  /** How many of the GIVEN source ids sit unresolved (pending/waived) in the window — exact per-sample DLQ discount. */
+  async countUnresolvedMatchingIds(runId: string, collection: string, ids: string[], lowerCdMs: number, upperCdMs: number): Promise<number> {
+    if (ids.length === 0) return 0;
+    return this.c().countDocuments({
+      run_id: runId, collection,
+      source_id: { $in: ids },
+      status: { $in: ['pending', 'waived'] },
+      cd_ms: { $gte: lowerCdMs, $lt: upperCdMs },
+    });
+  }
+
   async countUnresolvedInWindow(runId: string, collection: string, lowerCdMs: number, upperCdMs: number): Promise<number> {
     return this.c().countDocuments({
       run_id: runId, collection,
@@ -154,6 +203,51 @@ export class DlqStore {
       ])
       .toArray();
     return rows.map((r) => ({ error: r._id, n: r.n }));
+  }
+
+  /**
+   * Durable pre-insert intent: these entries' rows are about to be inserted
+   * by REPLAY, not by a chunk. Written while the entry is still PENDING so
+   * every crash ordering converges: crash before the insert = a plain retry;
+   * crash after it = the retry's already-live path resolves the entry WITH
+   * the flag and verification discounts the row.
+   */
+  async markReplayIntent(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.c().updateMany({ _id: { $in: ids } }, { $set: { replay_inserted: true, updated_at: new Date() } });
+  }
+
+  /** Total resolved replay-inserted entries for a collection — lets verification skip per-window queries in the common no-replay case. */
+  async countReplayInserted(runId: string, collection: string): Promise<number> {
+    return this.c().countDocuments({ run_id: runId, collection, status: 'resolved', replay_inserted: true });
+  }
+
+  /**
+   * Resolved replay-inserted rows in a regular window: they live in the
+   * window but rows_expected (computed when the doc was DLQ'd) excludes
+   * them. Date-cd docs only — a replayed null-cd doc's row is already
+   * subtracted by the verification's sweep index.
+   */
+  async countReplayInsertedInWindow(runId: string, collection: string, lowerCdMs: number, upperCdMs: number): Promise<number> {
+    return this.c().countDocuments({
+      run_id: runId, collection, status: 'resolved', replay_inserted: true,
+      'raw_doc.cd': { $type: 'date' },
+      cd_ms: { $gte: lowerCdMs, $lt: upperCdMs },
+    });
+  }
+
+  /**
+   * A cd-window purge (chunk retry) deleted any replay-inserted rows inside
+   * it — clear the flag so verification does not discount rows the redone
+   * chunk now supplies from source (or re-DLQs). Without this, a stale
+   * pre-insert intent whose chunk was later redone would over-expect the
+   * window forever.
+   */
+  async clearReplayInserted(runId: string, collection: string, lowerCdMs: number, upperCdMs: number): Promise<void> {
+    await this.c().updateMany(
+      { run_id: runId, collection, replay_inserted: true, cd_ms: { $gte: lowerCdMs, $lt: upperCdMs } },
+      { $unset: { replay_inserted: '' }, $set: { updated_at: new Date() } },
+    );
   }
 
   async markResolved(ids: string[], version: string): Promise<void> {

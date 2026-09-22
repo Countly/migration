@@ -87,6 +87,7 @@ describe('cross-collection scheduling with two pods', () => {
     process.env.MONGO_PAGE_SIZE = '100';             // slow pods down enough to overlap
     process.env.LEDGER_MONITOR_INTERVAL_MS = '0';
     process.env.BACKPRESSURE_ENABLED = 'false';
+    process.env.LEDGER_UNBOUNDED_OK = 'true'; // no-mirror declaration — recent-cd rows are this test's own data
     process.env.MULTI_POD_ENABLED = 'true';
     const config = loadConfig();
 

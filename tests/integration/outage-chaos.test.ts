@@ -79,6 +79,7 @@ describe.skipIf(!ENABLED)('backing-service outage chaos (CHAOS_OUTAGE=1, dedicat
     LEDGER_LEASE_SEC: '3',
     LEDGER_MONITOR_INTERVAL_MS: '0',
     BACKPRESSURE_ENABLED: 'false',
+    LEDGER_UNBOUNDED_OK: 'true', // no-mirror declaration for the chaos harness
     MULTI_POD_ENABLED: 'true',
     LOG_LEVEL: 'fatal',
     CHAOS_LOG_LEVEL: 'warn', // worker pino level — stderrTail captures it

@@ -327,6 +327,15 @@ export class StagingManager {
    * Used when retrying a chunk that was already (partially) promoted — redo
    * must start from a clean window or verify-then-attach would skip it.
    */
+  /**
+   * Ids per query when passed as a {ids:Array(String)} parameter. ClickHouse
+   * receives query params as HTTP form fields capped by
+   * http_max_field_value_size (128 KiB default): ~5,000 ObjectId strings
+   * already trip "HTML Form Exception: Field value too long" (field report).
+   * 2,000 ids ≈ 52 KB — safely under default limits everywhere.
+   */
+  static readonly ID_PARAM_PAGE = 2_000;
+
   private scopeSql(scope?: { a: string; e: string; n?: string } | null): string {
     if (!scope) return '';
     return 'AND a = {sa:String} AND e = {se:String}' + (scope.n !== undefined ? ' AND n = {sn:String}' : '');
@@ -406,8 +415,8 @@ export class StagingManager {
       ? 'AND cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})'
       : '';
     const out = new Map<string, Record<string, unknown>>();
-    for (let i = 0; i < ids.length; i += 5_000) {
-      const page = ids.slice(i, i + 5_000);
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
       const res = await this.ch().query({
         query: `SELECT _id, a, e, n, uid, uid_canon, did, lsid,
                        toString(ts) AS ts_txt, toString(cd) AS cd_txt,
@@ -440,6 +449,8 @@ export class StagingManager {
    */
   async duplicateStats(boundaryMs: number, sampleLimit = 20): Promise<{
     rows: number; duplicates: number;
+    /** EXACT count of ids with ≥2 pre-boundary copies — never derived from the display sample. */
+    migrationDuplicateGroups: number;
     sample: Array<{ _id: string; copies: number; migratedCopies: number; min_cd_ms: number; max_cd_ms: number }>;
   }> {
     const parts = await this.ch().query({
@@ -450,31 +461,53 @@ export class StagingManager {
       format: 'JSONEachRow',
     });
     const partitions = await parts.json<{ partition: string; r: string }>();
-    let rows = 0, duplicates = 0;
+    let rows = 0, duplicates = 0, migrationDuplicateGroups = 0;
     const sample: Array<{ _id: string; copies: number; migratedCopies: number; min_cd_ms: number; max_cd_ms: number }> = [];
     for (const p of partitions) {
       rows += Number(p.r);
       const res = await this.ch().query({
         query: `SELECT _id, count() AS c, countIf(cd < fromUnixTimestamp64Milli({b:Int64})) AS mc,
                        toUnixTimestamp64Milli(min(cd)) AS lo, toUnixTimestamp64Milli(max(cd)) AS hi,
-                       sum(c - 1) OVER () AS excess
-                FROM (SELECT _id, cd FROM ${this.fq(this.config.table)} WHERE _partition_id = {p:String})
-                GROUP BY _id HAVING c > 1
+                       sum(c - 1) OVER () AS excess,
+                       sum(mc >= 2) OVER () AS mg
+                FROM (SELECT _id, a, e, n, cd FROM ${this.fq(this.config.table)} WHERE _partition_id = {p:String})
+                GROUP BY _id, a, e, n HAVING c > 1
                 ORDER BY mc DESC, c DESC LIMIT {lim:UInt32}`,
         query_params: { b: boundaryMs, p: p.partition, lim: sampleLimit },
         format: 'JSONEachRow',
         clickhouse_settings: { max_bytes_before_external_group_by: '4000000000' },
       });
-      const groups = await res.json<{ _id: string; c: string; mc: string; lo: string; hi: string; excess: string }>();
-      if (groups.length > 0) duplicates += Number(groups[0].excess);
+      const groups = await res.json<{ _id: string; c: string; mc: string; lo: string; hi: string; excess: string; mg: string }>();
+      if (groups.length > 0) { duplicates += Number(groups[0].excess); migrationDuplicateGroups += Number(groups[0].mg); }
       for (const g of groups) {
         if (sample.length >= sampleLimit) break;
         sample.push({ _id: g._id, copies: Number(g.c), migratedCopies: Number(g.mc), min_cd_ms: Number(g.lo), max_cd_ms: Number(g.hi) });
       }
     }
-    return { rows, duplicates, sample };
+    return { rows, duplicates, migrationDuplicateGroups, sample };
   }
 
+
+  /**
+   * STRICT live row count for the boundary guard: operational failures
+   * THROW (they must hold the guard, not read as empty); a genuinely absent
+   * table returns null — authoritatively nothing to duplicate.
+   */
+  async liveRowCountStrict(): Promise<number | null> {
+    try {
+      const res = await this.ch().query({
+        query: `SELECT count() AS c FROM ${this.fq(this.config.table)}`,
+        format: 'JSONEachRow',
+      });
+      const rows = await res.json<{ c: string }>();
+      return Number(rows[0]?.c ?? 0);
+    } catch (err) {
+      const msg = (err as Error).message ?? '';
+      const code = (err as { code?: string | number }).code;
+      if (String(code) === '60' || msg.includes('UNKNOWN_TABLE') || msg.includes("doesn't exist") || msg.includes('does not exist')) return null;
+      throw err;
+    }
+  }
 
   /** Does the live target table exist / how many rows does it hold? */
   async targetTableInfo(): Promise<{ exists: boolean; rows: number }> {
@@ -491,22 +524,106 @@ export class StagingManager {
    * null-cd sweep) or the collection is unresolvable. Pair matching means a
    * live cross-cutover retry copy (same _id, post-cutover cd) is untouchable.
    */
-  async deleteLiveByPairs(pairs: Array<{ id: string; cdMs: number }>): Promise<void> {
-    if (pairs.length === 0) return;
+  async deleteLiveByPairs(pairs: Array<{ id: string; cdMs: number }>, scope?: { a: string; e: string; n?: string } | null): Promise<void> {
     // Two parallel arrays zipped server-side — the HTTP interface cannot
     // parse a JS array-of-arrays as Array(Tuple(...)). The cd min/max bound
     // lets the mutation prune to the pairs' partitions instead of scanning
-    // the whole table.
-    const lo = Math.min(...pairs.map((p) => p.cdMs));
-    const hi = Math.max(...pairs.map((p) => p.cdMs));
-    await this.ch().command({
-      query: `DELETE FROM ${this.fq(this.config.table)}
-              WHERE cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})
-                AND (_id, toUnixTimestamp64Milli(cd)) IN (
-                SELECT arrayJoin(arrayZip({ids:Array(String)}, {cds:Array(Int64)}))
-              )`,
-      query_params: { ids: pairs.map((p) => p.id), cds: pairs.map((p) => p.cdMs), blo: lo, bhi: hi },
-    });
+    // the whole table. Paged at ID_PARAM_PAGE like every id-parameter query:
+    // a larger batch overruns ClickHouse's ~128KiB HTTP form-field limit.
+    for (let i = 0; i < pairs.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = pairs.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      const lo = Math.min(...page.map((p) => p.cdMs));
+      const hi = Math.max(...page.map((p) => p.cdMs));
+      await this.ch().command({
+        query: `DELETE FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})
+                  AND (_id, toUnixTimestamp64Milli(cd)) IN (
+                  SELECT arrayJoin(arrayZip({ids:Array(String)}, {cds:Array(Int64)}))
+                ) ${this.scopeSql(scope)}`,
+        query_params: { ids: page.map((p) => p.id), cds: page.map((p) => p.cdMs), blo: lo, bhi: hi, ...this.scopeParams(scope) },
+      });
+    }
+  }
+
+  /**
+   * Live ROW count per hour bucket for the given ids — counts every copy,
+   * unlike fetchLiveCdByIds's Map which collapses duplicates of an id to
+   * one entry. Dedupe subtracts sweep rows from native evidence with this,
+   * so duplicate sweep copies can never masquerade as native counterparts.
+   */
+  async countRowsByHourBucket(ids: string[], loMs: number, hiMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<Map<number, number>> {
+    const out = new Map<number, number>();
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      const res = await this.ch().query({
+        query: `SELECT intDiv(toUnixTimestamp64Milli(cd), 3600000) AS b, count() AS cnt
+                FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
+                  AND _id IN {ids:Array(String)} ${this.scopeSql(scope)}
+                GROUP BY b`,
+        query_params: { ids: page, lo: loMs, hi: hiMs, ...this.scopeParams(scope) },
+        format: 'JSONEachRow',
+      });
+      for (const row of await res.json<{ b: string; cnt: string }>()) {
+        const bucket = Number(row.b) * 3_600_000;
+        out.set(bucket, (out.get(bucket) ?? 0) + Number(row.cnt));
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The subset of EXACT (_id, cd) pairs that exist live (distinct pairs).
+   * Pair-exact presence for null-cd sweep audits: an id-in-range lookup
+   * would let a native retry that reused the _id at a different cd stand in
+   * for the missing transformed sweep row.
+   */
+  async filterLivePairs(pairs: Array<{ id: string; cdMs: number }>, scope?: { a: string; e: string; n?: string } | null): Promise<Array<{ id: string; cdMs: number }>> {
+    const out: Array<{ id: string; cdMs: number }> = [];
+    for (let i = 0; i < pairs.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = pairs.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      const lo = Math.min(...page.map((p) => p.cdMs));
+      const hi = Math.max(...page.map((p) => p.cdMs));
+      const res = await this.ch().query({
+        query: `SELECT DISTINCT _id, toUnixTimestamp64Milli(cd) AS cd_ms FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})
+                  AND (_id, toUnixTimestamp64Milli(cd)) IN (
+                  SELECT arrayJoin(arrayZip({ids:Array(String)}, {cds:Array(Int64)}))
+                ) ${this.scopeSql(scope)}`,
+        query_params: { ids: page.map((p) => p.id), cds: page.map((p) => p.cdMs), blo: lo, bhi: hi, ...this.scopeParams(scope) },
+        format: 'JSONEachRow',
+      });
+      for (const row of await res.json<{ _id: string; cd_ms: string }>()) {
+        out.push({ id: row._id, cdMs: Number(row.cd_ms) });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Count live rows equal to EXACT (_id, cd) pairs — pair-exact so a native
+   * retry that reused a migrated doc's _id at a DIFFERENT cd is never
+   * counted (or deleted) as the migrated copy.
+   */
+  async countMatchingPairs(pairs: Array<{ id: string; cdMs: number }>, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
+    let total = 0;
+    for (let i = 0; i < pairs.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = pairs.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      const lo = Math.min(...page.map((p) => p.cdMs));
+      const hi = Math.max(...page.map((p) => p.cdMs));
+      const res = await this.ch().query({
+        query: `SELECT count() AS cnt FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})
+                  AND (_id, toUnixTimestamp64Milli(cd)) IN (
+                  SELECT arrayJoin(arrayZip({ids:Array(String)}, {cds:Array(Int64)}))
+                ) ${this.scopeSql(scope)}`,
+        query_params: { ids: page.map((p) => p.id), cds: page.map((p) => p.cdMs), blo: lo, bhi: hi, ...this.scopeParams(scope) },
+        format: 'JSONEachRow',
+      });
+      const rows = await res.json<{ cnt: string }>();
+      total += Number(rows[0]?.cnt ?? 0);
+    }
+    return total;
   }
 
   /** Staging tables left behind by crashes (crash between done and drop). */
@@ -536,7 +653,7 @@ export class StagingManager {
    */
   async countAndSumLiveCdRange(lowerCdMs: number, upperCdMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<{ n: number; sumCd: number }> {
     const res = await this.ch().query({
-      query: `SELECT count() AS c, sum(toUnixTimestamp64Milli(cd) % 4294967296) AS s FROM ${this.fq(this.config.table)}
+      query: `SELECT count() AS c, toUInt64(sum(toUnixTimestamp64Milli(cd) % 4294967296)) % 4294967296 AS s FROM ${this.fq(this.config.table)}
               WHERE cd >= fromUnixTimestamp64Milli({lo:Int64})
                 AND cd <  fromUnixTimestamp64Milli({hi:Int64})
                 ${this.scopeSql(scope)}`,
@@ -552,24 +669,92 @@ export class StagingManager {
    * queries; used by ledger rebuild to attribute null-cd sweep rows (their
    * cd is ts-derived and lands inside regular chunks' windows).
    */
-  async fetchLiveCdByIds(ids: string[], cdBounds?: { loMs: number; hiMs: number }): Promise<Map<string, number>> {
+  async fetchLiveCdByIds(ids: string[], cdBounds?: { loMs: number; hiMs: number }, scope?: { a: string; e: string; n?: string } | null): Promise<Map<string, number>> {
     // _id is not in the ORDER BY — without cd bounds this is a full-column
     // scan on a 10B-row table. Callers know their rows' cd values; pass them.
+    // Scope (when the collection resolves one) keeps a SIBLING collection's
+    // row with the same _id from answering for this one.
     const bound = cdBounds
       ? 'AND cd >= fromUnixTimestamp64Milli({blo:Int64}) AND cd <= fromUnixTimestamp64Milli({bhi:Int64})'
       : '';
     const out = new Map<string, number>();
-    for (let i = 0; i < ids.length; i += 10_000) {
-      const page = ids.slice(i, i + 10_000);
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
       const res = await this.ch().query({
         query: `SELECT _id, toUnixTimestamp64Milli(cd) AS cd_ms FROM ${this.fq(this.config.table)}
-                WHERE _id IN {ids:Array(String)} ${bound}`,
-        query_params: { ids: page, ...(cdBounds ? { blo: cdBounds.loMs, bhi: cdBounds.hiMs } : {}) },
+                WHERE _id IN {ids:Array(String)} ${bound} ${this.scopeSql(scope)}`,
+        query_params: { ids: page, ...(cdBounds ? { blo: cdBounds.loMs, bhi: cdBounds.hiMs } : {}), ...this.scopeParams(scope) },
         format: 'JSONEachRow',
       });
       const rows = await res.json<{ _id: string; cd_ms: string }>();
       for (const r of rows) out.set(r._id, Number(r.cd_ms));
     }
     return out;
+  }
+
+  /** Does the live table hold ANY row with cd at/after fromMs? (partition-pruned, LIMIT 1) */
+  async hasLiveCdSince(fromMs: number): Promise<boolean> {
+    const res = await this.ch().query({
+      query: `SELECT 1 AS x FROM ${this.fq(this.config.table)}
+              WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) LIMIT 1`,
+      query_params: { lo: fromMs },
+      format: 'JSONEachRow',
+    });
+    return (await res.json<{ x: number }>()).length > 0;
+  }
+
+  /** DISTINCT given ids present live in [fromMs, toMs) — duplicate rows of one id never vouch for another id's absence. Scope keeps a same-_id row in a SIBLING collection from vouching either. */
+  async countDistinctMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
+    let total = 0;
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      const res = await this.ch().query({
+        // alias must not be 'n' — the scope filter references the real column n
+        query: `SELECT uniqExact(_id) AS cnt FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
+                  AND _id IN {ids:Array(String)} ${this.scopeSql(scope)}`,
+        query_params: { ids: page, lo: fromMs, hi: toMs, ...this.scopeParams(scope) },
+        format: 'JSONEachRow',
+      });
+      const rows = await res.json<{ cnt: string }>();
+      total += Number(rows[0]?.cnt ?? 0);
+    }
+    return total;
+  }
+
+  /** Live rows in [fromMs, toMs) whose _id is one of the given ids, scoped to a collection's (a,e,n) when known. */
+  async countMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<number> {
+    let total = 0;
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      const res = await this.ch().query({
+        query: `SELECT count() AS cnt FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
+                  AND _id IN {ids:Array(String)} ${this.scopeSql(scope)}`,
+        query_params: { ids: page, lo: fromMs, hi: toMs, ...this.scopeParams(scope) },
+        format: 'JSONEachRow',
+      });
+      const rows = await res.json<{ cnt: string }>();
+      total += Number(rows[0]?.cnt ?? 0);
+    }
+    return total;
+  }
+
+  /**
+   * Lightweight-delete live rows in [fromMs, toMs) whose _id is one of the
+   * given ids. Tee-overlap cleanup: rows the migration copied from the old
+   * cluster that the mirror had already re-ingested natively. The cd window
+   * keeps each DELETE partition-prunable on multi-billion-row tables.
+   */
+  async deleteMatchingIdsInWindow(ids: string[], fromMs: number, toMs: number, scope?: { a: string; e: string; n?: string } | null): Promise<void> {
+    for (let i = 0; i < ids.length; i += StagingManager.ID_PARAM_PAGE) {
+      const page = ids.slice(i, i + StagingManager.ID_PARAM_PAGE);
+      await this.ch().command({
+        query: `DELETE FROM ${this.fq(this.config.table)}
+                WHERE cd >= fromUnixTimestamp64Milli({lo:Int64}) AND cd < fromUnixTimestamp64Milli({hi:Int64})
+                  AND _id IN {ids:Array(String)} ${this.scopeSql(scope)}`,
+        query_params: { ids: page, lo: fromMs, hi: toMs, ...this.scopeParams(scope) },
+      });
+    }
   }
 }

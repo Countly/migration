@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { MongoClient } from 'mongodb';
 import { createClient, type ClickHouseClient } from '@clickhouse/client';
 
-import { detectBoundary, newBoundaryProgress } from '../../src/runtime/boundary-detector.ts';
+import { detectBoundary, newBoundaryProgress, decideAutoApply } from '../../src/runtime/boundary-detector.ts';
 import { LedgerStore } from '../../src/state/ledger-store.ts';
 import { StagingManager } from '../../src/target/staging-manager.ts';
 import { loadConfig } from '../../src/config/loader.ts';
@@ -143,6 +143,177 @@ describe('tee-boundary detection + sync parity', () => {
     return report;
   };
 
+  it('stored-bound compare-and-set: only the apply that validated against the current value wins', async () => {
+    const RUN2 = 'boundary-cas-1';
+    const t1 = await ledger.setStoredBoundIf(RUN2, 1_000_000_000_000, 'a', null);
+    expect(t1).toBeTruthy();
+    expect(await ledger.setStoredBoundIf(RUN2, 1_100_000_000_000, 'b', null)).toBeNull();
+    const t2 = await ledger.setStoredBoundIf(RUN2, 1_200_000_000_000, 'c', 1_000_000_000_000);
+    expect(t2).toBeTruthy();
+    expect(await ledger.setStoredBoundIf(RUN2, 1_300_000_000_000, 'd', 1_000_000_000_000)).toBeNull();
+    expect(await ledger.getStoredBound(RUN2)).toBe(1_200_000_000_000);
+
+    // value-ABA: a competing apply re-stores the SAME value under its own
+    // token — the earlier owner's rollback must not unwind it
+    const t3 = await ledger.setStoredBoundIf(RUN2, 1_200_000_000_000, 'e', 1_200_000_000_000);
+    expect(t3).toBeTruthy();
+    expect(await ledger.rollbackStoredBound(RUN2, t2 as string, 1_000_000_000_000)).toBe(false);
+    expect(await ledger.getStoredBound(RUN2)).toBe(1_200_000_000_000);
+    // fence casualties are token-scoped: only the rolled-back bound's
+    // superseded chunks come back
+    const RUN3b = 'boundary-fence-1';
+    const mkc = (idx: number) => ({
+      _id: `${RUN3b}:c:${idx}`, run_id: RUN3b, collection: 'c',
+      scope_a: 'a', scope_e: 'e', scope_n: null, idx, lower_cd: idx * 100, upper_cd: idx * 100 + 100,
+      status: 'in_progress' as const, pod_id: 'p1', lease_until: new Date(Date.now() + 60_000), staging_table: null,
+      docs_read: 0, docs_skipped: 0, rows_expected: 0, partitions: [], attached: [],
+      attach_method: null, attempts: 0, last_error: null, transform_version: 'v', updated_at: new Date(),
+    });
+    await ledger.replaceAllForRun(RUN3b, [mkc(1), mkc(2)] as never[]);
+    await ledger.supersede(`${RUN3b}:c:1`, 'p1', 'tokenA');
+    await ledger.supersede(`${RUN3b}:c:2`, 'p1', 'tokenB');
+    expect(await ledger.restoreSuperseded(RUN3b, 'tokenA')).toBe(1);
+    const rows3 = await mc.db(DB).collection('mig_ranges').find({ run_id: RUN3b } as never).sort({ idx: 1 }).toArray();
+    expect(rows3.map((r) => [r.idx, r.status])).toEqual([[1, 'pending'], [2, 'superseded']]);
+
+    // apply marker: token-scoped set/clear, stale markers ignored
+    const RUN4 = 'boundary-marker-1';
+    expect(await ledger.acquireApplyMarker(RUN4, 'mtokA')).toBe(true);
+    expect((await ledger.getBoundState(RUN4)).applying).toBe(true);
+    expect(await ledger.clearApplyMarker(RUN4, 'WRONG')).toBe(false);
+    expect((await ledger.getBoundState(RUN4)).applying).toBe(true);
+    expect(await ledger.clearApplyMarker(RUN4, 'mtokA')).toBe(true);
+    expect((await ledger.getBoundState(RUN4)).applying).toBe(false);
+
+    // marker acquisition is a CAS: one live apply at a time
+    const RUN5 = 'boundary-marker-2';
+    expect(await ledger.acquireApplyMarker(RUN5, 'a1')).toBe(true);
+    expect(await ledger.acquireApplyMarker(RUN5, 'a2')).toBe(false);
+    expect(await ledger.clearApplyMarker(RUN5, 'a1')).toBe(true);
+    expect(await ledger.acquireApplyMarker(RUN5, 'a2')).toBe(true);
+    await ledger.clearApplyMarker(RUN5, 'a2');
+
+    // the CURRENT owner's rollback works
+    expect(await ledger.rollbackStoredBound(RUN2, t3 as string, 1_000_000_000_000)).toBe(true);
+    expect(await ledger.getStoredBound(RUN2)).toBe(1_000_000_000_000);
+  });
+
+  it('apply-marker renewal is token-scoped; the maintenance reservation is a cluster-wide CAS', async () => {
+    const RM = 'marker-renew-1';
+    expect(await ledger.acquireApplyMarker(RM, 'hb1')).toBe(true);
+    expect(await ledger.renewApplyMarker(RM, 'hb1')).toBe(true);
+    expect(await ledger.renewApplyMarker(RM, 'OTHER')).toBe(false);
+    expect(await ledger.clearApplyMarker(RM, 'hb1')).toBe(true);
+    expect(await ledger.renewApplyMarker(RM, 'hb1')).toBe(false); // cleared = gone
+
+    // prune writes are ownership-fenced: a zombie apply whose marker was
+    // taken over must not resume its destructive writes
+    const RZ = 'marker-fence-1';
+    await mc.db(DB).collection('mig_ranges').insertOne({
+      _id: 'rz:1', run_id: RZ, collection: 'c', idx: 0, lower_cd: 500, upper_cd: 600,
+      status: 'pending', attempts: 0, created_at: new Date(), updated_at: new Date(),
+    } as never);
+    expect(await ledger.acquireApplyMarker(RZ, 'ownerB')).toBe(true);
+    await expect(ledger.pruneBeyondBound(RZ, 100, undefined, 'zombieA')).rejects.toThrow('taken over');
+    expect(await mc.db(DB).collection('mig_ranges').countDocuments({ _id: 'rz:1' } as never)).toBe(1); // untouched
+    const rz = await ledger.pruneBeyondBound(RZ, 100, undefined, 'ownerB'); // the rightful owner prunes
+    expect(rz.deleted).toBe(1);
+    expect(await ledger.clearApplyMarker(RZ, 'ownerB')).toBe(true);
+
+    const RMM = 'maint-1';
+    expect((await ledger.acquireMaintenance(RMM, 'final-check', 't1')).acquired).toBe(true);
+    expect(await ledger.acquireMaintenance(RMM, 'dedupe', 't2')).toEqual({ acquired: false, holder: 'final-check' });
+    expect(await ledger.renewMaintenance(RMM, 't1')).toBe(true);
+    expect(await ledger.renewMaintenance(RMM, 't2')).toBe(false);
+    await ledger.releaseMaintenance(RMM, 't2'); // wrong token — must be a no-op
+    expect((await ledger.acquireMaintenance(RMM, 'dedupe', 't3')).acquired).toBe(false);
+    await ledger.releaseMaintenance(RMM, 't1');
+    expect((await ledger.acquireMaintenance(RMM, 'dedupe', 't4')).acquired).toBe(true);
+    await ledger.releaseMaintenance(RMM, 't4');
+  });
+
+  it('prune journal: orphaned receipts restore under the governing bound; live applies are skipped', async () => {
+    const mk = (run: string, id: string, lo: number, up: number) => ({
+      _id: id, run_id: run, collection: 'c', idx: 0, lower_cd: lo, upper_cd: up,
+      status: 'pending', attempts: 0, created_at: new Date(), updated_at: new Date(),
+    });
+    const ranges = mc.db(DB).collection('mig_ranges');
+
+    // crash BEFORE the bound committed: deleted chunk reinserted, straddler unclamped
+    const RJ = 'prune-journal-1';
+    await ranges.insertOne(mk(RJ, 'rj:straddle', 50, 100) as never); // on-disk: clamped by the dead apply
+    await ledger.journalPruneReceipt(RJ, 'tokDead', {
+      deletedChunks: [mk(RJ, 'rj:gone', 150, 200)] as never[],
+      clampedChunks: [{ _id: 'rj:straddle', upper_cd: 180 }],
+    });
+    expect(await ledger.recoverPruneJournal(RJ, null)).toEqual({ recovered: 1, skippedLiveApply: 0 });
+    const rows = await ranges.find({ run_id: RJ } as never).sort({ _id: 1 }).toArray();
+    expect(rows.map((r) => [r._id, r.lower_cd, r.upper_cd])).toEqual([['rj:gone', 150, 200], ['rj:straddle', 50, 180]]);
+    // the journal is empty now — recovery is idempotent
+    expect(await ledger.recoverPruneJournal(RJ, null)).toEqual({ recovered: 0, skippedLiveApply: 0 });
+
+    // a LIVE apply's entry is someone's in-flight work — skipped until its marker clears
+    await ledger.journalPruneReceipt(RJ, 'tokLive', { deletedChunks: [mk(RJ, 'rj:live', 300, 400)] as never[], clampedChunks: [] });
+    expect(await ledger.acquireApplyMarker(RJ, 'tokLive')).toBe(true);
+    expect(await ledger.recoverPruneJournal(RJ, null)).toEqual({ recovered: 0, skippedLiveApply: 1 });
+    expect(await ranges.countDocuments({ _id: 'rj:live' } as never)).toBe(0);
+    expect(await ledger.clearApplyMarker(RJ, 'tokLive')).toBe(true);
+    expect(await ledger.recoverPruneJournal(RJ, null)).toEqual({ recovered: 1, skippedLiveApply: 0 });
+    expect(await ranges.countDocuments({ _id: 'rj:live' } as never)).toBe(1);
+
+    // huge receipts PAGE across journal documents (16MiB BSON limit) and
+    // recover in full
+    const RJ3 = 'prune-journal-3';
+    const big = Array.from({ length: 5_001 }, (_, i) => mk(RJ3, `rj3:${i}`, i * 10, i * 10 + 9));
+    await ledger.journalPruneReceipt(RJ3, 'tokBig', { deletedChunks: big as never[], clampedChunks: [] });
+    expect(await ledger.countPruneJournal(RJ3)).toBe(2);
+    expect(await ledger.recoverPruneJournal(RJ3, null)).toEqual({ recovered: 2, skippedLiveApply: 0 });
+    expect(await ranges.countDocuments({ run_id: RJ3 } as never)).toBe(5_001);
+    expect(await ledger.countPruneJournal(RJ3)).toBe(0);
+
+    // FENCE GENERATION: a restore bumps it, so a zombie prune resuming its
+    // writes with the snapshotted generation matches NOTHING it brought back
+    const RG = 'fence-gen-1';
+    await ranges.insertOne(mk(RG, 'rg:1', 100, 200) as never);
+    const pr = await ledger.pruneBeyondBound(RG, 50); // snapshot saw fence_gen = null
+    expect(pr.deleted).toBe(1);
+    await ledger.restorePrune(pr.restore, null);      // takeover restores → gen 1
+    const restored = await ranges.findOne({ _id: 'rg:1' } as never);
+    expect(restored!.fence_gen).toBe(1);
+    // the zombie's per-document delete predicate (its snapshotted generation)
+    const zdel = await ranges.deleteOne({ _id: 'rg:1', status: 'pending', fence_gen: null } as never);
+    expect(zdel.deletedCount).toBe(0); // atomic fence: nothing to delete
+    expect(await ranges.countDocuments({ _id: 'rg:1' } as never)).toBe(1);
+
+    // a COMMITTED apply's leftover entry restores NOTHING — its own bound filters every chunk out
+    const RJ2 = 'prune-journal-2';
+    expect(await ledger.setStoredBoundIf(RJ2, 120, 'test', null)).toBeTruthy();
+    await ledger.journalPruneReceipt(RJ2, 'tokDone', { deletedChunks: [mk(RJ2, 'rj2:beyond', 130, 200)] as never[], clampedChunks: [] });
+    expect(await ledger.recoverPruneJournal(RJ2, null)).toEqual({ recovered: 1, skippedLiveApply: 0 });
+    expect(await ranges.countDocuments({ _id: 'rj2:beyond' } as never)).toBe(0);
+  });
+
+  it('restorePrune under a winning bound never resurrects what that bound pruned', async () => {
+    const RUN3 = 'boundary-restore-1';
+    const mk = (idx: number, lo: number, hi: number) => ({
+      _id: `${RUN3}:c:${idx}`, run_id: RUN3, collection: 'c',
+      scope_a: 'a', scope_e: 'e', scope_n: null, idx, lower_cd: lo, upper_cd: hi,
+      status: 'pending' as const, pod_id: null, lease_until: null, staging_table: null,
+      docs_read: 0, docs_skipped: 0, rows_expected: 0, partitions: [], attached: [],
+      attach_method: null, attempts: 0, last_error: null, transform_version: 'v', updated_at: new Date(),
+    });
+    // loser's receipt holds chunks at 100–200 and 200–300, straddler originally ending 150
+    const receipt = {
+      deletedChunks: [mk(1, 100, 200), mk(2, 200, 300)] as never[],
+      clampedChunks: [{ _id: `${RUN3}:c:0`, upper_cd: 150 }],
+    };
+    await ledger.replaceAllForRun(RUN3, [{ ...mk(0, 0, 100), upper_cd: 120 }] as never[]);
+    // the winner's bound is 150: chunk 200–300 stays gone, 100–200 comes back clamped to 150
+    await ledger.restorePrune(receipt as never, 150);
+    const rows = await mc.db(DB).collection('mig_ranges').find({ run_id: RUN3 } as never).sort({ idx: 1 }).toArray();
+    expect(rows.map((r) => [r.idx, r.lower_cd, r.upper_cd])).toEqual([[0, 0, 150], [1, 100, 150]]);
+  });
+
   it('finds the ingestion-pause gap and suggests a bound inside it; parity flags the dead hour', async () => {
     const report = (await run())!;
     const d = report.detection;
@@ -202,7 +373,7 @@ describe('tee-boundary detection + sync parity', () => {
     ], 'v2', null);
     const B = 150;
     const pruned = await ledger.pruneBeyondBound(AR, B);
-    expect(pruned).toEqual({ deleted: 2, clamped: 1 }); // #2,#3 gone; #1 clamped
+    expect(pruned).toMatchObject({ deleted: 2, clamped: 1 }); // #2,#3 gone; #1 clamped
     const left = await mc.db(DB).collection('mig_ranges')
       .find({ run_id: AR } as never).sort({ idx: 1 }).toArray();
     expect(left.map((c) => [c.lower_cd, c.upper_cd])).toEqual([[0, 100], [100, 150]]);
@@ -280,4 +451,68 @@ describe('tee-boundary detection + sync parity', () => {
     expect(report.sync.status).toBe('ok'); // parity is migration-agnostic
     await mc.db(DB).collection('mig_ranges').deleteMany({ run_id: RUN } as never);
   }, 60_000);
+});
+
+describe('set-boundary auto-apply decision', () => {
+  const report = (detection: Record<string, unknown>) => ({ detection, sync: { status: 'ok' } }) as never;
+  const M = 60_000;
+  const gapMinutes = (mongoPerMin: number, chPerMin: number, anchorMs = 22 * M) => {
+    const gap = { fromMs: 20 * M, toMs: 22 * M };
+    const minutes: Array<{ minuteMs: number; mongo: number; ch: number }> = [];
+    for (let m = 5; m < 20; m++) minutes.push({ minuteMs: m * M, mongo: mongoPerMin, ch: 0 });
+    for (let m = 22; m < 40; m++) minutes.push({ minuteMs: m * M, mongo: 0, ch: chPerMin });
+    return { gap, minutes, suggestedBoundMs: 21 * M, anchorMs };
+  };
+
+  it('a corroborated gap applies unattended', () => {
+    const g = gapMinutes(5, 4);
+    expect(decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), false))
+      .toEqual({ apply: true, boundMs: 21 * M });
+  });
+
+  it('a quiet minute on a sparse install is NOT taken as the seam', () => {
+    const g = gapMinutes(1, 1); // 10 docs per flank — any lull looks like this
+    const d = decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), false);
+    expect(d.apply).toBe(false);
+    expect(d.reason).toContain('sparse');
+    // …unless the operator explicitly accepts imperfect evidence
+    expect(decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), true))
+      .toEqual({ apply: true, boundMs: 21 * M });
+  });
+
+  it('an anchor needs the explicit acceptAnchor', () => {
+    const d = decideAutoApply(report({ status: 'ok', method: 'anchor', suggestedBoundMs: 123, ambiguousMongoDocs: 42 }), false);
+    expect(d.apply).toBe(false);
+    expect(d.reason).toContain('acceptAnchor');
+    expect(d.reason).toContain('42');
+    expect(decideAutoApply(report({ status: 'ok', method: 'anchor', suggestedBoundMs: 123 }), true))
+      .toEqual({ apply: true, boundMs: 123 });
+  });
+
+  it('old-side traffic resuming between the gap and the anchor disqualifies the gap', () => {
+    // quiet 20–22, mongo resumes at 22, first new-side data at 24: within
+    // the 2-min allowance, but those minute-22/23 docs would be orphaned
+    const g = gapMinutes(5, 4, 24 * M);
+    g.minutes.push({ minuteMs: 22 * M, mongo: 3, ch: 0 }, { minuteMs: 23 * M, mongo: 3, ch: 0 });
+    const d = decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), false);
+    expect(d.apply).toBe(false);
+    expect(d.reason).toContain('resumed');
+  });
+
+  it('a lull that does not abut the ClickHouse anchor is never auto-applied', () => {
+    // gap at minutes 20–22 but the first new-side data lands at minute 30:
+    // a quiet spell BEFORE the real tee start — applying it would exclude
+    // the old-side docs between the false gap and the anchor
+    const g = gapMinutes(5, 4, 30 * M);
+    const d = decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), false);
+    expect(d.apply).toBe(false);
+    expect(d.reason).toContain('abut');
+    expect(decideAutoApply(report({ status: 'ok', method: 'gap', ...g }), true))
+      .toEqual({ apply: true, boundMs: 21 * M });
+  });
+
+  it('refused or empty detections never apply', () => {
+    expect(decideAutoApply(report({ status: 'refused', reason: 'run already mapped' }), true).apply).toBe(false);
+    expect(decideAutoApply(null, true).apply).toBe(false);
+  });
 });

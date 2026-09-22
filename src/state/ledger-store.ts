@@ -33,6 +33,8 @@ export interface ChunkDoc {
   idx: number;
   lower_cd: number;            // inclusive, epoch ms
   upper_cd: number;            // exclusive, epoch ms
+  /** Fencing generation: every RESTORE bumps it, and prune mutations are predicated on the generation they snapshotted — a zombie prune resuming after a marker takeover carries stale generations and matches nothing. Absent = 0. */
+  fence_gen?: number | null;
   status: ChunkStatus;
   pod_id: string | null;
   lease_until: Date | null;
@@ -90,10 +92,12 @@ export class LedgerStore {
     total: number;
     byStatus: Record<string, number>;
     docsDone: number;
+    /** Cluster truth — each pod's in-memory skip counter only knows its own share. */
+    docsSkipped: number;
     perCollection: Array<{ collection: string; byStatus: Record<string, number>; docsDone: number; doneDocsRead: number; nonDoneRowsExpected: number }>;
   }> {
     const rows = await this.c().aggregate<{
-      _id: { c: string; s: string }; n: number; docsDone: number; docsRead: number; nonDoneExpected: number;
+      _id: { c: string; s: string }; n: number; docsDone: number; docsRead: number; nonDoneExpected: number; docsSkipped: number;
     }>([
       { $match: { run_id: runId } },
       { $group: {
@@ -102,11 +106,12 @@ export class LedgerStore {
         docsDone: { $sum: { $cond: [{ $eq: ['$status', 'done'] }, '$rows_expected', 0] } },
         docsRead: { $sum: { $cond: [{ $eq: ['$status', 'done'] }, '$docs_read', 0] } },
         nonDoneExpected: { $sum: { $cond: [{ $in: ['$status', ['pending', 'in_progress', 'written', 'attaching', 'failed']] }, '$rows_expected', 0] } },
+        docsSkipped: { $sum: '$docs_skipped' },
       } },
     ]).toArray();
     const perColl = new Map<string, { collection: string; byStatus: Record<string, number>; docsDone: number; doneDocsRead: number; nonDoneRowsExpected: number }>();
     const byStatus: Record<string, number> = {};
-    let total = 0, docsDone = 0;
+    let total = 0, docsDone = 0, docsSkipped = 0;
     for (const r of rows) {
       const e = perColl.get(r._id.c) ?? { collection: r._id.c, byStatus: {}, docsDone: 0, doneDocsRead: 0, nonDoneRowsExpected: 0 };
       e.byStatus[r._id.s] = (e.byStatus[r._id.s] ?? 0) + r.n;
@@ -117,8 +122,9 @@ export class LedgerStore {
       byStatus[r._id.s] = (byStatus[r._id.s] ?? 0) + r.n;
       total += r.n;
       docsDone += r.docsDone;
+      docsSkipped += r.docsSkipped;
     }
-    return { total, byStatus, docsDone, perCollection: [...perColl.values()].sort((a, b) => a.collection.localeCompare(b.collection)) };
+    return { total, byStatus, docsDone, docsSkipped, perCollection: [...perColl.values()].sort((a, b) => a.collection.localeCompare(b.collection)) };
   }
 
   /** Non-terminal + failed chunk details, capped — the interesting ones on huge runs. */
@@ -258,6 +264,9 @@ export class LedgerStore {
         if ((err as { code?: number }).code !== 11000) throw err;
       }
     }
+    // map-vs-apply race: this pass may have read an older (or no) bound —
+    // re-check the CURRENT one and clean our own delta before anyone claims
+    await this.prunePendingBeyondStoredBound(runId);
     return docs.length;
   }
 
@@ -339,6 +348,9 @@ export class LedgerStore {
         if ((err as { code?: number }).code !== 11000) throw err;
       }
     }
+    // map-vs-apply race: this pass may have read an older (or no) bound —
+    // re-check the CURRENT one and clean our own delta before anyone claims
+    await this.prunePendingBeyondStoredBound(runId);
     return docs.length;
   }
 
@@ -477,7 +489,11 @@ export class LedgerStore {
    */
   private rc(): Collection<{
     _id: string; cd_upper_bound_ms: number; set_at: Date; set_by: string;
+    bound_token?: string;
+    apply_in_progress_token?: string; apply_in_progress_at?: Date;
     start_gate_open?: boolean; start_gate_opened_at?: Date; start_gate_opened_by?: string;
+    unbounded_ok?: boolean; unbounded_ok_by?: string; unbounded_ok_at?: Date;
+    maintenance_op?: string; maintenance_token?: string; maintenance_at?: Date;
   }> {
     if (!this.coll) throw new Error('LedgerStore not connected');
     return this.client.db(this.dbName).collection('mig_run_config');
@@ -579,6 +595,261 @@ export class LedgerStore {
     return doc?.cd_upper_bound_ms ?? null;
   }
 
+  /** Bound plus its ownership token — fence mutations record the token so a rolled-back apply can restore exactly what its bound caused. */
+  async getStoredBoundInfo(runId: string): Promise<{ boundMs: number; token: string | null } | null> {
+    const doc = await this.rc().findOne({ _id: runId });
+    if (doc?.cd_upper_bound_ms === undefined) return null;
+    return { boundMs: doc.cd_upper_bound_ms, token: doc.bound_token ?? null };
+  }
+
+  /** One read for the post-claim fence: the bound, its token, and whether an apply is mid-flight (provisional grid — claims must not hold anything). */
+  async getBoundState(runId: string): Promise<{ boundMs: number | null; token: string | null; applying: boolean }> {
+    const doc = await this.rc().findOne({ _id: runId });
+    // a marker older than 10 min is a crashed apply — never let it stall the run
+    const applying = !!doc?.apply_in_progress_token
+      && (doc.apply_in_progress_at?.getTime() ?? 0) > Date.now() - 600_000;
+    return { boundMs: doc?.cd_upper_bound_ms ?? null, token: doc?.bound_token ?? null, applying };
+  }
+
+  /** Token-scoped heartbeat: keep a LEGITIMATE long apply's marker alive (huge-grid prunes, MongoDB stalls). False = the token was taken over — the apply must abort. */
+  async renewApplyMarker(runId: string, token: string): Promise<boolean> {
+    const res = await this.rc().updateOne(
+      { _id: runId, apply_in_progress_token: token },
+      { $set: { apply_in_progress_at: new Date() } },
+    );
+    return res.matchedCount > 0;
+  }
+
+  /**
+   * CAS-acquire the CLUSTER-WIDE maintenance reservation: final check and
+   * dedupe are destructive-vs-audit exclusive, and pods route their HTTP
+   * requests independently — a process-local lock cannot see the other
+   * pod's operation. Stale after 10 min without renewal (running ops
+   * heartbeat); a crashed holder's reservation is taken over then.
+   */
+  async acquireMaintenance(runId: string, op: string, token: string): Promise<{ acquired: boolean; holder?: string }> {
+    const staleBefore = new Date(Date.now() - 600_000);
+    try {
+      const res = await this.rc().updateOne(
+        {
+          _id: runId,
+          $or: [
+            { maintenance_token: { $exists: false } },
+            { maintenance_at: { $lt: staleBefore } },
+          ],
+        },
+        { $set: { maintenance_op: op, maintenance_token: token, maintenance_at: new Date() } },
+        { upsert: true },
+      );
+      if (res.matchedCount > 0 || (res.upsertedCount ?? 0) === 1) return { acquired: true };
+    } catch (err) {
+      if ((err as { code?: number }).code !== 11000) throw err;
+    }
+    const doc = await this.rc().findOne({ _id: runId });
+    return { acquired: false, holder: doc?.maintenance_op ?? 'unknown' };
+  }
+
+  /** Token-scoped heartbeat for the maintenance reservation. */
+  async renewMaintenance(runId: string, token: string): Promise<boolean> {
+    const res = await this.rc().updateOne(
+      { _id: runId, maintenance_token: token },
+      { $set: { maintenance_at: new Date() } },
+    );
+    return res.matchedCount > 0;
+  }
+
+  /** Release the maintenance reservation — only its own token can. */
+  async releaseMaintenance(runId: string, token: string): Promise<void> {
+    await this.rc().updateOne(
+      { _id: runId, maintenance_token: token },
+      { $unset: { maintenance_op: '', maintenance_token: '', maintenance_at: '' } },
+    );
+  }
+
+  /**
+   * ACQUIRE the apply marker — compare-and-set: succeeds only when no live
+   * marker exists (absent, or stale past the 10-minute crash expiry), so two
+   * applies can never interleave and one's clear can never expose the
+   * other's provisional grid. The fence releases every claim while any live
+   * marker is set.
+   */
+  async acquireApplyMarker(runId: string, token: string): Promise<boolean> {
+    const staleBefore = new Date(Date.now() - 600_000);
+    try {
+      const res = await this.rc().updateOne(
+        {
+          _id: runId,
+          $or: [
+            { apply_in_progress_token: { $exists: false } },
+            { apply_in_progress_at: { $lt: staleBefore } },
+          ],
+        },
+        { $set: { apply_in_progress_token: token, apply_in_progress_at: new Date() } },
+        { upsert: true },
+      );
+      return res.matchedCount > 0 || (res.upsertedCount ?? 0) === 1;
+    } catch (err) {
+      // duplicate key on upsert = a live marker exists on the doc
+      if ((err as { code?: number }).code === 11000) return false;
+      throw err;
+    }
+  }
+
+  /** Clear only this apply's marker (token-scoped) — a competing apply's marker survives. */
+  async clearApplyMarker(runId: string, token: string): Promise<boolean> {
+    const res = await this.rc().updateOne(
+      { _id: runId, apply_in_progress_token: token },
+      { $unset: { apply_in_progress_token: '', apply_in_progress_at: '' } },
+    );
+    return res.matchedCount > 0;
+  }
+
+  /** Cluster-wide operator answer to the startup guard: "nothing mirrors traffic — run unbounded". */
+  async getUnboundedAck(runId: string): Promise<boolean> {
+    const doc = await this.rc().findOne({ _id: runId });
+    return doc?.unbounded_ok === true;
+  }
+
+  async setUnboundedAck(runId: string, by: string): Promise<void> {
+    await this.rc().updateOne(
+      { _id: runId },
+      { $set: { unbounded_ok: true, unbounded_ok_by: by, unbounded_ok_at: new Date() } },
+      { upsert: true },
+    );
+  }
+
+  /**
+   * Durable change marker for a run's chunk state: any claim, completion,
+   * retry or remap moves it — including work that starts AND finishes
+   * between two snapshots (which an activeClaims poll would never see).
+   */
+  async runFingerprint(runId: string): Promise<string> {
+    const [row] = await this.c().aggregate<{ n: number; done: number; maxU: Date | null }>([
+      { $match: { run_id: runId } },
+      { $group: {
+        _id: null, n: { $sum: 1 },
+        done: { $sum: { $cond: [{ $eq: ['$status', 'done'] }, 1, 0] } },
+        maxU: { $max: '$updated_at' },
+      } },
+    ]).toArray();
+    return row ? `${row.n}:${row.done}:${row.maxU ? row.maxU.getTime() : 0}` : '0:0:0';
+  }
+
+  /** Supersede a chunk this pod holds — the bound says it must never be read. The bound's token is recorded so a rolled-back apply can restore exactly its own casualties. */
+  async supersede(chunkId: string, podId: string, boundToken?: string | null): Promise<void> {
+    await this.c().updateOne(
+      { _id: chunkId, pod_id: podId },
+      { $set: { status: 'superseded', pod_id: null, lease_until: null, updated_at: new Date(), ...(boundToken ? { superseded_by_token: boundToken } : {}) } as never },
+    );
+  }
+
+  /** Bring back the chunks a specific bound's fence superseded — its apply rolled back, so no bound governs them any more. */
+  async restoreSuperseded(runId: string, boundToken: string): Promise<number> {
+    const res = await this.c().updateMany(
+      { run_id: runId, status: 'superseded', superseded_by_token: boundToken } as never,
+      { $set: { status: 'pending', pod_id: null, lease_until: null, updated_at: new Date() }, $unset: { superseded_by_token: '' } } as never,
+    );
+    return res.modifiedCount ?? 0;
+  }
+
+  /** Release a claim untouched (status back to pending) — used when configuration cannot be read. */
+  async releaseClaim(chunkId: string, podId: string): Promise<void> {
+    await this.c().updateOne(
+      { _id: chunkId, pod_id: podId, status: 'in_progress' },
+      { $set: { status: 'pending', pod_id: null, lease_until: null, updated_at: new Date() } },
+    );
+  }
+
+  /** Clamp a chunk's upper edge to the bound (claimed straddler). */
+  async clampUpper(chunkId: string, boundMs: number): Promise<void> {
+    await this.c().updateOne({ _id: chunkId }, { $set: { upper_cd: boundMs, updated_at: new Date() } });
+  }
+
+  /**
+   * Self-heal for the map-vs-apply race: a map pass that read no bound (or
+   * an older one) may insert chunks a just-applied bound forbids. Called by
+   * the chunk-insert paths AFTER inserting: re-reads the CURRENT stored
+   * bound and prunes/clamps pending chunks beyond it, so a stale pass
+   * cleans up its own delta before the claim loop can drain it.
+   */
+  async prunePendingBeyondStoredBound(runId: string): Promise<number> {
+    // While an apply is mid-flight the stored bound may be PROVISIONAL and
+    // this cleanup keeps no receipt — a rollback could never restore what it
+    // deletes (and a collection whose regulars all died here while its
+    // null-cd sentinel survived would never remap). The marker is acquired
+    // BEFORE the store, so applying=false means the bound read is settled;
+    // deferring costs nothing: the apply's own prune, the post-claim fence,
+    // and the next map pass all cover the interim.
+    const state = await this.getBoundState(runId);
+    if (state.applying) return 0;
+    const bound = state.boundMs;
+    if (bound === null) return 0;
+    const del = await this.c().deleteMany({ run_id: runId, lower_cd: { $gte: bound }, status: 'pending' });
+    await this.c().updateMany(
+      { run_id: runId, lower_cd: { $gte: 0, $lt: bound }, upper_cd: { $gt: bound }, status: 'pending' },
+      { $set: { upper_cd: bound, updated_at: new Date() } },
+    );
+    return del.deletedCount ?? 0;
+  }
+
+  /** Roll back a bound whose post-store verification failed — apply must never leave a half-applied bound behind. */
+  async clearStoredBound(runId: string): Promise<void> {
+    await this.rc().updateOne({ _id: runId }, { $unset: { cd_upper_bound_ms: '', set_at: '', set_by: '' } });
+  }
+
+  /**
+   * Compare-and-set: store the bound only if the current stored value still
+   * equals what the caller validated against. Returns an OWNERSHIP TOKEN:
+   * the rollback predicate matches the token, not the value, so an
+   * identical-value re-apply by someone else (value-ABA) is never unwound
+   * by this caller's rollback.
+   */
+  async setStoredBoundIf(runId: string, boundMs: number, setBy: string, expectedPrior: number | null, mintedToken?: string): Promise<string | null> {
+    // the caller may mint the token BEFORE the write: on a lost
+    // acknowledgement it still knows what to roll back by
+    const token = mintedToken ?? `${setBy}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+    if (expectedPrior === null) {
+      const res = await this.rc().updateOne(
+        { _id: runId, cd_upper_bound_ms: { $exists: false } },
+        { $set: { cd_upper_bound_ms: boundMs, set_at: new Date(), set_by: setBy, bound_token: token } },
+        { upsert: true },
+      ).catch((err: unknown) => {
+        // duplicate-key on upsert = the doc appeared with a bound mid-flight
+        if ((err as { code?: number }).code === 11000) return { matchedCount: 0, upsertedCount: 0 };
+        throw err;
+      });
+      return (res.matchedCount > 0 || (res as { upsertedCount?: number }).upsertedCount === 1) ? token : null;
+    }
+    const res = await this.rc().updateOne(
+      { _id: runId, cd_upper_bound_ms: expectedPrior },
+      { $set: { cd_upper_bound_ms: boundMs, set_at: new Date(), set_by: setBy, bound_token: token } },
+    );
+    return res.matchedCount > 0 ? token : null;
+  }
+
+  /** Unwind ONLY the store identified by the token — restores the prior value or clears. Returns false if someone else's store governs now. */
+  async rollbackStoredBound(runId: string, token: string, priorBound: number | null): Promise<boolean> {
+    const res = priorBound === null
+      ? await this.rc().updateOne(
+        { _id: runId, bound_token: token },
+        { $unset: { cd_upper_bound_ms: '', set_at: '', set_by: '', bound_token: '' } },
+      )
+      : await this.rc().updateOne(
+        { _id: runId, bound_token: token },
+        { $set: { cd_upper_bound_ms: priorBound, set_at: new Date(), set_by: 'rollback', bound_token: `rollback:${token}` } },
+      );
+    return res.matchedCount > 0;
+  }
+
+  /** Clear the bound only if it still holds the value this caller stored — a rollback must never clobber a bound another apply won meanwhile. */
+  async clearStoredBoundIf(runId: string, expected: number): Promise<boolean> {
+    const res = await this.rc().updateOne(
+      { _id: runId, cd_upper_bound_ms: expected },
+      { $unset: { cd_upper_bound_ms: '', set_at: '', set_by: '' } },
+    );
+    return res.matchedCount > 0;
+  }
+
   async setStoredBound(runId: string, boundMs: number, setBy: string): Promise<void> {
     await this.rc().updateOne(
       { _id: runId },
@@ -594,7 +865,11 @@ export class LedgerStore {
    * Refuses when any non-pending chunk reaches past the bound — that data
    * (possibly) already moved and needs purge tooling, not a config flip.
    */
-  async pruneBeyondBound(runId: string, boundMs: number): Promise<{ deleted: number; clamped: number }> {
+  async pruneBeyondBound(runId: string, boundMs: number, receiptSink?: (r: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number; fence_gen?: number | null }> }) => void | Promise<void>, ownerToken?: string): Promise<{
+    deleted: number; clamped: number;
+    /** What the prune changed, verbatim — a raced apply restores it. */
+    restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number; fence_gen?: number | null }> };
+  }> {
     const busy = await this.c().countDocuments({
       run_id: runId, lower_cd: { $gte: 0 }, upper_cd: { $gt: boundMs },
       status: { $nin: ['pending'] },
@@ -602,14 +877,171 @@ export class LedgerStore {
     if (busy > 0) {
       throw new Error(`${busy} non-pending chunk(s) already reach past the bound — their windows may hold migrated post-bound data; purge/retry them first`);
     }
-    const del = await this.c().deleteMany({
-      run_id: runId, lower_cd: { $gte: boundMs }, status: 'pending',
-    });
-    const clamp = await this.c().updateMany(
-      { run_id: runId, lower_cd: { $gte: 0, $lt: boundMs }, upper_cd: { $gt: boundMs }, status: 'pending' },
-      { $set: { upper_cd: boundMs, updated_at: new Date() } },
+    // snapshot EVERYTHING first, hand the receipt to the caller, and only
+    // then write: a destructive write whose acknowledgement is lost must
+    // still be restorable by the caller
+    const deletedChunks = await this.c()
+      .find({ run_id: runId, lower_cd: { $gte: boundMs }, status: 'pending' })
+      .toArray();
+    const clampedChunks = (await this.c()
+      .find(
+        { run_id: runId, lower_cd: { $gte: 0, $lt: boundMs }, upper_cd: { $gt: boundMs }, status: 'pending' },
+        { projection: { _id: 1, upper_cd: 1, fence_gen: 1 } },
+      )
+      .toArray()).map((c) => ({ _id: String(c._id), upper_cd: c.upper_cd, fence_gen: (c.fence_gen as number | undefined) ?? null }));
+    // awaited: a sink that persists the receipt durably must finish BEFORE
+    // the destructive writes below — its failure aborts the prune untouched
+    await receiptSink?.({ deletedChunks, clampedChunks });
+    // Ownership fence: a pod that stalled past the marker expiry INSIDE this
+    // call must not resume writing after a takeover recovered its journal —
+    // the renewal doubles as the check and shrinks the zombie window from
+    // the whole prune to the instant before each destructive write.
+    if (ownerToken !== undefined && !(await this.renewApplyMarker(runId, ownerToken))) {
+      throw new Error('the apply marker was taken over — prune aborted before its destructive delete');
+    }
+    // FENCED per chunk: each delete is predicated on the fence generation
+    // the snapshot saw (null matches the absent field). A restore bumps the
+    // generation, so a zombie prune resuming these writes after a takeover
+    // recovered its journal deletes NOTHING the restore brought back — the
+    // check-then-write pair is atomic per document, not merely adjacent.
+    const del = deletedChunks.length === 0 ? { deletedCount: 0 } : await this.c().bulkWrite(
+      deletedChunks.map((c) => ({
+        deleteOne: { filter: { _id: c._id, status: 'pending', fence_gen: (c.fence_gen as number | undefined) ?? null } },
+      })),
+      { ordered: false },
     );
-    return { deleted: del.deletedCount ?? 0, clamped: clamp.modifiedCount ?? 0 };
+    // clamp ONLY the snapshotted ids: a straddler inserted after the
+    // snapshot must not be modified outside the receipt (a rollback would
+    // leave it truncated under a rejected bound) — the insert-path
+    // self-prune and the post-claim fence own anything newer
+    if (ownerToken !== undefined && !(await this.renewApplyMarker(runId, ownerToken))) {
+      throw new Error('the apply marker was taken over — prune aborted before its destructive clamp');
+    }
+    // clamps are fenced the same way, and BUMP the generation themselves so
+    // a zombie's re-clamp with the snapshotted generation misses
+    const clamp = clampedChunks.length === 0 ? { modifiedCount: 0 } : await this.c().bulkWrite(
+      clampedChunks.map((c) => ({
+        updateOne: {
+          filter: { _id: c._id, status: 'pending', fence_gen: c.fence_gen ?? null },
+          update: { $set: { upper_cd: boundMs, updated_at: new Date() }, $inc: { fence_gen: 1 } },
+        },
+      })),
+      { ordered: false },
+    );
+    return { deleted: del.deletedCount ?? 0, clamped: clamp.modifiedCount ?? 0, restore: { deletedChunks, clampedChunks } };
+  }
+
+  /**
+   * Undo a prune whose apply raced — re-insert deleted pending chunks,
+   * un-clamp straddlers (only while still pending). When another apply WON
+   * meanwhile, its bound governs: chunks at/beyond it stay pruned and
+   * straddlers stay clamped to it, so a losing rollback can never resurrect
+   * what the winning bound removed.
+   */
+  async restorePrune(
+    restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number; fence_gen?: number | null }> },
+    currentBoundMs: number | null = null,
+  ): Promise<void> {
+    // every restored document carries a BUMPED fence generation: the pruner
+    // whose receipt this is predicated its writes on the generation it
+    // snapshotted, so a zombie resuming those writes after this restore
+    // matches nothing
+    const insertable = (currentBoundMs === null
+      ? restore.deletedChunks
+      : restore.deletedChunks.filter((c) => c.lower_cd < currentBoundMs).map((c) => (
+        c.upper_cd > currentBoundMs ? { ...c, upper_cd: currentBoundMs } : c
+      ))).map((c) => ({ ...c, fence_gen: ((c.fence_gen as number | undefined) ?? 0) + 1 }));
+    if (insertable.length > 0) {
+      try {
+        await this.c().insertMany(insertable, { ordered: false });
+      } catch (err) {
+        // re-inserting is idempotent — chunks already present are fine; any
+        // OTHER failure means the grid was NOT restored and must propagate
+        const e = err as { code?: number; writeErrors?: Array<{ code?: number }> };
+        // when per-write errors exist THEY are the truth — a top-level 11000
+        // can front a mixed batch where other writes failed for real reasons
+        const we = e.writeErrors ?? [];
+        const dupOnly = we.length > 0 ? we.every((w) => w.code === 11000) : e.code === 11000;
+        if (!dupOnly) throw err;
+      }
+    }
+    for (const c of restore.clampedChunks) {
+      const upper = currentBoundMs !== null ? Math.min(c.upper_cd, currentBoundMs) : c.upper_cd;
+      // $inc bumps past the pruner's snapshotted generation — its zombie
+      // re-clamp then matches nothing
+      await this.c().updateOne({ _id: c._id, status: 'pending' }, { $set: { upper_cd: upper, updated_at: new Date() }, $inc: { fence_gen: 1 } });
+    }
+  }
+
+  /** Prune journal (mig_prune_journal): receipts persisted BEFORE each destructive prune. */
+  private pj(): Collection<{
+    run_id: string; token: string; created_at: Date;
+    receipt: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> };
+  }> {
+    if (!this.coll) throw new Error('LedgerStore not connected');
+    return this.client.db(this.dbName).collection('mig_prune_journal');
+  }
+
+  /**
+   * Persist a prune receipt durably — called by the sink BEFORE the prune's
+   * destructive writes. PAGED: a large grid's receipt must never approach
+   * the 16MiB BSON document limit (which would fail every apply attempt
+   * before pruning), so deleted chunks split across journal documents.
+   * Clamped straddlers (at most one per collection) ride in the first page.
+   */
+  async journalPruneReceipt(runId: string, token: string, receipt: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }): Promise<void> {
+    const PAGE = 5_000;
+    const { deletedChunks, clampedChunks } = receipt;
+    if (deletedChunks.length === 0 && clampedChunks.length === 0) return;
+    const docs: Array<{ run_id: string; token: string; created_at: Date; receipt: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> } }> = [];
+    for (let i = 0; i < Math.max(1, Math.ceil(deletedChunks.length / PAGE)); i++) {
+      docs.push({
+        run_id: runId, token, created_at: new Date(),
+        receipt: { deletedChunks: deletedChunks.slice(i * PAGE, (i + 1) * PAGE), clampedChunks: i === 0 ? clampedChunks : [] },
+      });
+    }
+    await this.pj().insertMany(docs);
+  }
+
+  /** Number of prune-journal entries for a run — non-zero means unsettled destructive work. */
+  async countPruneJournal(runId: string): Promise<number> {
+    return this.pj().countDocuments({ run_id: runId });
+  }
+
+  /** Remove an apply's journal entries once its outcome is settled (committed or fully rolled back). */
+  async clearPruneJournal(runId: string, token: string): Promise<void> {
+    await this.pj().deleteMany({ run_id: runId, token });
+  }
+
+  /**
+   * Restore orphaned prune journal entries — receipts whose apply died
+   * between the prune and a settled outcome. Restoration happens under the
+   * GOVERNING bound (env else stored), which makes it safe to run against
+   * ANY leftover entry: a journal whose apply actually committed its bound
+   * restores nothing (every pruned chunk is at/beyond that bound), while a
+   * crashed pre-commit apply gets its chunks back in full. Entries owned by
+   * a LIVE (non-stale) apply marker are someone's in-flight work — skipped.
+   * Runs at engine startup and before every new apply.
+   */
+  async recoverPruneJournal(runId: string, envBoundMs: number | null = null): Promise<{ recovered: number; skippedLiveApply: number }> {
+    const entries = await this.pj().find({ run_id: runId }).sort({ created_at: -1 }).toArray();
+    if (entries.length === 0) return { recovered: 0, skippedLiveApply: 0 };
+    const rc = await this.rc().findOne({ _id: runId });
+    const markerLive = rc?.apply_in_progress_token && rc.apply_in_progress_at
+      && rc.apply_in_progress_at.getTime() >= Date.now() - 600_000
+      ? rc.apply_in_progress_token : null;
+    const governing = envBoundMs ?? await this.getStoredBound(runId);
+    let recovered = 0, skippedLiveApply = 0;
+    for (const entry of entries) {
+      if (markerLive !== null && entry.token === markerLive) { skippedLiveApply++; continue; }
+      await this.restorePrune(entry.receipt, governing);
+      // by _id, never by (token, created_at): a paged receipt's documents
+      // share both, and deleting a DIFFERENT page than the one just restored
+      // would lose it forever if the process dies before its turn
+      await this.pj().deleteOne({ _id: entry._id });
+      recovered++;
+    }
+    return { recovered, skippedLiveApply };
   }
 
   /**

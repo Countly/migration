@@ -301,6 +301,16 @@ const PAGE = `<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Final check <span class="hint">— one click answers: is it safe to decommission the old source? (chunks + DLQ + full source recount + checksums + content samples — interpreted for you)</span></h2>
+    <div style="margin-bottom:8px">
+      <button class="btn primary" id="btn-finalcheck" onclick="startFinalCheck(this)">Run final check</button>
+      <label class="hint" style="margin-left:8px;cursor:pointer"><input type="checkbox" id="fc-deep" style="vertical-align:-2px"> deep source recount (slow — the pre-teardown gate; quick mode verifies against the run ledger in minutes)</label>
+      <input id="fc-cutover" placeholder="cutover time (optional, e.g. 2026-09-18T18:00Z) — only for tee/mirror runs without a stored bound" style="width:52%;max-width:560px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:12px;margin-left:8px;margin-top:6px">
+    </div>
+    <div id="finalcheck-out"><div class="empty">Not run. Run it after the migration completes — it recounts every window against the source, so give it time on big runs; progress shows here. SSH-only: <code>curl -X POST :PORT/control/final-check</code> then <code>curl :PORT/final-check.txt</code></div></div>
+  </div>
+
+  <div class="card">
     <h2>Collections</h2>
     <div id="collections"><div class="empty">Waiting for first chunk…</div></div>
   </div>
@@ -331,6 +341,17 @@ const PAGE = `<!doctype html>
   </div>
 
     <div id="mirror-detail" style="font-size:12.5px;color:var(--ink-2)"></div>
+  </div>
+
+  <div class="card">
+    <h2>Tee-overlap dedupe <span class="hint">(fix a mirrored run that migrated WITHOUT the cd bound: remove the migrated copies of events the new cluster already ingested natively)</span></h2>
+    <div style="margin-bottom:8px">
+      <input id="dd-from" placeholder="overlap start = tee flip / IP swap (ISO, e.g. 2026-09-18T18:00Z)" style="width:34%;max-width:380px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:12px">
+      <input id="dd-to" placeholder="overlap end = migration completion (ISO)" style="width:28%;max-width:320px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:12px;margin-left:6px">
+      <button class="btn" id="btn-dd-dry" onclick="startDedupe(this, false)">Dry run (count only)</button>
+      <button class="btn" id="btn-dd-exec" onclick="startDedupe(this, true)" disabled title="run the dry run over this window first">Delete duplicates</button>
+    </div>
+    <div id="dedupe-out"><div class="empty">Only for runs that migrated a mirrored setup unbounded. Every hour bucket is checked for count-evidence of native counterparts before anything is deleted — buckets where migrated rows are the ONLY copy are skipped and reported. Old-cluster Mongo must still be up. Start must be AT or AFTER the actual flip: too early deletes real data, too late only leaves a few duplicates.</div></div>
   </div>
 
   <div class="card">
@@ -427,7 +448,7 @@ const PAGE = `<!doctype html>
       </p>
       <div id="verify-result" style="margin-top:10px"></div>
       <div id="audit-result" style="margin-top:6px;font-size:12.5px;color:var(--ink-2)"></div>
-      <p>Then: final report (<a href="/report" target="_blank">/report</a>), customer sign-off, revert Kafka retention, decommission the old cluster.</p>
+      <p>Then: final report (<a href="/report" target="_blank">/report</a>), sign-off, revert Kafka retention, decommission the old cluster.</p>
     </div>
   </details>
 </div>
@@ -513,7 +534,7 @@ async function control(action, okMsg, btn, needsConfirm) {
     btn.dataset.label = btn.textContent;
     btn.textContent = 'Click again to confirm';
     btn.classList.add('armed');
-    setTimeout(() => { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 4000);
+    setTimeout(() => { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 8000);
     return;
   }
   if (btn) { armed.delete(btn); if (btn.dataset.label) { btn.textContent = btn.dataset.label; btn.classList.remove('armed'); } btn.disabled = true; }
@@ -534,7 +555,7 @@ async function startRebuild(btn, force) {
     btn.dataset.label = btn.textContent;
     btn.textContent = 'Click again to confirm';
     btn.classList.add('armed');
-    setTimeout(() => { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 4000);
+    setTimeout(() => { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 8000);
     return;
   }
   armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); btn.disabled = true;
@@ -720,6 +741,138 @@ function updatePhaseBadges() {
 }
 updatePhaseBadges();
 
+async function allowUnbounded(btn) {
+  if (!armed.get(btn)) {
+    armed.set(btn, true);
+    btn.dataset.label = btn.textContent;
+    btn.textContent = 'Click again to confirm: NOTHING mirrors traffic';
+    btn.classList.add('armed');
+    setTimeout(function () { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 8000);
+    return;
+  }
+  armed.delete(btn); btn.disabled = true;
+  try {
+    var res = await fetch('/control/allow-unbounded', { method: 'POST' });
+    var out = await res.json();
+    toast(out.allowed ? '\u2705 no-mirror declared \u2014 held pods release within seconds' : '\u274c ' + (out.reason || res.status));
+  } catch (e) { toast('\u274c ' + e.message); }
+}
+
+function ddWindow() {
+  var f = Date.parse((document.getElementById('dd-from').value || '').trim());
+  var t = Date.parse((document.getElementById('dd-to').value || '').trim());
+  if (isNaN(f) || isNaN(t) || !(f < t)) { toast('Enter both times as ISO (e.g. 2026-09-18T18:00Z), start before end'); return null; }
+  return { fromMs: f, toMs: t };
+}
+async function startDedupe(btn, execute) {
+  var w = ddWindow();
+  if (!w) return;
+  if (execute && !armed.get(btn)) {
+    armed.set(btn, true);
+    btn.dataset.label = btn.textContent;
+    btn.textContent = 'Click again to DELETE the counted duplicates';
+    btn.classList.add('armed');
+    setTimeout(function () { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 8000);
+    return;
+  }
+  if (execute) { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }
+  btn.disabled = true;
+  try {
+    var res = await fetch('/control/dedupe-overlap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ fromMs: w.fromMs, toMs: w.toMs, execute: !!execute }) });
+    var out = await res.json();
+    if (!out.started) toast('Not started: ' + (out.reason || 'unknown'));
+    else toast(execute ? 'Deleting duplicates\u2026' : 'Dry run started \u2014 counting duplicates');
+  } catch (e) { toast('failed: ' + e.message); }
+  btn.disabled = false;
+  pollDedupe();
+}
+var ddTimer = null;
+async function pollDedupe() {
+  try {
+    var dd = await fetch('/api/dedupe-overlap').then(function (r) { return r.json(); });
+    renderDedupe(dd);
+    if (dd.status === 'running') { clearTimeout(ddTimer); ddTimer = setTimeout(pollDedupe, 2000); }
+  } catch (e) { /* engine restarting */ }
+}
+function renderDedupe(dd) {
+  var el = document.getElementById('dedupe-out');
+  if (!el || !dd || dd.status === 'not_run') return;
+  var execBtn = document.getElementById('btn-dd-exec');
+  if (dd.status === 'running') { el.innerHTML = '<div class="empty">Running \u2014 ' + fcEsc(dd.phase) + '</div>'; return; }
+  if (dd.status === 'failed') { el.innerHTML = '<div style="padding:10px 14px;border-radius:8px;background:#FDECEC;color:#B3261E;font-weight:600">Failed: ' + fcEsc(dd.error) + '</div>'; return; }
+  var t = dd.totals || {};
+  var unsafeN = 0;
+  (dd.collections || []).forEach(function (c) { unsafeN += (c.unsafe || []).length; });
+  var html = '<p style="font-weight:600">' + (dd.execute
+    ? '\u2705 Deleted ' + fmt(t.deleted) + ' duplicate row(s).'
+    : 'Dry run: ' + fmt(t.chMatched) + ' migrated row(s) match old-cluster ids in the window (' + fmt(t.mongoDocsInWindow) + ' old-side docs scanned). Nothing deleted.') + '</p>';
+  if (t.unsafeMatched > 0) {
+    html += '<p style="color:#B3261E;font-weight:600">\u26a0 ' + fmt(t.unsafeMatched) + ' matched row(s) in ' + unsafeN + ' bucket(s) were NOT ' + (dd.execute ? 'deleted' : 'counted as deletable') + ': they lack count-evidence of a native counterpart, or belong to a collection without its own (a,e,n) scope \u2014 there the migrated row may be the ONLY copy. Review those buckets (tee outage / wrong start time / base collection?) before touching them.</p>';
+  }
+  if (!dd.execute && dd.lastDryRun) {
+    html += '<p class="hint">Window measured \u2014 the Delete button is now enabled for this exact window.</p>';
+    if (execBtn) { execBtn.disabled = false; execBtn.title = ''; }
+  }
+  html += '<p class="hint">window: ' + new Date(dd.fromMs).toISOString() + ' \u2192 ' + new Date(dd.toMs).toISOString() + ' \u00b7 ' + (dd.collections || []).length + ' collection(s) with matches</p>';
+  el.innerHTML = html;
+}
+
+async function startFinalCheck(btn) {
+  var body = {};
+  var deepEl = document.getElementById('fc-deep');
+  if (deepEl && deepEl.checked) body.deep = true;
+  var cutRaw = (document.getElementById('fc-cutover').value || '').trim();
+  if (cutRaw) {
+    var ms = Date.parse(cutRaw);
+    if (isNaN(ms)) { toast('Could not parse the cutover time — use ISO like 2026-09-18T18:00Z'); return; }
+    body.cutoverMs = ms;
+  }
+  btn.disabled = true;
+  try {
+    var res = await fetch('/control/final-check', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    var out = await res.json();
+    if (!out.started) toast('Not started: ' + (out.reason || 'unknown'));
+    else toast('Final check started — the verdict will appear below');
+  } catch (e) { toast('failed: ' + e.message); }
+  btn.disabled = false;
+  pollFinalCheck();
+}
+var fcTimer = null;
+async function pollFinalCheck() {
+  try {
+    var fc = await fetch('/api/final-check').then(function (r) { return r.json(); });
+    renderFinalCheck(fc);
+    if (fc.status === 'running') { clearTimeout(fcTimer); fcTimer = setTimeout(pollFinalCheck, 2000); }
+  } catch (e) { /* engine restarting — next poll or reload recovers */ }
+}
+function fcEsc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+function renderFinalCheck(fc) {
+  var el = document.getElementById('finalcheck-out');
+  if (!el || !fc || fc.status === 'not_run') return;
+  if (fc.status === 'running') {
+    var a = fc.audit || {};
+    el.innerHTML = '<div class="empty">Running — ' + fcEsc(fc.phase) + (a.collectionsTotal ? ' (' + a.collectionsDone + '/' + a.collectionsTotal + ' collections)' : '') + '</div>';
+    return;
+  }
+  if (fc.status === 'failed') {
+    el.innerHTML = '<div style="padding:10px 14px;border-radius:8px;background:#FDECEC;color:#B3261E;font-weight:600">The check itself failed to complete: ' + fcEsc(fc.error) + ' — a tooling error, not a data verdict. Re-run it.</div>';
+    return;
+  }
+  var pal = fc.verdict === 'PASS' ? ['#E4F6EC', '#157A45'] : fc.verdict === 'PASS_WITH_NOTES' ? ['#FDEEDD', '#A05A16'] : ['#FDECEC', '#B3261E'];
+  var badge = (fc.verdict === 'PASS' ? 'PASS' : fc.verdict === 'PASS_WITH_NOTES' ? 'PASS WITH NOTES' : 'FAIL')
+    + (fc.mode === 'deep' ? ' \u00b7 deep (full source recount)' : ' \u00b7 quick (ledger verify + samples)');
+  var html = '<div style="padding:12px 16px;border-radius:10px;background:' + pal[0] + ';color:' + pal[1] + '">'
+    + '<div style="font-size:16px;font-weight:800;margin-bottom:4px">' + badge + '</div>'
+    + '<div style="font-weight:600">' + fcEsc(fc.headline) + '</div></div>'
+    + '<ul style="margin:10px 0 0;padding-left:20px;line-height:1.55">';
+  (fc.problems || []).forEach(function (p) { html += '<li style="color:#B3261E;font-weight:600">' + fcEsc(p) + '</li>'; });
+  (fc.notes || []).forEach(function (n) { html += '<li style="color:#A05A16">' + fcEsc(n) + '</li>'; });
+  (fc.passes || []).forEach(function (g) { html += '<li style="color:#157A45">' + fcEsc(g) + '</li>'; });
+  html += '</ul>';
+  if (fc.cutoverMs) html += '<p class="hint" style="margin-top:6px">cutover applied: source compared only for cd &lt; ' + new Date(fc.cutoverMs).toISOString() + '</p>';
+  el.innerHTML = html;
+}
+
 async function tick() {
   try {
     const [stats, chunkResp] = await Promise.all([
@@ -760,23 +913,39 @@ async function tick() {
       if (changes >= 3 && (last.t - windowStart.t) >= 10000) break;
     }
     var rspan = (last.t - windowStart.t) / 1000;
-    var liveRate = rspan >= 10 ? Math.max(0, (last.d - windowStart.d) / rspan) : null;
-    var multiPod = stats.cluster && stats.cluster.pods > 1;
+    // the client window is only trustworthy once it has WITNESSED chunk
+    // completions — a freshly opened tab on a huge-chunk run showed "0"
+    // (field report); until then the server's 10-min ledger window is truth
+    var clientReady = changes >= 3 && rspan >= 10;
+    var slowRate = stats.clusterSlow && stats.clusterSlow.docsPerSecond > 0 ? stats.clusterSlow.docsPerSecond : null;
+    var liveRate = clientReady ? Math.max(0, (last.d - windowStart.d) / rspan)
+                 : slowRate !== null ? slowRate
+                 : null;
+    var podsSeen = Math.max(stats.cluster ? stats.cluster.pods : 0, stats.clusterSlow ? stats.clusterSlow.pods : 0);
+    var multiPod = podsSeen > 1;
     var effRate = liveRate !== null ? liveRate
-                : multiPod && stats.status === 'running' ? stats.cluster.docsPerSecond
+                : multiPod && stats.status === 'running' ? (stats.cluster ? stats.cluster.docsPerSecond : 0)
                 : stats.docsPerSecond;
     if (stats.status === 'completed') {
-      // a pod restarted after completion migrated nothing itself — its
-      // local average is 0 and would read as an anomaly
-      dpsEl.textContent = stats.docsPerSecond >= 1 ? fmt(stats.docsPerSecond) + ' avg' : '\u2013';
+      // whole-RUN average from ledger docs + run timeline; the pod's own
+      // lifetime counter is only its share of a multi-pod run (field: a
+      // 4-pod run showed 5,060 instead of the run's ~20,300), and a pod
+      // restarted after completion migrated nothing at all
+      var rt = stats.runTimes || {};
+      var runSec = rt.startedAtMs && rt.completedAtMs ? (rt.completedAtMs - rt.startedAtMs) / 1000 : 0;
+      var runAvg = runSec > 0 && sum.docsDone > 0 ? sum.docsDone / runSec : stats.docsPerSecond;
+      dpsEl.textContent = runAvg >= 1 ? fmt(Math.round(runAvg)) + ' avg' : '\u2013';
     } else if (liveRate !== null) {
-      dpsEl.textContent = fmt(Math.round(liveRate)) + (multiPod ? ' \u00b7 ' + stats.cluster.pods + ' pods' : '');
+      dpsEl.textContent = fmt(Math.round(liveRate)) + (multiPod ? ' \u00b7 ' + podsSeen + ' pods' : '');
     } else if (stats.status === 'running') {
       dpsEl.textContent = 'measuring\u2026';
     } else {
       dpsEl.textContent = '\u2013';
     }
-    document.getElementById('s-skipped').textContent = fmt(stats.totalDocsSkipped);
+    // ledger truth — each pod's in-memory counter only knows its own share
+    // (field: a 3-pod run showed 100,623 while the DLQ held 314,125)
+    document.getElementById('s-skipped').textContent =
+      fmt(Math.max(sum.docsSkipped || 0, stats.totalDocsSkipped || 0));
     // ledger truth, not this pod's counter — in multi-pod each pod only
     // counts its own failures, so the card under-reported cluster-wide
     document.getElementById('s-failed').textContent = fmt((sum.byStatus || {}).failed || 0);
@@ -858,17 +1027,31 @@ async function tick() {
     var hint = document.getElementById('pause-hint');
     if (isPaused) {
       hint.style.display = '';
-      hint.textContent = stats.pauseReason === 'not-started'
-        ? '\u23f8 NOT STARTED \u2014 deployed and waiting. Nothing has been read, mapped or indexed yet; '
-          + 'run preflight, build indexes and rehearse first, then click Start to begin the run (all pods).'
-        : '\u23f8 ENGINE PAUSED' +
-        (stats.pauseReason === 'breaker-transient' ? ' (backend outage \u2014 auto-resume armed)' :
-         stats.pauseReason === 'breaker-data' ? ' (systematic data problem \u2014 needs you)' : ' (by operator)') +
-        ' \u2014 Retry / Replay / Waive only QUEUE work; click Resume to process it.';
+      if (stats.pauseReason === 'boundary-unset') {
+        hint.innerHTML = '\u26a0 HELD BY THE BOUNDARY GUARD \u2014 the target ClickHouse is already receiving live data and no cd bound is set. '
+          + 'If a mirror re-ingests the same requests on both sides, running unbounded WILL duplicate the overlap window. '
+          + 'Either apply a bound (Tee boundary card below), or \u2014 if NOTHING mirrors traffic between the stacks \u2014 '
+          + '<button class="btn" style="margin-left:6px" onclick="allowUnbounded(this)">Proceed unbounded</button>';
+      } else {
+        hint.textContent = stats.pauseReason === 'not-started'
+          ? '\u23f8 NOT STARTED \u2014 deployed and waiting. Nothing has been read, mapped or indexed yet; '
+            + 'run preflight, build indexes and rehearse first, then click Start to begin the run (all pods).'
+          : '\u23f8 ENGINE PAUSED' +
+          (stats.pauseReason === 'breaker-transient' ? ' (backend outage \u2014 auto-resume armed)' :
+           stats.pauseReason === 'breaker-data' ? ' (systematic data problem \u2014 needs you)' : ' (by operator)') +
+          ' \u2014 Retry / Replay / Waive only QUEUE work; click Resume to process it.';
+      }
     } else { hint.style.display = 'none'; }
     var prBtn = document.getElementById('btn-pauseresume');
     if (prBtn) {
-      if (isPaused) {
+      if (isPaused && stats.pauseReason === 'boundary-unset') {
+        // a plain Resume cannot answer the mirror question — the banner
+        // above carries the two real actions (bound / proceed unbounded)
+        prBtn.dataset.action = '';
+        prBtn.innerHTML = '\u25b6 Resume';
+        prBtn.classList.remove('primary');
+        prBtn.disabled = true;
+      } else if (isPaused) {
         prBtn.dataset.action = 'resume';
         prBtn.innerHTML = stats.pauseReason === 'not-started' ? '\u25b6 Start' : '\u25b6 Resume';
         prBtn.classList.add('primary');
@@ -998,6 +1181,7 @@ var SCENARIOS = [
       '<li><b>LEDGER_CD_UPPER_BOUND: LEAVE UNSET.</b> The migration must take everything, including data still arriving in the old cluster \u2014 top-up passes chase it until the final drain finds nothing new.</li>' +
       '<li>Cutover-first: switch SDK ingestion to the new cluster, then run the migration (old drill data is frozen). Bulk-before-cutover: run the bulk first, switch ingestion, then let the final top-up pass drain the tail.</li>' +
       '<li>Ignore the Tee boundary card \u2014 it is for mirrored setups only. Applying a bound here would ORPHAN newly arrived data.</li>' +
+      '<li>If ingestion already switched to the new cluster before the run starts, the startup guard will hold and ask \u2014 <b>Proceed unbounded</b> is the correct answer for this scenario.</li>' +
       '<li>Sign-off: Verify + Audit vs source + content audit, DLQ pending = 0.</li>' +
       '</ul>' },
   { id: 'tee-old', name: '2 \u00b7 Mirror old \u2192 new',
@@ -1012,7 +1196,7 @@ var SCENARIOS = [
       '</ul>' },
   { id: 'tee-new', name: '3 \u00b7 Mirror new \u2192 old',
     bound: true,
-    html: '<p><b>New cluster is already primary; nginx mirrors back to the old stack</b> as the customer\u2019s rollback safety net during validation.</p>' +
+    html: '<p><b>New cluster is already primary; nginx mirrors back to the old stack</b> as the rollback safety net during validation.</p>' +
       '<ul>' +
       '<li>Everything from scenario 2 applies unchanged \u2014 detection, bound, badge, sync parity. ClickHouse is the store that started cold in both directions, so the detector does not care which side is primary.</li>' +
       '<li>The bound = the moment the new cluster became primary. Old-cluster docs after it are the mirror\u2019s copies \u2014 never migrate them.</li>' +
@@ -1048,7 +1232,7 @@ async function applyBound(btn, ms) {
     btn.dataset.label = btn.textContent;
     btn.textContent = 'Click again to confirm';
     btn.classList.add('armed');
-    setTimeout(function() { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 4000);
+    setTimeout(function() { armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); }, 8000);
     return;
   }
   armed.delete(btn); btn.textContent = btn.dataset.label; btn.classList.remove('armed'); btn.disabled = true;
@@ -1223,7 +1407,7 @@ async function slowTick() {
   } catch { /* engine restarting */ }
 }
 
-tick(); slowTick();
+tick(); slowTick(); pollFinalCheck(); pollDedupe();
 setInterval(tick, 2000);
 setInterval(slowTick, 5000);
 </script>

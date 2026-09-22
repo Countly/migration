@@ -205,6 +205,15 @@ describe('cd upper bound (tee-mirror duplication guard)', () => {
     // second run (which appended nothing) did not disturb it
     expect(await ledger.sumEstimates(RUN)).toBe(HIST);
 
+    // content audit: unclamped sampling reaches the post-flip old-side docs
+    // (never migrated by design) and reports phantom "missing" rows; the
+    // clamped call must stay clean — this is what the Final check passes in
+    const unclamped = await orchestrator.contentAudit(100);
+    expect(unclamped.missing).toBeGreaterThan(0);
+    const clamped = await orchestrator.contentAudit(100, BOUND);
+    expect(clamped.missing).toBe(0);
+    expect(clamped.different).toBe(0);
+
     // verify + source audit stay green with a growing source: post-bound
     // windows derived from the source show live=0 (pending), never defects
     const verify = await orchestrator.verifyMigration();

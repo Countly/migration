@@ -21,6 +21,8 @@ import { ClickHousePressure } from '../target/clickhouse-pressure.ts';
 import { ChunkOrchestrator } from './chunk-orchestrator.ts';
 import { wireExitOnComplete } from './exit-on-complete.ts';
 import { rebuildLedger, newRebuildProgress, type RebuildProgress } from './ledger-rebuild.ts';
+import { runFinalCheck, newFinalCheckResult, renderFinalCheckText, type FinalCheckResult } from './final-check.ts';
+import { runDedupeOverlap, newDedupeOverlapState, effectiveSlackPct, type DedupeOverlapState } from './dedupe-overlap.ts';
 
 export async function runLedgerEngine(config: Config, logger: Logger): Promise<void> {
   logger.info({ engine: 'ledger', runId: config.ledger.runId }, 'Starting ledger engine (no Redis)');
@@ -93,6 +95,18 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   await staging.connect();
   await hashResolver.build();
   logger.info('Ledger engine: all services connected (MongoDB + ClickHouse only)');
+
+  // A bound apply that died between its prune and a settled outcome left its
+  // receipts in mig_prune_journal — restore them under the governing bound
+  // before any mapping or claiming sees the mutilated grid. (Remapping does
+  // NOT always recreate a pruned range: a collection whose regular chunks
+  // were all pruned but whose null-cd sentinel survived reads as already
+  // mapped.) A committed apply's leftover entry restores nothing — its own
+  // bound filters every chunk out — so this is safe against ANY leftover.
+  const orphanedPrunes = await ledger.recoverPruneJournal(config.ledger.runId, config.ledger.cdUpperBoundMs ?? null);
+  if (orphanedPrunes.recovered > 0) {
+    logger.warn(orphanedPrunes, 'Startup: restored prune-journal receipts left by an apply that died mid-flight — the grid holds its pre-apply chunks again');
+  }
 
   // Backpressure sampler (TTL-cached inside the orchestrator — never per-batch)
   const pressureClient = createClickHouseClient({
@@ -294,11 +308,15 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   app.get('/stats', async () => {
     const stats = orchestrator.getStats();
     const runId = config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId;
-    const [cluster, runTimes] = await Promise.all([
+    const [cluster, clusterSlow, runTimes] = await Promise.all([
       ledger.clusterRate(runId, 120).catch(() => null),
+      // 10-min window: with huge chunks completions land ~once a minute, so
+      // the 2-min window strobes and a freshly opened dashboard tab has no
+      // client-side history yet — this one is real the moment the page loads
+      ledger.clusterRate(runId, 600).catch(() => null),
       ledger.getRunTimes(config.ledger.runId).catch(() => ({ startedAtMs: null, completedAtMs: null })),
     ]);
-    return { ...stats, cluster, runTimes };
+    return { ...stats, cluster, clusterSlow, runTimes };
   });
   app.get('/report', async () => orchestrator.getReport());
   app.post('/control/pause', async () => { orchestrator.pause(); return { status: orchestrator.getStatus() }; });
@@ -320,10 +338,35 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     { status: 'not_run', result: null, error: null };
   app.post('/control/replay-dlq', async () => {
     if (replayState.status === 'running') return { started: false, reason: 'replay already running' };
+    // replay INSERTS live rows without moving the ledger fingerprint — it
+    // must hold the same cluster-wide reservation as final check and dedupe,
+    // or a dedupe execute on another pod could delete a row it never counted
+    const mtToken = `dlq-replay:${config.worker.podId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const acq = await ledger.acquireMaintenance(config.ledger.runId, 'dlq-replay', mtToken);
+      if (!acq.acquired) return { started: false, reason: `another maintenance operation (${acq.holder}) holds the cluster-wide reservation — wait for it to finish` };
+    } catch {
+      return { started: false, reason: 'could not acquire the cluster-wide maintenance reservation — retry when MongoDB answers' };
+    }
     replayState.status = 'running'; replayState.result = null; replayState.error = null;
-    void orchestrator.replayDlq()
+    const lease = { lost: false };
+    const probe = async (): Promise<boolean> => {
+      if (lease.lost) return true;
+      try {
+        const ok = await ledger.renewMaintenance(config.ledger.runId, mtToken);
+        if (!ok) lease.lost = true;
+        return !ok;
+      } catch { return true; } // unverifiable ownership before a batch = abort
+    };
+    const hb = setInterval(() => {
+      void ledger.renewMaintenance(config.ledger.runId, mtToken)
+        .then((ok) => { if (!ok) lease.lost = true; })
+        .catch(() => { /* keep-fresh only — batches revalidate synchronously */ });
+    }, 60_000);
+    void orchestrator.replayDlq(probe)
       .then((r) => { replayState.result = r as unknown as Record<string, unknown>; replayState.status = 'completed'; })
-      .catch((e) => { replayState.error = (e as Error).message; replayState.status = 'failed'; });
+      .catch((e) => { replayState.error = (e as Error).message; replayState.status = 'failed'; })
+      .finally(() => { clearInterval(hb); void ledger.releaseMaintenance(config.ledger.runId, mtToken).catch(() => {}); });
     return { started: true };
   });
   app.get('/api/replay', async () => ({
@@ -366,7 +409,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — audit after completion or while paused' };
     const busyCnt = await ledger.activeClaims(config.ledger.runId, config.worker.podId);
     if (busyCnt.length > 0) return { started: false, reason: `other pods are actively migrating (${busyCnt.map((row) => row.pod).join(', ')}) — a mid-run audit reports false mismatches; audit after completion` };
-    const samples = Math.min(10_000, Math.max(50, req.body?.samples ?? 500));
+    const samples = Math.min(10_000, Math.max(50, typeof req.body?.samples === 'number' && Number.isFinite(req.body.samples) ? req.body.samples : 500));
     auditContentState.status = 'running'; auditContentState.result = null; auditContentState.error = null;
     void orchestrator.contentAudit(samples)
       .then((r) => { auditContentState.result = r as unknown as Record<string, unknown>; auditContentState.status = 'completed'; })
@@ -374,6 +417,179 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     return { started: true, samples };
   });
   app.get('/api/audit-content', async () => ({ ...auditContentState, progress: orchestrator.contentAuditProgress }));
+
+  // ── Final check: the whole sign-off, interpreted (chunks + DLQ + source
+  // recount + checksums + content samples → one PASS/NOTES/FAIL verdict) ──
+  const finalCheckState: FinalCheckResult = newFinalCheckResult();
+  // declared here so final-check and dedupe can mutually exclude: dedupe
+  // deletes target rows the ledger fingerprint cannot see
+  const dedupeState: DedupeOverlapState = newDedupeOverlapState();
+  // SYNCHRONOUS maintenance lock: the status checks alone leave an async
+  // gap (both requests can pass them, then yield in activeClaims before
+  // either marks itself running) — taken before the first await, released
+  // on refusal or completion
+  let maintenanceOp: string | null = null;
+  app.post<{ Body: { cutoverMs?: number; samples?: number; deep?: boolean; acceptUnscoped?: boolean } }>('/control/final-check', async (req) => {
+    if (finalCheckState.status === 'running') return { started: false, reason: 'final check already running' };
+    if (dedupeState.status === 'running') return { started: false, reason: 'a dedupe is running — it changes the target under the check; wait for it to finish' };
+    if (maintenanceOp !== null) return { started: false, reason: `${maintenanceOp} is starting — retry in a moment` };
+    maintenanceOp = 'final-check'; // synchronous acquire — released in the finally below unless the run launched
+    let launchedFc = false;
+    let mtTokenFc: string | null = null;
+    try {
+    if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — run the final check after completion (or while paused)' };
+    // CLUSTER-WIDE reservation: another pod's dedupe execute deletes target
+    // rows the ledger fingerprint cannot see — the local lock above only
+    // serializes THIS pod's routes
+    mtTokenFc = `final-check:${config.worker.podId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const acq = await ledger.acquireMaintenance(config.ledger.runId, 'final-check', mtTokenFc);
+      if (!acq.acquired) { mtTokenFc = null; return { started: false, reason: `another maintenance operation (${acq.holder}) holds the cluster-wide reservation — wait for it to finish` }; }
+    } catch { mtTokenFc = null; return { started: false, reason: 'could not acquire the cluster-wide maintenance reservation — retry when MongoDB answers' }; }
+    // no exclusion: the SERVING pod's own live claims block the check too —
+    // a paused pod mid-chunk still owns half-written state
+    const busyFc = await ledger.activeClaims(config.ledger.runId);
+    if (busyFc.length > 0) return { started: false, reason: `pods still hold active chunk claims (${busyFc.map((row) => `${row.pod}×${row.count}`).join(', ')}) — the migration must be fully stopped/complete before the final check` };
+    let cutoverMs: number | null = null;
+    if (req.body?.cutoverMs !== undefined) {
+      const err = epochMsError(req.body.cutoverMs, 'cutoverMs');
+      if (err) return { started: false, reason: err };
+      cutoverMs = req.body.cutoverMs as number;
+      let storedFc: number | null;
+      try {
+        storedFc = await ledger.getStoredBound(config.ledger.runId);
+      } catch {
+        return { started: false, reason: 'could not read the stored bound to validate cutoverMs against — retry when MongoDB answers' };
+      }
+      const effectiveBound = storedFc ?? config.ledger.cdUpperBoundMs ?? null;
+      if (effectiveBound !== null && cutoverMs < effectiveBound) {
+        return { started: false, reason: `cutoverMs is EARLIER than the run's effective bound (${new Date(effectiveBound).toISOString()}) — that would silently exclude migrated data from the audit; pass the bound or later` };
+      }
+    }
+    const samples = Math.min(10_000, Math.max(50, typeof req.body?.samples === 'number' && Number.isFinite(req.body.samples) ? req.body.samples : 500));
+    const deep = req.body?.deep === true;
+    const acceptUnscoped = req.body?.acceptUnscoped === true;
+    const tokenFc = mtTokenFc;
+    // a renewal that finds the token GONE means the lease expired and was
+    // taken over — the check must not publish a verdict from its reads. The
+    // interval only keeps the lease fresh; the DECISION POINTS revalidate
+    // ownership synchronously, so a connectivity-blinded pod cannot publish
+    // between takeover and its next successful beat (unverifiable = lost).
+    const leaseFc = { lost: false };
+    const probeFc = async (): Promise<boolean> => {
+      if (leaseFc.lost) return true;
+      try {
+        const ok = await ledger.renewMaintenance(config.ledger.runId, tokenFc);
+        if (!ok) leaseFc.lost = true;
+        return !ok;
+      } catch { return true; }
+    };
+    const hbFc = setInterval(() => {
+      void ledger.renewMaintenance(config.ledger.runId, tokenFc)
+        .then((ok) => { if (!ok) leaseFc.lost = true; })
+        .catch(() => { /* keep-fresh only — decision points revalidate synchronously */ });
+    }, 60_000);
+    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep, acceptUnscoped, leaseLost: probeFc })
+      .finally(() => { clearInterval(hbFc); maintenanceOp = null; void ledger.releaseMaintenance(config.ledger.runId, tokenFc).catch(() => {}); });
+    launchedFc = true;
+    return { started: true, cutoverMs, samples, deep, acceptUnscoped };
+    } finally {
+      if (!launchedFc) {
+        maintenanceOp = null;
+        if (mtTokenFc !== null) void ledger.releaseMaintenance(config.ledger.runId, mtTokenFc).catch(() => {});
+      }
+    }
+  });
+  app.get('/api/final-check', async () => finalCheckState);
+  app.get('/final-check.txt', async (_req, reply) => {
+    reply.type('text/plain; charset=utf-8').send(renderFinalCheckText(finalCheckState, config.ledger.runId));
+  });
+
+  // ── Tee-overlap dedupe: remove duplicates a missing cd bound created ────
+  // Dry-run by default; execute is licensed by a completed dry run over the
+  // SAME window in this process — measure first, delete second.
+  app.post<{ Body: { fromMs?: number; toMs?: number; execute?: boolean; slackPct?: number } }>('/control/dedupe-overlap', async (req) => {
+    if (dedupeState.status === 'running') return { started: false, reason: 'dedupe already running' };
+    if (finalCheckState.status === 'running') return { started: false, reason: 'a final check is running — dedupe would delete rows it already audited; wait for the verdict' };
+    if (maintenanceOp !== null) return { started: false, reason: `${maintenanceOp} is starting — retry in a moment` };
+    maintenanceOp = 'dedupe'; // synchronous acquire — released in the finally below unless the run launched
+    let launchedDd = false;
+    let mtTokenDd: string | null = null;
+    try {
+    // CLUSTER-WIDE reservation (see the final-check route)
+    mtTokenDd = `dedupe:${config.worker.podId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const acq = await ledger.acquireMaintenance(config.ledger.runId, 'dedupe', mtTokenDd);
+      if (!acq.acquired) { mtTokenDd = null; return { started: false, reason: `another maintenance operation (${acq.holder}) holds the cluster-wide reservation — wait for it to finish` }; }
+    } catch { mtTokenDd = null; return { started: false, reason: 'could not acquire the cluster-wide maintenance reservation — retry when MongoDB answers' }; }
+    // destructive against the live table: the migration must be fully
+    // stopped — no pod (this one included) may hold an active chunk claim,
+    // dry run included, so the counts it licenses execute with are stable
+    if (orchestrator.getStatus() === 'running') return { started: false, reason: 'main migration is running — dedupe (even a dry run) requires the migration stopped or complete' };
+    const busyDd = await ledger.activeClaims(config.ledger.runId);
+    if (busyDd.length > 0) return { started: false, reason: `pods still hold active chunk claims (${busyDd.map((row) => `${row.pod}×${row.count}`).join(', ')}) — stop the migration everywhere before dedupe, even for a dry run` };
+    const fromMs = req.body?.fromMs;
+    const toMs = req.body?.toMs;
+    const fromErr = epochMsError(fromMs, 'fromMs');
+    const toErr = fromErr ? null : epochMsError(toMs, 'toMs');
+    if (fromErr || toErr) return { started: false, reason: (fromErr ?? toErr) as string };
+    if (!((fromMs as number) < (toMs as number))) {
+      return { started: false, reason: 'pass the overlap window as {fromMs, toMs} (epoch ms): fromMs = the tee flip / IP swap, toMs = migration completion' };
+    }
+    const execute = req.body?.execute === true;
+    const slackPct = typeof req.body?.slackPct === 'number' ? req.body.slackPct : undefined;
+    if (execute && config.ledger.dryRun) {
+      // the rehearsal service must never delete live rows — same guard as
+      // the bound-apply route
+      return { started: false, reason: 'dry run service — execute deletes LIVE rows; run it on the real deployment' };
+    }
+    if (execute) {
+      const dry = dedupeState.lastDryRun;
+      if (!dry || dry.fromMs !== fromMs || dry.toMs !== toMs || dry.slackPct !== effectiveSlackPct(slackPct)) {
+        return { started: false, reason: 'execute refused: run a DRY RUN over this exact window WITH THE SAME slackPct first — execute may only delete what a reviewed dry run counted' };
+      }
+      if (dedupeState.runStateChanged) {
+        return { started: false, reason: 'execute refused: the run state changed during the dry run (a pod claimed work mid-scan) — its counts are stale; re-run the dry run with all pods idle' };
+      }
+      // the license also covers the gap BETWEEN dry run and execute: work
+      // that landed since (even started-and-finished) moves the fingerprint
+      let fpNow: string;
+      try {
+        fpNow = await ledger.runFingerprint(config.ledger.runId);
+      } catch {
+        return { started: false, reason: 'execute refused: could not read the run fingerprint to validate the dry-run license — retry when MongoDB answers' };
+      }
+      if (dry.fingerprint === null || fpNow !== dry.fingerprint) {
+        return { started: false, reason: 'execute refused: the run state changed since the dry run — its counts no longer describe the grid; re-run the dry run with all pods idle' };
+      }
+    }
+    const tokenDd = mtTokenDd;
+    const leaseDd = { lost: false };
+    const probeDd = async (): Promise<boolean> => {
+      if (leaseDd.lost) return true;
+      try {
+        const ok = await ledger.renewMaintenance(config.ledger.runId, tokenDd);
+        if (!ok) leaseDd.lost = true;
+        return !ok;
+      } catch { return true; } // unverifiable ownership before a delete = abort
+    };
+    const hbDd = setInterval(() => {
+      void ledger.renewMaintenance(config.ledger.runId, tokenDd)
+        .then((ok) => { if (!ok) leaseDd.lost = true; })
+        .catch(() => { /* keep-fresh only — decision points revalidate synchronously */ });
+    }, 60_000);
+    void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct, expectedFingerprint: execute ? dedupeState.lastDryRun?.fingerprint ?? null : null, leaseLost: probeDd })
+      .finally(() => { clearInterval(hbDd); maintenanceOp = null; void ledger.releaseMaintenance(config.ledger.runId, tokenDd).catch(() => {}); });
+    launchedDd = true;
+    return { started: true, execute, fromMs, toMs };
+    } finally {
+      if (!launchedDd) {
+        maintenanceOp = null;
+        if (mtTokenDd !== null) void ledger.releaseMaintenance(config.ledger.runId, mtTokenDd).catch(() => {});
+      }
+    }
+  });
+  app.get('/api/dedupe-overlap', async () => dedupeState);
   app.get('/api/dryrun', async () => dryState);
   app.get('/api/config', async () => ({
     knobs: [
@@ -407,46 +623,277 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // the ConfigMap — two sources of truth with duplication at stake is how
   // operators get hurt.
   const envBoundAtBoot = config.ledger.cdUpperBoundMs;
+  // Epoch-ms sanity for operator-supplied timestamps: the classic mistake is
+  // epoch SECONDS (silently ~1970 in ms — a bound like that would prune every
+  // pending chunk and persist a nonsense cutover).
+  const epochMsError = (v: unknown, name: string): string | null => {
+    if (typeof v !== 'number' || !Number.isFinite(v)) return `${name} (epoch ms) required`;
+    if (v < 1_000_000_000_000) return `${name}=${v} looks like epoch SECONDS — pass milliseconds (×1000)`;
+    if (v > Date.now() + 60_000) return `${name} is in the future`;
+    return null;
+  };
+
+  let boundaryApplied: Record<string, unknown> | null = null;
+  const applyBoundNow = async (boundMs: number, source: string): Promise<Record<string, unknown>> => {
+    const msErr = epochMsError(boundMs, 'boundMs');
+    if (msErr) return { applied: false, reason: msErr };
+    if (config.ledger.dryRun) return { applied: false, reason: 'dry run — apply on the real run' };
+    if (envBoundAtBoot !== null) {
+      return { applied: false, reason: `bound already pinned via LEDGER_CD_UPPER_BOUND=${envBoundAtBoot} — change it in the deployment config, not here` };
+    }
+    if (boundMs >= Date.now() - 60_000) return { applied: false, reason: 'bound must be safely in the past (>60s ago)' };
+    // Claim fence: prune deletes/clamps PENDING chunks only, so a pod
+    // claiming a post-bound chunk between the check and the delete would
+    // slip past it and migrate mirror territory. No active claims = no
+    // claiming in flight (pods hold at most their current chunk, and a
+    // paused/held fleet holds none).
+    const claims = await ledger.activeClaims(config.ledger.runId).catch(() => null);
+    if (claims === null) return { applied: false, reason: 'could not read active claims — retry when MongoDB answers' };
+    if (claims.length > 0) {
+      return { applied: false, reason: `pods hold active chunk claims (${claims.map((c) => `${c.pod}×${c.count}`).join(', ')}) — pause the pods, let in-flight chunks finish, then apply the bound` };
+    }
+    let priorBound: number | null = null;
+    try {
+      priorBound = await ledger.getStoredBound(config.ledger.runId);
+    } catch {
+      return { applied: false, reason: 'could not read the current stored bound — retry when MongoDB answers' };
+    }
+    // Raising an applied bound cannot resurrect the chunks the earlier bound
+    // pruned, and mapping never tops up while a bound is set — the interval
+    // between the two values would silently never migrate.
+    if (priorBound !== null && boundMs > priorBound) {
+      let gridSize: number;
+      try {
+        gridSize = Object.values(await ledger.statusCounts(config.ledger.runId)).reduce((a, b) => a + b, 0);
+      } catch {
+        return { applied: false, reason: 'could not read the chunk grid to validate raising the bound — retry when MongoDB answers' };
+      }
+      if (gridSize > 0) {
+        return { applied: false, reason: `raising an applied bound (${new Date(priorBound).toISOString()} → ${new Date(boundMs).toISOString()}) would leave the interval between them unmigrated — the earlier apply already pruned its chunks. Lowering is safe; to extend the range, restart the run's mapping under the new bound with the ledger rebuilt.` };
+      }
+    }
+    const restores: Array<{ deletedChunks: import('../state/ledger-store.ts').ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }> = [];
+    // minted BEFORE any write: even a lost store acknowledgement leaves the
+    // caller knowing exactly which token to roll back by
+    const applyToken = `apply:${config.worker.podId}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
+    let storeAttempted = false;
+    // apply marker: from here until settled, the post-claim fence releases
+    // every claim — no pod can hold a provisionally pruned/clamped chunk,
+    // so rollback's pending-only restore is complete by construction. Best-
+    // effort clear at the end; a crashed apply's marker expires in 10 min.
+    try {
+      const acquired = await ledger.acquireApplyMarker(config.ledger.runId, applyToken);
+      if (!acquired) return { applied: false, reason: 'another bound apply is in flight — wait for it to settle, then retry' };
+    } catch {
+      return { applied: false, reason: 'could not acquire the apply marker — retry when MongoDB answers' };
+    }
+    // Heartbeat: a LEGITIMATE long apply (huge-grid prune pages, MongoDB
+    // stalls) must not expire mid-flight — expiry would let claimers restore
+    // its journal and a second apply take over while it still prunes. A
+    // renewal that finds the token GONE means a takeover already happened
+    // (this process stalled past expiry): abort before the next destructive
+    // step rather than fight the takeover.
+    let markerLost = false;
+    const markerHeartbeat = setInterval(() => {
+      void ledger.renewApplyMarker(config.ledger.runId, applyToken)
+        .then((ok) => { if (!ok) markerLost = true; })
+        .catch(() => { /* transient — the next beat retries; only a lost token aborts */ });
+    }, 60_000);
+    try {
+      // an earlier apply that died mid-flight left journal receipts — restore
+      // them (under the governing bound, so a committed apply's leftovers are
+      // no-ops) before this apply prunes anything on top of a mutilated grid
+      const orphaned = await ledger.recoverPruneJournal(config.ledger.runId, envBoundAtBoot);
+      if (orphaned.recovered > 0) logger.warn(orphaned, 'Restored prune-journal receipts from an earlier apply that died mid-flight');
+      // receipts land in the journal BEFORE each destructive write: a crash
+      // anywhere past this point is recoverable from storage, not memory
+      const journalSink = async (r: { deletedChunks: import('../state/ledger-store.ts').ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }): Promise<void> => {
+        await ledger.journalPruneReceipt(config.ledger.runId, applyToken, r);
+        restores.push(r);
+      };
+      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, journalSink, applyToken);
+      if (markerLost) throw new Error('the apply marker was taken over mid-apply (this process stalled past the marker expiry) — aborted before storing the bound; the takeover governs now');
+      // Compare-and-set against the prior bound this call validated: two
+      // concurrent applies cannot both win — the loser rolls its prune back.
+      storeAttempted = true;
+      const storedToken = await ledger.setStoredBoundIf(config.ledger.runId, boundMs, source, priorBound, applyToken);
+      if (storedToken === null) {
+        // a competing apply won: restore only what ITS bound permits — and
+        // if that bound cannot be read, restore NOTHING (fail closed: an
+        // unbounded restore could resurrect chunks the winner pruned)
+        let winner: number | null;
+        try {
+          winner = await ledger.getStoredBound(config.ledger.runId);
+        } catch {
+          return { applied: false, indeterminate: true, reason: 'another bound application raced this one AND the winning bound could not be read — nothing was restored (fail closed); when MongoDB answers, read mig_run_config and re-apply deliberately or Rebuild ledger from data' };
+        }
+        const rollbackErrors: string[] = [];
+        for (const r of restores.reverse()) await ledger.restorePrune(r, winner).catch((e: Error) => rollbackErrors.push(e.message));
+        if (rollbackErrors.length > 0) {
+          return { applied: false, indeterminate: true, reason: `another bound application raced this one and restoring this call's prune failed (${rollbackErrors.join('; ')}) — grid state is INDETERMINATE: Rebuild ledger from data or re-apply deliberately` };
+        }
+        await ledger.clearPruneJournal(config.ledger.runId, applyToken).catch(() => {});
+        return { applied: false, reason: 'another bound application raced this one (the stored bound changed mid-apply) — this call was rolled back; re-read the current bound and retry deliberately' };
+      }
+      // Post-store verification: a claim that raced the fence shows up as a
+      // non-pending beyond-bound chunk (second prune throws) or a fresh
+      // active claim. EVERY receipt collected so far rolls back on failure —
+      // no half-applied state and no grid gaps, whichever step failed.
+      try {
+        if (markerLost) throw new Error('the apply marker was taken over mid-apply (this process stalled past the marker expiry) — rolling back; the takeover governs now');
+        const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, journalSink, applyToken);
+        const claimsAfter = await ledger.activeClaims(config.ledger.runId);
+        if (claimsAfter.length > 0) {
+          throw new Error(`pods claimed chunks during apply (${claimsAfter.map((c) => `${c.pod}×${c.count}`).join(', ')})`);
+        }
+        const total = { deleted: (pruned.deleted + pruned2.deleted), clamped: (pruned.clamped + pruned2.clamped) };
+        logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), source, ...total }, 'Run bound applied — pods adopt it on their next map pass');
+        // settled: the committed bound now governs — leftover journal entries
+        // would restore nothing anyway, but clear them to keep recovery quiet
+        await ledger.clearPruneJournal(config.ledger.runId, applyToken).catch(() => {});
+        // a guard-held engine has its answer now
+        if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume(true);
+        return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...total };
+      } catch (raceErr) {
+        const rollbackErrors: string[] = [];
+        // conditional rollback: only unwind the bound if it still holds THIS
+        // call's value — another apply may have legitimately won meanwhile,
+        // and its configuration must not be clobbered
+        let boundRolledBack = false;
+        try {
+          // token predicate, not value: an identical-value re-apply by a
+          // competing request owns a DIFFERENT token and is never unwound
+          boundRolledBack = await ledger.rollbackStoredBound(config.ledger.runId, applyToken, priorBound);
+        } catch (e) { rollbackErrors.push(`bound: ${(e as Error).message}`); }
+        // fence casualties of THIS bound come back too — no bound governs them
+        await ledger.restoreSuperseded(config.ledger.runId, applyToken).catch((e: Error) => rollbackErrors.push(`superseded: ${e.message}`));
+        // restore chunks under whatever bound now governs the grid
+        let governing: number | null = priorBound;
+        if (!boundRolledBack && rollbackErrors.length === 0) {
+          try { governing = await ledger.getStoredBound(config.ledger.runId); }
+          catch (e) { rollbackErrors.push(`winner read: ${(e as Error).message}`); }
+        }
+        if (rollbackErrors.length === 0) {
+          for (const r of restores.reverse()) await ledger.restorePrune(r, governing).catch((e: Error) => rollbackErrors.push(`chunks: ${e.message}`));
+        }
+        if (rollbackErrors.length > 0) {
+          // an unverified rollback must never claim restoration
+          return { applied: false, indeterminate: true, reason: `apply failed (${(raceErr as Error).message}) AND the rollback itself failed (${rollbackErrors.join('; ')}) — bound/grid state is INDETERMINATE: when MongoDB answers, read GET /api/boundary and mig_run_config, then re-apply the intended bound or Rebuild ledger from data` };
+        }
+        await ledger.clearPruneJournal(config.ledger.runId, applyToken).catch(() => {});
+        return { applied: false, reason: `apply raced concurrent claiming and was ROLLED BACK (${boundRolledBack ? 'bound and pruned chunks restored' : 'a newer bound governs; chunks restored under it'}) (${(raceErr as Error).message}) — pause all pods, let in-flight chunks finish, then apply again` };
+      }
+    } catch (err) {
+      // lost-ack store: the token was minted BEFORE the write, so a store
+      // whose acknowledgement was lost can still be unwound by token — and
+      // its fence casualties restored. These compensations FAIL CLOSED: a
+      // failure here means a chunk may sit terminally superseded under a
+      // bound that no longer exists, which must never read as an ordinary
+      // rolled-back response.
+      const lostAckErrors: string[] = [];
+      if (storeAttempted) {
+        await ledger.rollbackStoredBound(config.ledger.runId, applyToken, priorBound).catch((e: Error) => lostAckErrors.push(`bound: ${e.message}`));
+        await ledger.restoreSuperseded(config.ledger.runId, applyToken).catch((e: Error) => lostAckErrors.push(`superseded: ${e.message}`));
+      }
+      if (lostAckErrors.length > 0) {
+        return { applied: false, indeterminate: true, reason: `apply failed (${(err as Error).message}) AND unwinding the possibly-persisted store failed (${lostAckErrors.join('; ')}) — a chunk may remain superseded under a rolled-back bound: when MongoDB answers, Rebuild ledger from data or re-apply the intended bound` };
+      }
+      // restore ONLY under the bound that actually governs — a lost CAS ack
+      // may have persisted the new bound, so an assumed prior would restore
+      // chunks that bound intentionally pruned. Unreadable = untouched.
+      let governing: number | null;
+      try {
+        governing = await ledger.getStoredBound(config.ledger.runId);
+      } catch {
+        return { applied: false, indeterminate: true, reason: `apply failed (${(err as Error).message}) AND the governing bound could not be read — nothing was restored (fail closed); when MongoDB answers, read mig_run_config, then re-apply deliberately or Rebuild ledger from data` };
+      }
+      const rollbackErrors: string[] = [];
+      for (const r of restores.reverse()) await ledger.restorePrune(r, governing).catch((e: Error) => rollbackErrors.push(e.message));
+      if (rollbackErrors.length > 0) {
+        return { applied: false, indeterminate: true, reason: `apply failed (${(err as Error).message}) AND restoring pruned chunks failed (${rollbackErrors.join('; ')}) — grid state is INDETERMINATE: when MongoDB answers, Rebuild ledger from data or re-apply the intended bound` };
+      }
+      await ledger.clearPruneJournal(config.ledger.runId, applyToken).catch(() => {});
+      return { applied: false, reason: (err as Error).message };
+    } finally {
+      clearInterval(markerHeartbeat);
+      // best-effort: a clear that fails leaves the marker to its 10-minute
+      // expiry — claims release (visibly, safely) until then
+      await ledger.clearApplyMarker(config.ledger.runId, applyToken).catch(() => {});
+    }
+  };
   app.post<{ Body: { boundMs?: number } }>('/control/apply-bound', async (req, reply) => {
     const boundMs = Number(req.body?.boundMs);
     if (!Number.isFinite(boundMs) || boundMs <= 0) {
       reply.code(400);
       return { applied: false, reason: 'boundMs (epoch ms) required' };
     }
-    if (config.ledger.dryRun) return { applied: false, reason: 'dry run — apply on the real run' };
-    if (envBoundAtBoot !== null) {
-      return { applied: false, reason: `bound already pinned via LEDGER_CD_UPPER_BOUND=${envBoundAtBoot} — change it in the deployment config, not here` };
-    }
-    if (boundMs >= Date.now() - 60_000) {
-      return { applied: false, reason: 'bound must be safely in the past (>60s ago)' };
-    }
-    try {
-      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs);
-      await ledger.setStoredBound(config.ledger.runId, boundMs, 'dashboard');
-      logger.warn({ boundMs, iso: new Date(boundMs).toISOString(), ...pruned }, 'Run bound applied from dashboard — pods adopt it on their next map pass');
-      return { applied: true, boundMs, iso: new Date(boundMs).toISOString(), ...pruned };
-    } catch (err) {
-      reply.code(409);
-      return { applied: false, reason: (err as Error).message };
-    }
+    const res = await applyBoundNow(boundMs, 'dashboard');
+    if (!res.applied) reply.code(409);
+    return res;
   });
 
   // Tee-boundary detection + sync parity (background task — the Mongo
   // scan across thousands of collections is minutes of work).
-  const { detectBoundary, newBoundaryProgress } = await import('./boundary-detector.ts');
+  const { detectBoundary, newBoundaryProgress, decideAutoApply } = await import('./boundary-detector.ts');
   const boundaryState = newBoundaryProgress();
   app.post<{ Body: { bandMinutes?: number } }>('/control/detect-boundary', async (req) => {
     if (boundaryState.status === 'running') return { started: false, reason: 'detection already running' };
+    boundaryApplied = null;
     Object.assign(boundaryState, newBoundaryProgress(), { status: 'running', startedAt: Date.now() });
     void detectBoundary({
-      config, logger, db: mongoReader.getDatabase(), staging, ledger,
+      // PRIMARY reads: a lagging secondary's empty interval must never
+      // classify as an ingestion-pause gap
+      config, logger, db: mongoReader.getPrimaryDatabase(), staging, ledger,
       progress: boundaryState, bandMinutes: req.body?.bandMinutes,
     })
       .then((report) => { boundaryState.report = report; boundaryState.status = 'completed'; boundaryState.finishedAt = Date.now(); })
       .catch((e) => { boundaryState.status = 'failed'; boundaryState.error = (e as Error).message; boundaryState.finishedAt = Date.now(); });
     return { started: true };
   });
-  app.get('/api/boundary', async () => boundaryState);
+  app.get('/api/boundary', async () => ({ ...boundaryState, applied: boundaryApplied }));
+
+  // Startup-guard answer: "nothing mirrors traffic between the stacks" —
+  // cluster-wide (stored in run config), releases every held pod.
+  app.post('/control/allow-unbounded', async () => {
+    await ledger.setUnboundedAck(config.ledger.runId, config.worker.podId);
+    if (orchestrator.getStats().pauseReason === 'boundary-unset') orchestrator.resume(true);
+    logger.warn('Operator declared no-mirror: unbounded run allowed — held pods release within seconds');
+    return { allowed: true, note: 'held pods release within ~3s; the decision is stored cluster-wide in mig_run_config' };
+  });
+
+  // ── ONE endpoint for the whole boundary flow ────────────────────────────
+  // {} → detect, and auto-apply when the seam is an exact ingestion-pause
+  // gap; {"acceptAnchor":true} → also take an anchor suggestion; {"boundMs"}
+  // → apply that value directly. The result (incl. the apply receipt) lands
+  // in GET /api/boundary under .applied.
+  app.post<{ Body: { boundMs?: number; acceptAnchor?: boolean; bandMinutes?: number } }>('/control/set-boundary', async (req) => {
+    if (typeof req.body?.boundMs === 'number') {
+      boundaryApplied = await applyBoundNow(req.body.boundMs, 'set-boundary explicit');
+      return boundaryApplied;
+    }
+    if (boundaryState.status === 'running') return { started: false, reason: 'detection already running — poll GET /api/boundary' };
+    const acceptAnchor = req.body?.acceptAnchor === true;
+    boundaryApplied = null;
+    Object.assign(boundaryState, newBoundaryProgress(), { status: 'running', startedAt: Date.now() });
+    void detectBoundary({
+      // PRIMARY reads: a lagging secondary's empty interval must never
+      // classify as an ingestion-pause gap
+      config, logger, db: mongoReader.getPrimaryDatabase(), staging, ledger,
+      progress: boundaryState, bandMinutes: req.body?.bandMinutes,
+    })
+      .then(async (report) => {
+        boundaryState.report = report;
+        const decision = decideAutoApply(report, acceptAnchor);
+        boundaryApplied = decision.apply
+          ? await applyBoundNow(decision.boundMs as number, acceptAnchor ? 'set-boundary anchor accepted' : 'set-boundary exact gap')
+          : { applied: false, reason: decision.reason };
+        // completed only once .applied is decided — a poller leaving at
+        // 'completed' must never see the apply still in flight
+        boundaryState.status = 'completed'; boundaryState.finishedAt = Date.now();
+      })
+      .catch((e) => { boundaryState.status = 'failed'; boundaryState.error = (e as Error).message; boundaryState.finishedAt = Date.now(); });
+    return { started: true, mode: acceptAnchor ? 'detect + apply (anchor accepted)' : 'detect + apply only if the seam is exact', result: 'poll GET /api/boundary — the receipt lands in .applied' };
+  });
 
   app.get('/api/pods', async () => ({
     pods: await ledger.podActivity(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId),

@@ -64,10 +64,11 @@ both stacks, in the same partition), checks match `(_id, cd)` pairs — the
 retry copy's cd can never equal the migrated copy's. Preflight verifies the
 boundary is trustworthy (source frozen, clocks sane) before anything runs.
 
-This README covers what you need BEFORE the dashboard exists (installing,
-env vars, starting the service, automation reference). Everything after —
-running, monitoring, troubleshooting, verifying — lives in the dashboard,
-with `docs/RUNBOOK.md` as the cross-system procedure (cutover choreography,
-Kafka retention, incident tables) for operators.
-
-## Architecture
+This README covers what you need BEFORE the dashboard exists: installing
+and starting the service. `.env.example` is the commented configuration
+reference (the two required variables and every optional one). Everything
+after — running, monitoring, troubleshooting, verifying — lives in the
+dashboard's **Migration Guide** and **Help & Recovery** tabs, with
+`docs/RUNBOOK.md` as the standalone operations manual (terms, cutover
+scenarios, incident table, sign-off procedure, curl reference) — start
+there if you are planning a migration from scratch.
