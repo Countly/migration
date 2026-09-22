@@ -271,6 +271,20 @@ describe('tee-boundary detection + sync parity', () => {
     expect(await ranges.countDocuments({ run_id: RJ3 } as never)).toBe(5_001);
     expect(await ledger.countPruneJournal(RJ3)).toBe(0);
 
+    // FENCE GENERATION: a restore bumps it, so a zombie prune resuming its
+    // writes with the snapshotted generation matches NOTHING it brought back
+    const RG = 'fence-gen-1';
+    await ranges.insertOne(mk(RG, 'rg:1', 100, 200) as never);
+    const pr = await ledger.pruneBeyondBound(RG, 50); // snapshot saw fence_gen = null
+    expect(pr.deleted).toBe(1);
+    await ledger.restorePrune(pr.restore, null);      // takeover restores → gen 1
+    const restored = await ranges.findOne({ _id: 'rg:1' } as never);
+    expect(restored!.fence_gen).toBe(1);
+    // the zombie's per-document delete predicate (its snapshotted generation)
+    const zdel = await ranges.deleteOne({ _id: 'rg:1', status: 'pending', fence_gen: null } as never);
+    expect(zdel.deletedCount).toBe(0); // atomic fence: nothing to delete
+    expect(await ranges.countDocuments({ _id: 'rg:1' } as never)).toBe(1);
+
     // a COMMITTED apply's leftover entry restores NOTHING — its own bound filters every chunk out
     const RJ2 = 'prune-journal-2';
     expect(await ledger.setStoredBoundIf(RJ2, 120, 'test', null)).toBeTruthy();

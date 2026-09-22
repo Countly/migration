@@ -33,6 +33,8 @@ export interface ChunkDoc {
   idx: number;
   lower_cd: number;            // inclusive, epoch ms
   upper_cd: number;            // exclusive, epoch ms
+  /** Fencing generation: every RESTORE bumps it, and prune mutations are predicated on the generation they snapshotted — a zombie prune resuming after a marker takeover carries stale generations and matches nothing. Absent = 0. */
+  fence_gen?: number | null;
   status: ChunkStatus;
   pod_id: string | null;
   lease_until: Date | null;
@@ -863,10 +865,10 @@ export class LedgerStore {
    * Refuses when any non-pending chunk reaches past the bound — that data
    * (possibly) already moved and needs purge tooling, not a config flip.
    */
-  async pruneBeyondBound(runId: string, boundMs: number, receiptSink?: (r: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }) => void | Promise<void>, ownerToken?: string): Promise<{
+  async pruneBeyondBound(runId: string, boundMs: number, receiptSink?: (r: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number; fence_gen?: number | null }> }) => void | Promise<void>, ownerToken?: string): Promise<{
     deleted: number; clamped: number;
     /** What the prune changed, verbatim — a raced apply restores it. */
-    restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> };
+    restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number; fence_gen?: number | null }> };
   }> {
     const busy = await this.c().countDocuments({
       run_id: runId, lower_cd: { $gte: 0 }, upper_cd: { $gt: boundMs },
@@ -884,9 +886,9 @@ export class LedgerStore {
     const clampedChunks = (await this.c()
       .find(
         { run_id: runId, lower_cd: { $gte: 0, $lt: boundMs }, upper_cd: { $gt: boundMs }, status: 'pending' },
-        { projection: { _id: 1, upper_cd: 1 } },
+        { projection: { _id: 1, upper_cd: 1, fence_gen: 1 } },
       )
-      .toArray()).map((c) => ({ _id: String(c._id), upper_cd: c.upper_cd }));
+      .toArray()).map((c) => ({ _id: String(c._id), upper_cd: c.upper_cd, fence_gen: (c.fence_gen as number | undefined) ?? null }));
     // awaited: a sink that persists the receipt durably must finish BEFORE
     // the destructive writes below — its failure aborts the prune untouched
     await receiptSink?.({ deletedChunks, clampedChunks });
@@ -897,9 +899,17 @@ export class LedgerStore {
     if (ownerToken !== undefined && !(await this.renewApplyMarker(runId, ownerToken))) {
       throw new Error('the apply marker was taken over — prune aborted before its destructive delete');
     }
-    const del = await this.c().deleteMany({
-      _id: { $in: deletedChunks.map((c) => c._id) }, status: 'pending',
-    });
+    // FENCED per chunk: each delete is predicated on the fence generation
+    // the snapshot saw (null matches the absent field). A restore bumps the
+    // generation, so a zombie prune resuming these writes after a takeover
+    // recovered its journal deletes NOTHING the restore brought back — the
+    // check-then-write pair is atomic per document, not merely adjacent.
+    const del = deletedChunks.length === 0 ? { deletedCount: 0 } : await this.c().bulkWrite(
+      deletedChunks.map((c) => ({
+        deleteOne: { filter: { _id: c._id, status: 'pending', fence_gen: (c.fence_gen as number | undefined) ?? null } },
+      })),
+      { ordered: false },
+    );
     // clamp ONLY the snapshotted ids: a straddler inserted after the
     // snapshot must not be modified outside the receipt (a rollback would
     // leave it truncated under a rejected bound) — the insert-path
@@ -907,9 +917,16 @@ export class LedgerStore {
     if (ownerToken !== undefined && !(await this.renewApplyMarker(runId, ownerToken))) {
       throw new Error('the apply marker was taken over — prune aborted before its destructive clamp');
     }
-    const clamp = await this.c().updateMany(
-      { _id: { $in: clampedChunks.map((c) => c._id) }, status: 'pending' },
-      { $set: { upper_cd: boundMs, updated_at: new Date() } },
+    // clamps are fenced the same way, and BUMP the generation themselves so
+    // a zombie's re-clamp with the snapshotted generation misses
+    const clamp = clampedChunks.length === 0 ? { modifiedCount: 0 } : await this.c().bulkWrite(
+      clampedChunks.map((c) => ({
+        updateOne: {
+          filter: { _id: c._id, status: 'pending', fence_gen: c.fence_gen ?? null },
+          update: { $set: { upper_cd: boundMs, updated_at: new Date() }, $inc: { fence_gen: 1 } },
+        },
+      })),
+      { ordered: false },
     );
     return { deleted: del.deletedCount ?? 0, clamped: clamp.modifiedCount ?? 0, restore: { deletedChunks, clampedChunks } };
   }
@@ -922,14 +939,18 @@ export class LedgerStore {
    * what the winning bound removed.
    */
   async restorePrune(
-    restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> },
+    restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number; fence_gen?: number | null }> },
     currentBoundMs: number | null = null,
   ): Promise<void> {
-    const insertable = currentBoundMs === null
+    // every restored document carries a BUMPED fence generation: the pruner
+    // whose receipt this is predicated its writes on the generation it
+    // snapshotted, so a zombie resuming those writes after this restore
+    // matches nothing
+    const insertable = (currentBoundMs === null
       ? restore.deletedChunks
       : restore.deletedChunks.filter((c) => c.lower_cd < currentBoundMs).map((c) => (
         c.upper_cd > currentBoundMs ? { ...c, upper_cd: currentBoundMs } : c
-      ));
+      ))).map((c) => ({ ...c, fence_gen: ((c.fence_gen as number | undefined) ?? 0) + 1 }));
     if (insertable.length > 0) {
       try {
         await this.c().insertMany(insertable, { ordered: false });
@@ -946,7 +967,9 @@ export class LedgerStore {
     }
     for (const c of restore.clampedChunks) {
       const upper = currentBoundMs !== null ? Math.min(c.upper_cd, currentBoundMs) : c.upper_cd;
-      await this.c().updateOne({ _id: c._id, status: 'pending' }, { $set: { upper_cd: upper, updated_at: new Date() } });
+      // $inc bumps past the pruner's snapshotted generation — its zombie
+      // re-clamp then matches nothing
+      await this.c().updateOne({ _id: c._id, status: 'pending' }, { $set: { upper_cd: upper, updated_at: new Date() }, $inc: { fence_gen: 1 } });
     }
   }
 
