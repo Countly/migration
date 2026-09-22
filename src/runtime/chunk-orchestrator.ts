@@ -2118,12 +2118,12 @@ export class ChunkOrchestrator {
       // first re-reads which (_id, cd) pairs are already live (scoped) and
       // sends only the absent remainder, so a lost ack cannot double-store
       // a batch even where insert deduplication is inert.
-      const insertAbsent = async (subRows: OutputRow[], subColls: string[], tag: string): Promise<void> => {
+      const insertAbsent = async (subRows: OutputRow[], subColls: string[], tag: string, reconcileFirst = false): Promise<void> => {
         if (this.dryRun) { await staging.insertIntoLive(subRows, tag, replayTarget); return; }
         let pending = subRows.map((r, j) => ({ r, c: subColls[j] }));
         let lastErr: unknown = null;
         for (let attempt = 0; attempt < 5; attempt++) {
-          if (attempt > 0) {
+          if (attempt > 0 || reconcileFirst) {
             const live = await livePairSet(pending.map((x) => x.r), pending.map((x) => x.c));
             pending = pending.filter(({ r, c }) => !live.has(`${c}\u0000${r._id}\u0000${cdMsOf(r)}`));
             if (pending.length === 0) return; // the "failed" insert actually landed
@@ -2167,16 +2167,17 @@ export class ChunkOrchestrator {
       // path resolves the entry WITH the flag, and verification discounts it.
       // A failed intent write aborts the batch untouched (fail closed).
       if (!this.dryRun) await dlq.markReplayIntent(ids);
+      let batchInserted = false;
       try {
         await insertAbsent(rows, colls, `dlqreplay:${batchKey}`);
-        await dlq.markResolved(ids, config.transform.version);
-        replayed += rows.length;
+        batchInserted = true;
       } catch (err) {
-        // Isolate row-level failures within the replay batch too — each row
-        // goes through the same idempotent-by-reconciliation insert.
+        // Isolate row-level failures within the replay batch — each row goes
+        // through the same idempotent insert, RECONCILING BEFORE its first
+        // attempt too: a partial batch failure may have landed some rows.
         for (let j = 0; j < rows.length; j++) {
           try {
-            await insertAbsent([rows[j]], [colls[j]], `dlqreplay:${batchKey}:${j}`);
+            await insertAbsent([rows[j]], [colls[j]], `dlqreplay:${batchKey}:${j}`, true);
             await dlq.markResolved([ids[j]], config.transform.version);
             replayed++;
           } catch (rowErr) {
@@ -2185,6 +2186,15 @@ export class ChunkOrchestrator {
           }
         }
         void err;
+      }
+      if (batchInserted) {
+        // OUTSIDE the insert catch: a transient MongoDB status-write failure
+        // must never re-trigger target inserts. It propagates and fails the
+        // replay run — the rows are live, the entries stay pending WITH the
+        // intent flag, and the next replay's already-live filter resolves
+        // them without inserting.
+        await dlq.markResolved(ids, config.transform.version);
+        replayed += rows.length;
       }
       this.syncReplayProgress(replayed, stillFailing, alreadyLive);
     }
