@@ -1535,6 +1535,29 @@ export class ChunkOrchestrator {
     return { frozen: grew.length === 0, grew, probeMs };
   }
 
+  /**
+   * One source snapshot (per-collection newest cd + estimated count). The
+   * final check brackets its deep phase with two of these: an unbounded
+   * deep recount only proves anything if the source stayed FROZEN across
+   * it, and a snapshot the recount took at its start cannot see documents
+   * accepted afterwards.
+   */
+  async snapshotSourceState(): Promise<Array<{ collection: string; maxCd: number; est: number }>> {
+    const db = this.d.mongoReader.getDatabase();
+    const collections = await discoverCollections(db, this.d.config.source.collectionPrefix, this.logger);
+    const out: Array<{ collection: string; maxCd: number; est: number }> = [];
+    for (const name of collections) {
+      const [top] = await db.collection(name).find({ cd: { $type: 'date' } })
+        .sort({ cd: -1 }).limit(1).project({ cd: 1 }).toArray();
+      out.push({
+        collection: name,
+        maxCd: top?.cd instanceof Date ? top.cd.getTime() : 0,
+        est: await db.collection(name).estimatedDocumentCount(),
+      });
+    }
+    return out;
+  }
+
   /** Drop staging tables orphaned by crash-between-done-and-drop. */
   private async sweepOrphanStaging(collection: string): Promise<void> {
     if (this.dryRun) return;

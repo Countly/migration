@@ -50,6 +50,7 @@ const chRow = (id: string, cdMs: number): Record<string, unknown> => ({
 const contentClean = {
   contentAudit: async (samples = 500) => ({ sampled: samples, matched: samples, missing: 0, different: 0, mismatches: [] }),
   verifyMigration: async () => ({ ok: true, mismatches: [], migrationDuplicates: 0 }),
+  snapshotSourceState: async () => [] as Array<{ collection: string; maxCd: number; est: number }>,
 };
 
 describe('final check: the interpreted sign-off', () => {
@@ -220,6 +221,21 @@ describe('final check: the interpreted sign-off', () => {
     const out2 = await check({ cutoverMs: CUTOVER, deep: false, orchestrator: badVerify });
     expect(out2.verdict).toBe('FAIL');
     expect(out2.problems.join(' ')).toContain('different live row count');
+  });
+
+  it('an unbounded deep check FAILS when the source advances during it (frozen-source bracket)', async () => {
+    let probes = 0;
+    const advancing = {
+      ...contentClean,
+      snapshotSourceState: async () => [{ collection: 'drill_events_probe', maxCd: 1_000, est: 100 + probes++ }],
+    };
+    const out = await check({ cutoverMs: null, orchestrator: advancing });
+    expect(out.verdict).toBe('FAIL');
+    expect(out.problems.some((pr) => pr.includes('SOURCE ADVANCED'))).toBe(true);
+    // with a cutover the recount is clamped — no bracket, no probes
+    probes = 0;
+    await check({ cutoverMs: CUTOVER, orchestrator: advancing });
+    expect(probes).toBe(0);
   });
 
   it('content mismatch and failed chunks each FAIL with their own action line', async () => {

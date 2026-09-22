@@ -65,6 +65,21 @@ interface ContentAuditRunner {
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }>;
   verifyMigration(upToMs?: number | null): Promise<Record<string, unknown>>;
+  snapshotSourceState(): Promise<Array<{ collection: string; maxCd: number; est: number }>>;
+}
+
+/** Collections whose source state advanced between two snapshots — a new collection counts as an advance. Exported for tests. */
+export function sourceAdvanced(
+  before: Array<{ collection: string; maxCd: number; est: number }>,
+  after: Array<{ collection: string; maxCd: number; est: number }>,
+): string[] {
+  const b = new Map(before.map((s) => [s.collection, s]));
+  const grew: string[] = [];
+  for (const a of after) {
+    const prev = b.get(a.collection);
+    if (!prev || a.maxCd > prev.maxCd || a.est > prev.est) grew.push(a.collection);
+  }
+  return grew;
 }
 
 export async function runFinalCheck(
@@ -167,6 +182,17 @@ export async function runFinalCheck(
       }
     }
 
+    // deep with NO cutover claims a FROZEN source — prove it by bracketing:
+    // the recount snapshots each collection's high cd at ITS start and can
+    // never see documents accepted afterwards, so any source advance across
+    // the deep phase voids the authorization. (With a cutover the recount is
+    // clamped and post-cutover writes are excluded by construction.)
+    let sourceBefore: Array<{ collection: string; maxCd: number; est: number }> | null = null;
+    if (deep && cutoverMs === null) {
+      out.phase = 'snapshotting the source (frozen-source proof)';
+      sourceBefore = await deps.orchestrator.snapshotSourceState();
+    }
+
     // ── 3b. DEEP tier: full source recount + cd-checksum fingerprint ──────
     const audit = newRebuildProgress();
     if (deep) {
@@ -249,6 +275,17 @@ export async function runFinalCheck(
       // value-level fidelity is pinned by the transform's differential
       // harness, not by this sampler)
       out.passes.push(`Sampled ${fmt(content.sampled)} random docs against the source — every scalar field exact, every JSON field's key set matched.`);
+    }
+
+    // ── Frozen-source proof (unbounded deep): the closing bracket ─────────
+    if (sourceBefore !== null) {
+      out.phase = 'confirming the source stayed frozen during the check';
+      const grew = sourceAdvanced(sourceBefore, await deps.orchestrator.snapshotSourceState());
+      if (grew.length > 0) {
+        out.problems.push(`The SOURCE ADVANCED while the deep check ran (${grew.join(', ')}) — old-side ingestion is not stopped, so an unbounded recount cannot authorize teardown. Stop ingestion into the old cluster (or pass a cutoverMs boundary) and run the deep check again.`);
+      } else {
+        out.passes.push('Frozen-source bracket held: no collection gained documents while the deep check ran.');
+      }
     }
 
     // ── Staleness: did the run's chunk state move while we measured? ──────

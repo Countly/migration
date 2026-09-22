@@ -946,7 +946,10 @@ export class LedgerStore {
     for (const entry of entries) {
       if (markerLive !== null && entry.token === markerLive) { skippedLiveApply++; continue; }
       await this.restorePrune(entry.receipt, governing);
-      await this.pj().deleteOne({ run_id: runId, token: entry.token, created_at: entry.created_at });
+      // by _id, never by (token, created_at): a paged receipt's documents
+      // share both, and deleting a DIFFERENT page than the one just restored
+      // would lose it forever if the process dies before its turn
+      await this.pj().deleteOne({ _id: entry._id });
       recovered++;
     }
     return { recovered, skippedLiveApply };
