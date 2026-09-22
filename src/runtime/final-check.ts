@@ -69,20 +69,27 @@ interface ContentAuditRunner {
 }
 
 /**
- * Collections whose source MUTATED between two snapshots — a new collection,
- * a higher max cd, or ANY change in the exact count or the order-free cd
- * checksum (which catches backdated inserts, deletes, and insert+delete
- * pairs that leave the count unchanged). Exported for tests.
+ * Collections whose source MUTATED between two snapshots — a collection that
+ * appeared OR disappeared, a higher max cd, or ANY change in the exact count
+ * or the order-free cd checksum (which catches backdated inserts, deletes,
+ * and insert+delete pairs that leave the count unchanged). Both directions
+ * are compared: a collection dropped mid-check must void the authorization,
+ * or its (possibly empty) recount would stand unchallenged. Exported for
+ * tests.
  */
 export function sourceAdvanced(
   before: Array<{ collection: string; maxCd: number; n: number; cdSum: number }>,
   after: Array<{ collection: string; maxCd: number; n: number; cdSum: number }>,
 ): string[] {
   const b = new Map(before.map((s) => [s.collection, s]));
+  const seen = new Set(after.map((s) => s.collection));
   const grew: string[] = [];
   for (const a of after) {
     const prev = b.get(a.collection);
     if (!prev || a.maxCd > prev.maxCd || a.n !== prev.n || a.cdSum !== prev.cdSum) grew.push(a.collection);
+  }
+  for (const prev of before) {
+    if (!seen.has(prev.collection)) grew.push(prev.collection);
   }
   return grew;
 }

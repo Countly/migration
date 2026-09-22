@@ -184,7 +184,11 @@ export async function runDedupeOverlap(
         // migrated copy would lose the only surviving copy of its event.
         // (Scope still guards the coincidence of a sibling collection's row
         // sharing the exact same pair.)
-        const matched = await staging.countMatchingPairs(pairs, scope);
+        // Execute deletes ONLY the observed subset below — a row that
+        // appears between this scan and the delete (a DLQ replay landing an
+        // old-source pair) was never counted and must never be deleted.
+        const observed = await staging.filterLivePairs(pairs, scope);
+        const matched = observed.length > 0 ? await staging.countMatchingPairs(observed, scope) : 0;
         row.chMatched += matched;
         state.totals.chMatched += matched;
         if (matched === 0) return;
@@ -219,7 +223,7 @@ export async function runDedupeOverlap(
           // drift), meaning each fenced call issues exactly one command.
           // Within one command the exposure is milliseconds; an attach takes
           // a chunk's full read-transform-insert-verify cycle.
-          for (let i = 0; i < pairs.length; i += StagingManager.ID_PARAM_PAGE) {
+          for (let i = 0; i < observed.length; i += StagingManager.ID_PARAM_PAGE) {
             if (opts.leaseLost?.()) {
               throw new Error('the cluster-wide maintenance reservation was LOST mid-execute (this pod stalled past its expiry and another operation may have started) — aborted before the next delete page');
             }
@@ -229,7 +233,7 @@ export async function runDedupeOverlap(
                 throw new Error('run chunk state changed during execute — aborted before the next delete page; re-run the dry run with all pods idle');
               }
             }
-            await staging.deleteLiveByPairs(pairs.slice(i, i + StagingManager.ID_PARAM_PAGE), scope);
+            await staging.deleteLiveByPairs(observed.slice(i, i + StagingManager.ID_PARAM_PAGE), scope);
           }
           row.deleted += matched;
           state.totals.deleted += matched;

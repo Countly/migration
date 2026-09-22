@@ -1975,7 +1975,7 @@ export class ChunkOrchestrator {
    * them from the source first) are marked resolved without inserting, so
    * redo-then-replay cannot duplicate.
    */
-  async replayDlq(): Promise<{ replayed: number; stillFailing: number; alreadyLive: number }> {
+  async replayDlq(leaseLost?: () => boolean): Promise<{ replayed: number; stillFailing: number; alreadyLive: number }> {
     const { dlq, staging, retryPolicy, config } = this.d;
     // Dry run must never write the live table: replay rehearses against the
     // Null-engine table (full parse/type validation, nothing stored) —
@@ -1997,6 +1997,9 @@ export class ChunkOrchestrator {
     // cursor, so the loop always terminates.
     let afterId: string | null = null;
     for (;;) {
+      if (leaseLost?.()) {
+        throw new Error('the cluster-wide maintenance reservation was LOST mid-replay (this pod stalled past its expiry) — aborted before the next batch; re-run the replay');
+      }
       const batch = await dlq.listPendingAfter(this.runId, afterId, 500);
       if (batch.length === 0) break;
       afterId = batch[batch.length - 1]._id;

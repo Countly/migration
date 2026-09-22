@@ -338,10 +338,27 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     { status: 'not_run', result: null, error: null };
   app.post('/control/replay-dlq', async () => {
     if (replayState.status === 'running') return { started: false, reason: 'replay already running' };
+    // replay INSERTS live rows without moving the ledger fingerprint — it
+    // must hold the same cluster-wide reservation as final check and dedupe,
+    // or a dedupe execute on another pod could delete a row it never counted
+    const mtToken = `dlq-replay:${config.worker.podId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const acq = await ledger.acquireMaintenance(config.ledger.runId, 'dlq-replay', mtToken);
+      if (!acq.acquired) return { started: false, reason: `another maintenance operation (${acq.holder}) holds the cluster-wide reservation — wait for it to finish` };
+    } catch {
+      return { started: false, reason: 'could not acquire the cluster-wide maintenance reservation — retry when MongoDB answers' };
+    }
     replayState.status = 'running'; replayState.result = null; replayState.error = null;
-    void orchestrator.replayDlq()
+    const lease = { lost: false };
+    const hb = setInterval(() => {
+      void ledger.renewMaintenance(config.ledger.runId, mtToken)
+        .then((ok) => { if (!ok) lease.lost = true; })
+        .catch(() => { /* transient — the next beat retries */ });
+    }, 60_000);
+    void orchestrator.replayDlq(() => lease.lost)
       .then((r) => { replayState.result = r as unknown as Record<string, unknown>; replayState.status = 'completed'; })
-      .catch((e) => { replayState.error = (e as Error).message; replayState.status = 'failed'; });
+      .catch((e) => { replayState.error = (e as Error).message; replayState.status = 'failed'; })
+      .finally(() => { clearInterval(hb); void ledger.releaseMaintenance(config.ledger.runId, mtToken).catch(() => {}); });
     return { started: true };
   });
   app.get('/api/replay', async () => ({

@@ -223,6 +223,15 @@ describe('final check: the interpreted sign-off', () => {
     expect(out2.problems.join(' ')).toContain('different live row count');
   });
 
+  it('the mutation bracket flags a collection that DISAPPEARED mid-check', async () => {
+    const { sourceAdvanced } = await import('../../src/runtime/final-check.ts');
+    const snapA = [{ collection: 'c1', maxCd: 10, n: 5, cdSum: 100 }, { collection: 'c2', maxCd: 20, n: 3, cdSum: 60 }];
+    expect(sourceAdvanced(snapA, [snapA[0]])).toEqual(['c2']);          // dropped mid-check
+    expect(sourceAdvanced(snapA, snapA)).toEqual([]);                    // frozen
+    expect(sourceAdvanced(snapA, [snapA[0], { ...snapA[1], cdSum: 61 }])).toEqual(['c2']); // checksum-only change
+    expect(sourceAdvanced(snapA, [snapA[0], { ...snapA[1], n: 2 }])).toEqual(['c2']);      // delete (count down)
+  });
+
   it('a check that lost the cluster-wide maintenance lease can never publish a PASS', async () => {
     const out = await check({ cutoverMs: CUTOVER, deep: false, leaseLost: () => true });
     expect(out.verdict).toBe('FAIL');
