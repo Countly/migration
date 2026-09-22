@@ -1543,7 +1543,10 @@ export class ChunkOrchestrator {
    * accepted afterwards.
    */
   async snapshotSourceState(upToMs: number | null = null): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number }>> {
-    const db = this.d.mongoReader.getDatabase();
+    // PRIMARY reads: the recount audits the primary's view — a bracket read
+    // from a lagging secondary could miss the very mutation it exists to
+    // catch and compare equal across the check
+    const db = this.d.mongoReader.getPrimaryDatabase();
     const collections = await discoverCollections(db, this.d.config.source.collectionPrefix, this.logger);
     const out: Array<{ collection: string; maxCd: number; n: number; cdSum: number }> = [];
     // A bounded check audits only cd < upToMs — its bracket must watch that
@@ -1988,7 +1991,7 @@ export class ChunkOrchestrator {
    * them from the source first) are marked resolved without inserting, so
    * redo-then-replay cannot duplicate.
    */
-  async replayDlq(leaseLost?: () => boolean): Promise<{ replayed: number; stillFailing: number; alreadyLive: number }> {
+  async replayDlq(leaseLost?: () => boolean | Promise<boolean>): Promise<{ replayed: number; stillFailing: number; alreadyLive: number }> {
     const { dlq, staging, retryPolicy, config } = this.d;
     // Dry run must never write the live table: replay rehearses against the
     // Null-engine table (full parse/type validation, nothing stored) —
@@ -2010,7 +2013,7 @@ export class ChunkOrchestrator {
     // cursor, so the loop always terminates.
     let afterId: string | null = null;
     for (;;) {
-      if (leaseLost?.()) {
+      if (await leaseLost?.()) {
         throw new Error('the cluster-wide maintenance reservation was LOST mid-replay (this pod stalled past its expiry) — aborted before the next batch; re-run the replay');
       }
       const batch = await dlq.listPendingAfter(this.runId, afterId, 500);

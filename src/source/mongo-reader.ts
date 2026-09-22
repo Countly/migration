@@ -137,6 +137,21 @@ export class MongoReader {
     return this.db;
   }
 
+  /**
+   * A PRIMARY-read view of the same database. Decision-authorizing reads —
+   * boundary detection's gap probes and the deep check's source-stability
+   * brackets — must never see a lagging secondary: replication lag reads as
+   * an ingestion-pause gap (auto-applying a bound that excludes documents
+   * the primary accepted) or masks a mid-check mutation. Bulk chunk reads
+   * stay on the configured (secondaryPreferred) preference.
+   */
+  getPrimaryDatabase(): Db {
+    if (!this.client || !this.db) {
+      throw new Error("MongoReader is not connected. Call connect() first.");
+    }
+    return this.client.db(this.db.databaseName, { readPreference: ReadPreference.PRIMARY });
+  }
+
   async getUpperBound(): Promise<Cursor | null> {
     this.ensureConnected();
 

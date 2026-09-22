@@ -350,12 +350,20 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     }
     replayState.status = 'running'; replayState.result = null; replayState.error = null;
     const lease = { lost: false };
+    const probe = async (): Promise<boolean> => {
+      if (lease.lost) return true;
+      try {
+        const ok = await ledger.renewMaintenance(config.ledger.runId, mtToken);
+        if (!ok) lease.lost = true;
+        return !ok;
+      } catch { return true; } // unverifiable ownership before a batch = abort
+    };
     const hb = setInterval(() => {
       void ledger.renewMaintenance(config.ledger.runId, mtToken)
         .then((ok) => { if (!ok) lease.lost = true; })
-        .catch(() => { /* transient — the next beat retries */ });
+        .catch(() => { /* keep-fresh only — batches revalidate synchronously */ });
     }, 60_000);
-    void orchestrator.replayDlq(() => lease.lost)
+    void orchestrator.replayDlq(probe)
       .then((r) => { replayState.result = r as unknown as Record<string, unknown>; replayState.status = 'completed'; })
       .catch((e) => { replayState.error = (e as Error).message; replayState.status = 'failed'; })
       .finally(() => { clearInterval(hb); void ledger.releaseMaintenance(config.ledger.runId, mtToken).catch(() => {}); });
@@ -463,14 +471,25 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     const acceptUnscoped = req.body?.acceptUnscoped === true;
     const tokenFc = mtTokenFc;
     // a renewal that finds the token GONE means the lease expired and was
-    // taken over — the check must not publish a verdict from its reads
+    // taken over — the check must not publish a verdict from its reads. The
+    // interval only keeps the lease fresh; the DECISION POINTS revalidate
+    // ownership synchronously, so a connectivity-blinded pod cannot publish
+    // between takeover and its next successful beat (unverifiable = lost).
     const leaseFc = { lost: false };
+    const probeFc = async (): Promise<boolean> => {
+      if (leaseFc.lost) return true;
+      try {
+        const ok = await ledger.renewMaintenance(config.ledger.runId, tokenFc);
+        if (!ok) leaseFc.lost = true;
+        return !ok;
+      } catch { return true; }
+    };
     const hbFc = setInterval(() => {
       void ledger.renewMaintenance(config.ledger.runId, tokenFc)
         .then((ok) => { if (!ok) leaseFc.lost = true; })
-        .catch(() => { /* transient — the next beat retries; a real takeover returns false once MongoDB answers */ });
+        .catch(() => { /* keep-fresh only — decision points revalidate synchronously */ });
     }, 60_000);
-    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep, acceptUnscoped, leaseLost: () => leaseFc.lost })
+    void runFinalCheck({ config, logger, ledger, dlq, hashResolver, orchestrator }, finalCheckState, { cutoverMs, samples, deep, acceptUnscoped, leaseLost: probeFc })
       .finally(() => { clearInterval(hbFc); maintenanceOp = null; void ledger.releaseMaintenance(config.ledger.runId, tokenFc).catch(() => {}); });
     launchedFc = true;
     return { started: true, cutoverMs, samples, deep, acceptUnscoped };
@@ -546,12 +565,20 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     }
     const tokenDd = mtTokenDd;
     const leaseDd = { lost: false };
+    const probeDd = async (): Promise<boolean> => {
+      if (leaseDd.lost) return true;
+      try {
+        const ok = await ledger.renewMaintenance(config.ledger.runId, tokenDd);
+        if (!ok) leaseDd.lost = true;
+        return !ok;
+      } catch { return true; } // unverifiable ownership before a delete = abort
+    };
     const hbDd = setInterval(() => {
       void ledger.renewMaintenance(config.ledger.runId, tokenDd)
         .then((ok) => { if (!ok) leaseDd.lost = true; })
-        .catch(() => { /* transient — the next beat retries; a real takeover returns false once MongoDB answers */ });
+        .catch(() => { /* keep-fresh only — decision points revalidate synchronously */ });
     }, 60_000);
-    void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct, expectedFingerprint: execute ? dedupeState.lastDryRun?.fingerprint ?? null : null, leaseLost: () => leaseDd.lost })
+    void runDedupeOverlap({ config, logger, hashResolver, ledger }, dedupeState, { fromMs: fromMs as number, toMs: toMs as number, execute, slackPct, expectedFingerprint: execute ? dedupeState.lastDryRun?.fingerprint ?? null : null, leaseLost: probeDd })
       .finally(() => { clearInterval(hbDd); maintenanceOp = null; void ledger.releaseMaintenance(config.ledger.runId, tokenDd).catch(() => {}); });
     launchedDd = true;
     return { started: true, execute, fromMs, toMs };
@@ -814,7 +841,9 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     boundaryApplied = null;
     Object.assign(boundaryState, newBoundaryProgress(), { status: 'running', startedAt: Date.now() });
     void detectBoundary({
-      config, logger, db: mongoReader.getDatabase(), staging, ledger,
+      // PRIMARY reads: a lagging secondary's empty interval must never
+      // classify as an ingestion-pause gap
+      config, logger, db: mongoReader.getPrimaryDatabase(), staging, ledger,
       progress: boundaryState, bandMinutes: req.body?.bandMinutes,
     })
       .then((report) => { boundaryState.report = report; boundaryState.status = 'completed'; boundaryState.finishedAt = Date.now(); })
@@ -847,7 +876,9 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     boundaryApplied = null;
     Object.assign(boundaryState, newBoundaryProgress(), { status: 'running', startedAt: Date.now() });
     void detectBoundary({
-      config, logger, db: mongoReader.getDatabase(), staging, ledger,
+      // PRIMARY reads: a lagging secondary's empty interval must never
+      // classify as an ingestion-pause gap
+      config, logger, db: mongoReader.getPrimaryDatabase(), staging, ledger,
       progress: boundaryState, bandMinutes: req.body?.bandMinutes,
     })
       .then(async (report) => {

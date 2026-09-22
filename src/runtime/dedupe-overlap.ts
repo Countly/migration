@@ -100,7 +100,7 @@ const MAX_BUCKET_IDS = 3_000_000;
 export async function runDedupeOverlap(
   deps: { config: Config; logger: Logger; hashResolver: HashResolver; ledger?: LedgerStore },
   state: DedupeOverlapState,
-  opts: { fromMs: number; toMs: number; execute: boolean; slackPct?: number; expectedFingerprint?: string | null; leaseLost?: () => boolean },
+  opts: { fromMs: number; toMs: number; execute: boolean; slackPct?: number; expectedFingerprint?: string | null; leaseLost?: () => boolean | Promise<boolean> },
 ): Promise<void> {
   const { config, hashResolver } = deps;
   const logger = deps.logger.child({ component: 'DedupeOverlap' });
@@ -224,7 +224,7 @@ export async function runDedupeOverlap(
           // Within one command the exposure is milliseconds; an attach takes
           // a chunk's full read-transform-insert-verify cycle.
           for (let i = 0; i < observed.length; i += StagingManager.ID_PARAM_PAGE) {
-            if (opts.leaseLost?.()) {
+            if (await opts.leaseLost?.()) {
               throw new Error('the cluster-wide maintenance reservation was LOST mid-execute (this pod stalled past its expiry and another operation may have started) — aborted before the next delete page');
             }
             if (deps.ledger && fpBefore !== null) {
@@ -281,7 +281,7 @@ export async function runDedupeOverlap(
     }
     // a run that lost the reservation may have interleaved with another
     // maintenance operation — its counts must neither stand nor license
-    if (opts.leaseLost?.()) {
+    if (await opts.leaseLost?.()) {
       throw new Error('the cluster-wide maintenance reservation was LOST during this run (this pod stalled past its expiry) — counts may interleave with another maintenance operation; re-run');
     }
     state.status = 'completed';
