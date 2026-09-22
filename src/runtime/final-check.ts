@@ -65,7 +65,7 @@ interface ContentAuditRunner {
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }>;
   verifyMigration(upToMs?: number | null): Promise<Record<string, unknown>>;
-  snapshotSourceState(): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number }>>;
+  snapshotSourceState(upToMs?: number | null): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number }>>;
 }
 
 /**
@@ -194,15 +194,17 @@ export async function runFinalCheck(
       }
     }
 
-    // deep with NO cutover claims a FROZEN source — prove it by bracketing:
-    // the recount snapshots each collection's high cd at ITS start and can
-    // never see documents accepted afterwards, so any source advance across
-    // the deep phase voids the authorization. (With a cutover the recount is
-    // clamped and post-cutover writes are excluded by construction.)
+    // The deep recount snapshots each collection at ITS start and can never
+    // see documents accepted afterwards — so the WHOLE deep phase is
+    // bracketed by source snapshots. Unbounded: the full source must stay
+    // frozen. Bounded: the audited prefix (cd < cutover, plus null-cd docs)
+    // must stay frozen — post-cutover traffic is free to continue, but a
+    // backdated pre-cutover repair or delete mid-check voids the
+    // authorization exactly like an unbounded append would.
     let sourceBefore: Array<{ collection: string; maxCd: number; n: number; cdSum: number }> | null = null;
-    if (deep && cutoverMs === null) {
-      out.phase = 'snapshotting the source (frozen-source proof)';
-      sourceBefore = await deps.orchestrator.snapshotSourceState();
+    if (deep) {
+      out.phase = 'snapshotting the source (stability proof)';
+      sourceBefore = await deps.orchestrator.snapshotSourceState(cutoverMs);
     }
 
     // ── 3b. DEEP tier: full source recount + cd-checksum fingerprint ──────
@@ -291,12 +293,14 @@ export async function runFinalCheck(
 
     // ── Frozen-source proof (unbounded deep): the closing bracket ─────────
     if (sourceBefore !== null) {
-      out.phase = 'confirming the source stayed frozen during the check';
-      const grew = sourceAdvanced(sourceBefore, await deps.orchestrator.snapshotSourceState());
+      out.phase = 'confirming the audited source data stayed frozen during the check';
+      const grew = sourceAdvanced(sourceBefore, await deps.orchestrator.snapshotSourceState(cutoverMs));
       if (grew.length > 0) {
-        out.problems.push(`The SOURCE MUTATED while the deep check ran (${grew.join(', ')}) — it is not frozen (ingestion, retention or repairs are still writing), so an unbounded recount cannot authorize teardown. Freeze the old cluster (or pass a cutoverMs boundary) and run the deep check again.`);
+        out.problems.push(cutoverMs === null
+          ? `The SOURCE MUTATED while the deep check ran (${grew.join(', ')}) — it is not frozen (ingestion, retention or repairs are still writing), so an unbounded recount cannot authorize teardown. Freeze the old cluster (or pass a cutoverMs boundary) and run the deep check again.`
+          : `The AUDITED PREFIX of the source (cd < cutover) MUTATED while the deep check ran (${grew.join(', ')}) — backdated writes, repairs or deletions landed below the cutover mid-check, so this recount cannot authorize teardown. Stop pre-cutover repairs/imports and run the deep check again.`);
       } else {
-        out.passes.push('Frozen-source bracket held: exact per-collection count and cd checksum unchanged across the whole deep check.');
+        out.passes.push('Source-stability bracket held: exact per-collection count and cd checksum of the audited data unchanged across the whole deep check.');
       }
     }
 

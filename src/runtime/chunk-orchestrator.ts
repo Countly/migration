@@ -1542,26 +1542,39 @@ export class ChunkOrchestrator {
    * it, and a snapshot the recount took at its start cannot see documents
    * accepted afterwards.
    */
-  async snapshotSourceState(): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number }>> {
+  async snapshotSourceState(upToMs: number | null = null): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number }>> {
     const db = this.d.mongoReader.getDatabase();
     const collections = await discoverCollections(db, this.d.config.source.collectionPrefix, this.logger);
     const out: Array<{ collection: string; maxCd: number; n: number; cdSum: number }> = [];
+    // A bounded check audits only cd < upToMs — its bracket must watch that
+    // same prefix (a backdated pre-cutover repair is exactly as invisible to
+    // an already-finished recount as an unbounded append). Null-cd docs are
+    // audited in both modes, so they are always in the snapshot.
+    const prefix = upToMs !== null
+      ? { $or: [{ cd: { $lt: new Date(upToMs) } }, { cd: null }] }
+      : {};
     for (const name of collections) {
-      const [top] = await db.collection(name).find({ cd: { $type: 'date' } })
+      const [top] = await db.collection(name)
+        .find(upToMs !== null ? { cd: { $type: 'date', $lt: new Date(upToMs) } } : { cd: { $type: 'date' } })
         .sort({ cd: -1 }).limit(1).project({ cd: 1 }).toArray();
-      // EXACT count + order-free cd checksum (same mod space as the window
-      // fingerprints): a backdated insert, a delete, or an insert+delete
-      // pair all move at least one of these even when max-cd and estimated
-      // counts stay put. Only a cd-preserving in-place update is invisible —
-      // out of scope for an append-only event store.
+      // EXACT count + order-free cd checksum: a backdated insert, a delete,
+      // or an insert+delete pair all move at least one of these even when
+      // max-cd and estimated counts stay put. Only a cd-preserving in-place
+      // update is invisible — out of scope for an append-only event store.
+      // Inputs are reduced mod 2^26 so the accumulating $sum stays an EXACT
+      // Long even on 10B-row collections (a raw or 2^32-residue sum promotes
+      // to double past ~4e9 docs and Number() would round low bits away),
+      // and the final $mod happens server-side, like the window checksums.
       const [agg] = await db.collection(name).aggregate([
+        ...(upToMs !== null ? [{ $match: prefix }] : []),
         {
           $group: {
             _id: null,
             n: { $sum: 1 },
-            cdSum: { $sum: { $mod: [{ $convert: { input: '$cd', to: 'long', onError: 0, onNull: 0 } }, 4294967296] } },
+            cdSum: { $sum: { $mod: [{ $convert: { input: '$cd', to: 'long', onError: 0, onNull: 0 } }, 67108864] } },
           },
         },
+        { $project: { n: 1, cdSum: { $mod: ['$cdSum', 4294967296] } } },
       ]).toArray();
       out.push({
         collection: name,

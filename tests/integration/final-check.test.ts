@@ -247,10 +247,13 @@ describe('final check: the interpreted sign-off', () => {
     const out = await check({ cutoverMs: null, orchestrator: advancing });
     expect(out.verdict).toBe('FAIL');
     expect(out.problems.some((pr) => pr.includes('SOURCE MUTATED'))).toBe(true);
-    // with a cutover the recount is clamped — no bracket, no probes
+    // bounded checks bracket the AUDITED PREFIX (cd < cutover): a backdated
+    // pre-cutover write mid-check voids the authorization too
     probes = 0;
-    await check({ cutoverMs: CUTOVER, orchestrator: advancing });
-    expect(probes).toBe(0);
+    const outBounded = await check({ cutoverMs: CUTOVER, orchestrator: advancing });
+    expect(probes).toBe(2);
+    expect(outBounded.verdict).toBe('FAIL');
+    expect(outBounded.problems.some((pr) => pr.includes('AUDITED PREFIX'))).toBe(true);
   });
 
   it('content mismatch and failed chunks each FAIL with their own action line', async () => {
