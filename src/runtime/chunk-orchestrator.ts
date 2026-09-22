@@ -2016,7 +2016,7 @@ export class ChunkOrchestrator {
    * redo-then-replay cannot duplicate.
    */
   async replayDlq(leaseLost?: () => boolean | Promise<boolean>): Promise<{ replayed: number; stillFailing: number; alreadyLive: number }> {
-    const { dlq, staging, retryPolicy, config } = this.d;
+    const { dlq, staging, config } = this.d;
     // Dry run must never write the live table: replay rehearses against the
     // Null-engine table (full parse/type validation, nothing stored) —
     // field bug: a dry-run replay wrote real rows that the actual run would
@@ -2058,41 +2058,69 @@ export class ChunkOrchestrator {
         }
       }
 
-      // Skip rows already live as (_id, cd) pairs — a chunk redo with a
-      // fixed transform migrates DLQ'd docs from the source; replaying them
-      // on top would duplicate. Marked resolved: the doc IS migrated.
-      if (rows.length > 0 && !this.dryRun) {
-        const cdVals = rows.map(cdMsOf);
-        // SCOPED presence, per collection: a SIBLING collection's row with
-        // the same (_id, cd) pair must not stand in for this collection's
-        // replay row — resolving on it would silently skip a needed insert.
-        // Unscopable collections keep the table-wide check (same reduced
-        // evidence the audits document for them).
+      // SCOPED live-pair lookup, per collection: a SIBLING collection's row
+      // with the same (_id, cd) pair must never stand in for this
+      // collection's row. Unscopable collections keep the table-wide check
+      // (same reduced evidence the audits document for them).
+      const liveMapFor = async (subRows: OutputRow[], subColls: string[]): Promise<Map<string, number>> => {
         const liveCd = new Map<string, number>();
         const rowsByColl = new Map<string, number[]>();
-        for (let j = 0; j < rows.length; j++) {
-          const a = rowsByColl.get(colls[j]) ?? [];
+        for (let j = 0; j < subRows.length; j++) {
+          const a = rowsByColl.get(subColls[j]) ?? [];
           a.push(j);
-          rowsByColl.set(colls[j], a);
+          rowsByColl.set(subColls[j], a);
         }
         for (const [collName, idxs] of rowsByColl) {
           const defs = this.d.hashResolver.resolveCollectionName(collName, config.source.collectionPrefix);
           const scope = defs ? chScopeOf(defs) : null;
-          const cds = idxs.map((j) => cdVals[j]);
+          const cds = idxs.map((j) => cdMsOf(subRows[j]));
           const sub = await staging.fetchLiveCdByIds(
-            idxs.map((j) => rows[j]._id),
+            idxs.map((j) => subRows[j]._id),
             { loMs: Math.min(...cds), hiMs: Math.max(...cds) },
             scope,
           );
           for (const [k, v] of sub) liveCd.set(`${collName}\u0000${k}`, v);
         }
+        return liveCd;
+      };
+
+      // Idempotent-by-reconciliation insert: an acknowledgement-ambiguous
+      // insert is never blindly re-sent to the live table — every retry
+      // first re-reads which (_id, cd) pairs are already live (scoped) and
+      // sends only the absent remainder, so a lost ack cannot double-store
+      // a batch even where insert deduplication is inert.
+      const insertAbsent = async (subRows: OutputRow[], subColls: string[], tag: string): Promise<void> => {
+        if (this.dryRun) { await staging.insertIntoLive(subRows, tag, replayTarget); return; }
+        let pending = subRows.map((r, j) => ({ r, c: subColls[j] }));
+        let lastErr: unknown = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          if (attempt > 0) {
+            const live = await liveMapFor(pending.map((x) => x.r), pending.map((x) => x.c));
+            pending = pending.filter(({ r, c }) => live.get(`${c}\u0000${r._id}`) !== cdMsOf(r));
+            if (pending.length === 0) return; // the "failed" insert actually landed
+            await sleep(1_000 * attempt);
+          }
+          try {
+            await staging.insertIntoLive(pending.map((x) => x.r), `${tag}:a${attempt}`, replayTarget);
+            return;
+          } catch (err) { lastErr = err; }
+        }
+        throw lastErr;
+      };
+
+      // Skip rows already live as (_id, cd) pairs — a chunk redo with a
+      // fixed transform migrates DLQ'd docs from the source; replaying them
+      // on top would duplicate. Marked resolved: the doc IS migrated.
+      if (rows.length > 0 && !this.dryRun) {
+        const liveCd = await liveMapFor(rows, colls);
         const keep: OutputRow[] = [];
         const keepIds: string[] = [];
+        const keepColls: string[] = [];
         const resolvedIds: string[] = [];
         for (let j = 0; j < rows.length; j++) {
           const cdMs = Date.parse(rows[j].cd.replace(' ', 'T') + 'Z');
           if (liveCd.get(`${colls[j]}\u0000${rows[j]._id}`) === cdMs) { resolvedIds.push(ids[j]); }
-          else { keep.push(rows[j]); keepIds.push(ids[j]); }
+          else { keep.push(rows[j]); keepIds.push(ids[j]); keepColls.push(colls[j]); }
         }
         if (resolvedIds.length > 0) {
           await dlq.markResolved(resolvedIds, config.transform.version + ' (already live — no insert)');
@@ -2100,6 +2128,7 @@ export class ChunkOrchestrator {
         }
         rows.length = 0; rows.push(...keep);
         ids.length = 0; ids.push(...keepIds);
+        colls.length = 0; colls.push(...keepColls);
       }
       if (rows.length === 0) { this.syncReplayProgress(replayed, stillFailing, alreadyLive); continue; }
       // Durable INTENT before any insert: a replayed row's window will be
@@ -2111,20 +2140,15 @@ export class ChunkOrchestrator {
       // A failed intent write aborts the batch untouched (fail closed).
       if (!this.dryRun) await dlq.markReplayIntent(ids);
       try {
-        await retryPolicy.execute(
-          () => staging.insertIntoLive(rows, `dlqreplay:${batchKey}`, replayTarget),
-          `dlq-replay-${batchKey}`,
-          this.logger,
-          undefined,
-          classifyError,
-        );
+        await insertAbsent(rows, colls, `dlqreplay:${batchKey}`);
         await dlq.markResolved(ids, config.transform.version);
         replayed += rows.length;
       } catch (err) {
-        // Isolate row-level failures within the replay batch too.
+        // Isolate row-level failures within the replay batch too — each row
+        // goes through the same idempotent-by-reconciliation insert.
         for (let j = 0; j < rows.length; j++) {
           try {
-            await staging.insertIntoLive([rows[j]], `dlqreplay:${batchKey}:${j}`, replayTarget);
+            await insertAbsent([rows[j]], [colls[j]], `dlqreplay:${batchKey}:${j}`);
             await dlq.markResolved([ids[j]], config.transform.version);
             replayed++;
           } catch (rowErr) {
