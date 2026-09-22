@@ -206,6 +206,20 @@ describe('tee-boundary detection + sync parity', () => {
     expect(await ledger.clearApplyMarker(RM, 'hb1')).toBe(true);
     expect(await ledger.renewApplyMarker(RM, 'hb1')).toBe(false); // cleared = gone
 
+    // prune writes are ownership-fenced: a zombie apply whose marker was
+    // taken over must not resume its destructive writes
+    const RZ = 'marker-fence-1';
+    await mc.db(DB).collection('mig_ranges').insertOne({
+      _id: 'rz:1', run_id: RZ, collection: 'c', idx: 0, lower_cd: 500, upper_cd: 600,
+      status: 'pending', attempts: 0, created_at: new Date(), updated_at: new Date(),
+    } as never);
+    expect(await ledger.acquireApplyMarker(RZ, 'ownerB')).toBe(true);
+    await expect(ledger.pruneBeyondBound(RZ, 100, undefined, 'zombieA')).rejects.toThrow('taken over');
+    expect(await mc.db(DB).collection('mig_ranges').countDocuments({ _id: 'rz:1' } as never)).toBe(1); // untouched
+    const rz = await ledger.pruneBeyondBound(RZ, 100, undefined, 'ownerB'); // the rightful owner prunes
+    expect(rz.deleted).toBe(1);
+    expect(await ledger.clearApplyMarker(RZ, 'ownerB')).toBe(true);
+
     const RMM = 'maint-1';
     expect((await ledger.acquireMaintenance(RMM, 'final-check', 't1')).acquired).toBe(true);
     expect(await ledger.acquireMaintenance(RMM, 'dedupe', 't2')).toEqual({ acquired: false, holder: 'final-check' });

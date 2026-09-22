@@ -1542,17 +1542,32 @@ export class ChunkOrchestrator {
    * it, and a snapshot the recount took at its start cannot see documents
    * accepted afterwards.
    */
-  async snapshotSourceState(): Promise<Array<{ collection: string; maxCd: number; est: number }>> {
+  async snapshotSourceState(): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number }>> {
     const db = this.d.mongoReader.getDatabase();
     const collections = await discoverCollections(db, this.d.config.source.collectionPrefix, this.logger);
-    const out: Array<{ collection: string; maxCd: number; est: number }> = [];
+    const out: Array<{ collection: string; maxCd: number; n: number; cdSum: number }> = [];
     for (const name of collections) {
       const [top] = await db.collection(name).find({ cd: { $type: 'date' } })
         .sort({ cd: -1 }).limit(1).project({ cd: 1 }).toArray();
+      // EXACT count + order-free cd checksum (same mod space as the window
+      // fingerprints): a backdated insert, a delete, or an insert+delete
+      // pair all move at least one of these even when max-cd and estimated
+      // counts stay put. Only a cd-preserving in-place update is invisible —
+      // out of scope for an append-only event store.
+      const [agg] = await db.collection(name).aggregate([
+        {
+          $group: {
+            _id: null,
+            n: { $sum: 1 },
+            cdSum: { $sum: { $mod: [{ $convert: { input: '$cd', to: 'long', onError: 0, onNull: 0 } }, 4294967296] } },
+          },
+        },
+      ]).toArray();
       out.push({
         collection: name,
         maxCd: top?.cd instanceof Date ? top.cd.getTime() : 0,
-        est: await db.collection(name).estimatedDocumentCount(),
+        n: Number(agg?.n ?? 0),
+        cdSum: Number(agg?.cdSum ?? 0),
       });
     }
     return out;

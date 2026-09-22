@@ -863,7 +863,7 @@ export class LedgerStore {
    * Refuses when any non-pending chunk reaches past the bound — that data
    * (possibly) already moved and needs purge tooling, not a config flip.
    */
-  async pruneBeyondBound(runId: string, boundMs: number, receiptSink?: (r: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }) => void | Promise<void>): Promise<{
+  async pruneBeyondBound(runId: string, boundMs: number, receiptSink?: (r: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> }) => void | Promise<void>, ownerToken?: string): Promise<{
     deleted: number; clamped: number;
     /** What the prune changed, verbatim — a raced apply restores it. */
     restore: { deletedChunks: ChunkDoc[]; clampedChunks: Array<{ _id: string; upper_cd: number }> };
@@ -890,6 +890,13 @@ export class LedgerStore {
     // awaited: a sink that persists the receipt durably must finish BEFORE
     // the destructive writes below — its failure aborts the prune untouched
     await receiptSink?.({ deletedChunks, clampedChunks });
+    // Ownership fence: a pod that stalled past the marker expiry INSIDE this
+    // call must not resume writing after a takeover recovered its journal —
+    // the renewal doubles as the check and shrinks the zombie window from
+    // the whole prune to the instant before each destructive write.
+    if (ownerToken !== undefined && !(await this.renewApplyMarker(runId, ownerToken))) {
+      throw new Error('the apply marker was taken over — prune aborted before its destructive delete');
+    }
     const del = await this.c().deleteMany({
       _id: { $in: deletedChunks.map((c) => c._id) }, status: 'pending',
     });
@@ -897,6 +904,9 @@ export class LedgerStore {
     // snapshot must not be modified outside the receipt (a rollback would
     // leave it truncated under a rejected bound) — the insert-path
     // self-prune and the post-claim fence own anything newer
+    if (ownerToken !== undefined && !(await this.renewApplyMarker(runId, ownerToken))) {
+      throw new Error('the apply marker was taken over — prune aborted before its destructive clamp');
+    }
     const clamp = await this.c().updateMany(
       { _id: { $in: clampedChunks.map((c) => c._id) }, status: 'pending' },
       { $set: { upper_cd: boundMs, updated_at: new Date() } },

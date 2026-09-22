@@ -667,7 +667,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         await ledger.journalPruneReceipt(config.ledger.runId, applyToken, r);
         restores.push(r);
       };
-      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, journalSink);
+      const pruned = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, journalSink, applyToken);
       if (markerLost) throw new Error('the apply marker was taken over mid-apply (this process stalled past the marker expiry) — aborted before storing the bound; the takeover governs now');
       // Compare-and-set against the prior bound this call validated: two
       // concurrent applies cannot both win — the loser rolls its prune back.
@@ -697,7 +697,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
       // no half-applied state and no grid gaps, whichever step failed.
       try {
         if (markerLost) throw new Error('the apply marker was taken over mid-apply (this process stalled past the marker expiry) — rolling back; the takeover governs now');
-        const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, journalSink);
+        const pruned2 = await ledger.pruneBeyondBound(config.ledger.runId, boundMs, journalSink, applyToken);
         const claimsAfter = await ledger.activeClaims(config.ledger.runId);
         if (claimsAfter.length > 0) {
           throw new Error(`pods claimed chunks during apply (${claimsAfter.map((c) => `${c.pod}×${c.count}`).join(', ')})`);

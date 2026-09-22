@@ -65,19 +65,24 @@ interface ContentAuditRunner {
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }>;
   verifyMigration(upToMs?: number | null): Promise<Record<string, unknown>>;
-  snapshotSourceState(): Promise<Array<{ collection: string; maxCd: number; est: number }>>;
+  snapshotSourceState(): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number }>>;
 }
 
-/** Collections whose source state advanced between two snapshots — a new collection counts as an advance. Exported for tests. */
+/**
+ * Collections whose source MUTATED between two snapshots — a new collection,
+ * a higher max cd, or ANY change in the exact count or the order-free cd
+ * checksum (which catches backdated inserts, deletes, and insert+delete
+ * pairs that leave the count unchanged). Exported for tests.
+ */
 export function sourceAdvanced(
-  before: Array<{ collection: string; maxCd: number; est: number }>,
-  after: Array<{ collection: string; maxCd: number; est: number }>,
+  before: Array<{ collection: string; maxCd: number; n: number; cdSum: number }>,
+  after: Array<{ collection: string; maxCd: number; n: number; cdSum: number }>,
 ): string[] {
   const b = new Map(before.map((s) => [s.collection, s]));
   const grew: string[] = [];
   for (const a of after) {
     const prev = b.get(a.collection);
-    if (!prev || a.maxCd > prev.maxCd || a.est > prev.est) grew.push(a.collection);
+    if (!prev || a.maxCd > prev.maxCd || a.n !== prev.n || a.cdSum !== prev.cdSum) grew.push(a.collection);
   }
   return grew;
 }
@@ -187,7 +192,7 @@ export async function runFinalCheck(
     // never see documents accepted afterwards, so any source advance across
     // the deep phase voids the authorization. (With a cutover the recount is
     // clamped and post-cutover writes are excluded by construction.)
-    let sourceBefore: Array<{ collection: string; maxCd: number; est: number }> | null = null;
+    let sourceBefore: Array<{ collection: string; maxCd: number; n: number; cdSum: number }> | null = null;
     if (deep && cutoverMs === null) {
       out.phase = 'snapshotting the source (frozen-source proof)';
       sourceBefore = await deps.orchestrator.snapshotSourceState();
@@ -282,9 +287,9 @@ export async function runFinalCheck(
       out.phase = 'confirming the source stayed frozen during the check';
       const grew = sourceAdvanced(sourceBefore, await deps.orchestrator.snapshotSourceState());
       if (grew.length > 0) {
-        out.problems.push(`The SOURCE ADVANCED while the deep check ran (${grew.join(', ')}) — old-side ingestion is not stopped, so an unbounded recount cannot authorize teardown. Stop ingestion into the old cluster (or pass a cutoverMs boundary) and run the deep check again.`);
+        out.problems.push(`The SOURCE MUTATED while the deep check ran (${grew.join(', ')}) — it is not frozen (ingestion, retention or repairs are still writing), so an unbounded recount cannot authorize teardown. Freeze the old cluster (or pass a cutoverMs boundary) and run the deep check again.`);
       } else {
-        out.passes.push('Frozen-source bracket held: no collection gained documents while the deep check ran.');
+        out.passes.push('Frozen-source bracket held: exact per-collection count and cd checksum unchanged across the whole deep check.');
       }
     }
 
