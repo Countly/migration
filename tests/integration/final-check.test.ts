@@ -50,7 +50,9 @@ const chRow = (id: string, cdMs: number): Record<string, unknown> => ({
 const contentClean = {
   contentAudit: async (samples = 500) => ({ sampled: samples, matched: samples, missing: 0, different: 0, mismatches: [] }),
   verifyMigration: async () => ({ ok: true, mismatches: [], migrationDuplicates: 0 }),
-  snapshotSourceState: async () => [] as Array<{ collection: string; maxCd: number; n: number; cdSum: number }>,
+  snapshotSourceState: async () => [] as Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }>,
+  ledgerMaxUpperCd: async () => CUTOVER + 3_600_000,
+  snapshotTargetState: async () => ({ n: 0, sumCd: 0 }),
 };
 
 describe('final check: the interpreted sign-off', () => {
@@ -225,11 +227,21 @@ describe('final check: the interpreted sign-off', () => {
 
   it('the mutation bracket flags a collection that DISAPPEARED mid-check', async () => {
     const { sourceAdvanced } = await import('../../src/runtime/final-check.ts');
-    const snapA = [{ collection: 'c1', maxCd: 10, n: 5, cdSum: 100 }, { collection: 'c2', maxCd: 20, n: 3, cdSum: 60 }];
+    const snapA = [{ collection: 'c1', maxCd: 10, n: 5, cdSum: 100, idSum: 40 }, { collection: 'c2', maxCd: 20, n: 3, cdSum: 60, idSum: 30 }];
     expect(sourceAdvanced(snapA, [snapA[0]])).toEqual(['c2']);          // dropped mid-check
     expect(sourceAdvanced(snapA, snapA)).toEqual([]);                    // frozen
     expect(sourceAdvanced(snapA, [snapA[0], { ...snapA[1], cdSum: 61 }])).toEqual(['c2']); // checksum-only change
     expect(sourceAdvanced(snapA, [snapA[0], { ...snapA[1], n: 2 }])).toEqual(['c2']);      // delete (count down)
+    // identity swap: equal count, max-cd and time checksum — only _id hash moves
+    expect(sourceAdvanced(snapA, [snapA[0], { ...snapA[1], idSum: 31 }])).toEqual(['c2']);
+  });
+
+  it('a target mutation mid-check (rows deleted or inserted in the audited range) FAILs both tiers', async () => {
+    let tprobes = 0;
+    const shifting = { ...contentClean, snapshotTargetState: async () => ({ n: 1_000 - tprobes++, sumCd: 9 }) };
+    const out = await check({ cutoverMs: CUTOVER, deep: false, orchestrator: shifting });
+    expect(out.verdict).toBe('FAIL');
+    expect(out.problems.some((pr) => pr.includes('TARGET changed'))).toBe(true);
   });
 
   it('a check that lost the cluster-wide maintenance lease can never publish a PASS', async () => {
@@ -242,7 +254,7 @@ describe('final check: the interpreted sign-off', () => {
     let probes = 0;
     const advancing = {
       ...contentClean,
-      snapshotSourceState: async () => [{ collection: 'drill_events_probe', maxCd: 1_000, n: 100, cdSum: 5_000 + probes++ }],
+      snapshotSourceState: async () => [{ collection: 'drill_events_probe', maxCd: 1_000, n: 100, cdSum: 5_000 + probes++, idSum: 7 }],
     };
     const out = await check({ cutoverMs: null, orchestrator: advancing });
     expect(out.verdict).toBe('FAIL');

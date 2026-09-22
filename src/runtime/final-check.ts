@@ -65,7 +65,9 @@ interface ContentAuditRunner {
     mismatches: Array<{ _id: string; collection: string; kind: string; fields?: string[] }>;
   }>;
   verifyMigration(upToMs?: number | null): Promise<Record<string, unknown>>;
-  snapshotSourceState(upToMs?: number | null): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number }>>;
+  snapshotSourceState(upToMs?: number | null): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }>>;
+  ledgerMaxUpperCd(): Promise<number>;
+  snapshotTargetState(upToMs: number): Promise<{ n: number; sumCd: number }>;
 }
 
 /**
@@ -78,15 +80,15 @@ interface ContentAuditRunner {
  * tests.
  */
 export function sourceAdvanced(
-  before: Array<{ collection: string; maxCd: number; n: number; cdSum: number }>,
-  after: Array<{ collection: string; maxCd: number; n: number; cdSum: number }>,
+  before: Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }>,
+  after: Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }>,
 ): string[] {
   const b = new Map(before.map((s) => [s.collection, s]));
   const seen = new Set(after.map((s) => s.collection));
   const grew: string[] = [];
   for (const a of after) {
     const prev = b.get(a.collection);
-    if (!prev || a.maxCd > prev.maxCd || a.n !== prev.n || a.cdSum !== prev.cdSum) grew.push(a.collection);
+    if (!prev || a.maxCd > prev.maxCd || a.n !== prev.n || a.cdSum !== prev.cdSum || a.idSum !== prev.idSum) grew.push(a.collection);
   }
   for (const prev of before) {
     if (!seen.has(prev.collection)) grew.push(prev.collection);
@@ -201,11 +203,22 @@ export async function runFinalCheck(
     // must stay frozen — post-cutover traffic is free to continue, but a
     // backdated pre-cutover repair or delete mid-check voids the
     // authorization exactly like an unbounded append would.
-    let sourceBefore: Array<{ collection: string; maxCd: number; n: number; cdSum: number }> | null = null;
+    let sourceBefore: Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }> | null = null;
     if (deep) {
       out.phase = 'snapshotting the source (stability proof)';
       sourceBefore = await deps.orchestrator.snapshotSourceState(cutoverMs);
     }
+
+    // TARGET bracket, BOTH tiers: audited target rows must not change while
+    // this check reads them. A ClickHouse mutation cannot be fenced by
+    // ownership (a zombie dedupe delete surviving a lease takeover does not
+    // move the ledger fingerprint), but it cannot escape this bracket:
+    // whoever wrote, the count or cd checksum over the audited range moves
+    // and the verdict refuses to stand. Post-cutover (or post-ledger-max)
+    // native traffic stays outside the bracket.
+    out.phase = 'snapshotting the target (audit-stability proof)';
+    const targetHi = cutoverMs ?? await deps.orchestrator.ledgerMaxUpperCd();
+    const targetBefore = await deps.orchestrator.snapshotTargetState(targetHi);
 
     // ── 3b. DEEP tier: full source recount + cd-checksum fingerprint ──────
     const audit = newRebuildProgress();
@@ -309,6 +322,17 @@ export async function runFinalCheck(
     const fpAfter = await ledger.runFingerprint(runId);
     if (fpAfter !== fpBefore) {
       out.problems.push('The run\'s chunk state CHANGED while this check ran (a retry, top-up or remap landed mid-check) — every layer above measured a moving target. Let the run settle, then run this check again.');
+    }
+
+    // ── Target bracket: did the audited target rows stay put? ─────────────
+    {
+      out.phase = 'confirming the audited target rows did not change during the check';
+      const targetAfter = await deps.orchestrator.snapshotTargetState(targetHi);
+      if (targetAfter.n !== targetBefore.n || targetAfter.sumCd !== targetBefore.sumCd) {
+        out.problems.push(`The TARGET changed under this check (audited cd range: ${targetBefore.n} rows → ${targetAfter.n}) — rows were inserted or deleted mid-audit (a concurrent dedupe/replay, a nightly cleanup job, or an external writer). Every layer above measured a moving target; stop target-mutating jobs and run the check again.`);
+      } else {
+        out.passes.push('Target-stability bracket held: audited row count and cd checksum unchanged across the whole check.');
+      }
     }
 
     // ── Reservation: did this pod keep the cluster-wide lease throughout? ─

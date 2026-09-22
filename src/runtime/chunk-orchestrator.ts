@@ -1542,13 +1542,13 @@ export class ChunkOrchestrator {
    * it, and a snapshot the recount took at its start cannot see documents
    * accepted afterwards.
    */
-  async snapshotSourceState(upToMs: number | null = null): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number }>> {
+  async snapshotSourceState(upToMs: number | null = null): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }>> {
     // PRIMARY reads: the recount audits the primary's view — a bracket read
     // from a lagging secondary could miss the very mutation it exists to
     // catch and compare equal across the check
     const db = this.d.mongoReader.getPrimaryDatabase();
     const collections = await discoverCollections(db, this.d.config.source.collectionPrefix, this.logger);
-    const out: Array<{ collection: string; maxCd: number; n: number; cdSum: number }> = [];
+    const out: Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }> = [];
     // A bounded check audits only cd < upToMs — its bracket must watch that
     // same prefix (a backdated pre-cutover repair is exactly as invisible to
     // an already-finished recount as an unbounded append). Null-cd docs are
@@ -1560,33 +1560,57 @@ export class ChunkOrchestrator {
       const [top] = await db.collection(name)
         .find(upToMs !== null ? { cd: { $type: 'date', $lt: new Date(upToMs) } } : { cd: { $type: 'date' } })
         .sort({ cd: -1 }).limit(1).project({ cd: 1 }).toArray();
-      // EXACT count + order-free cd checksum: a backdated insert, a delete,
-      // or an insert+delete pair all move at least one of these even when
-      // max-cd and estimated counts stay put. Only a cd-preserving in-place
-      // update is invisible — out of scope for an append-only event store.
-      // Inputs are reduced mod 2^26 so the accumulating $sum stays an EXACT
-      // Long even on 10B-row collections (a raw or 2^32-residue sum promotes
-      // to double past ~4e9 docs and Number() would round low bits away),
-      // and the final $mod happens server-side, like the window checksums.
+      // EXACT count + TWO order-free checksums: a time checksum over
+      // cd-else-ts (null-cd docs contribute their ts, not zero), and an
+      // IDENTITY checksum over hashed _ids — a delete+insert swap of two
+      // null-cd docs with equal ts moves the identity sum even when count,
+      // max-cd and the time sum all stay put. Inputs are reduced mod 2^26 so
+      // the accumulating $sum stays an EXACT Long even on 10B-row
+      // collections (a raw or 2^32-residue sum promotes to double past ~4e9
+      // docs and Number() would round low bits away); the final $mod happens
+      // server-side, like the window checksums. $toHashedIndexKey needs
+      // MongoDB 4.4+ — on older servers the aggregation errors and the deep
+      // check FAILS loudly instead of skipping the bracket (fail closed).
       const [agg] = await db.collection(name).aggregate([
         ...(upToMs !== null ? [{ $match: prefix }] : []),
         {
           $group: {
             _id: null,
             n: { $sum: 1 },
-            cdSum: { $sum: { $mod: [{ $convert: { input: '$cd', to: 'long', onError: 0, onNull: 0 } }, 67108864] } },
+            cdSum: { $sum: { $mod: [{ $convert: { input: { $ifNull: ['$cd', '$ts'] }, to: 'long', onError: 0, onNull: 0 } }, 67108864] } },
+            idSum: { $sum: { $mod: [{ $abs: { $toHashedIndexKey: { $toString: '$_id' } } }, 67108864] } },
           },
         },
-        { $project: { n: 1, cdSum: { $mod: ['$cdSum', 4294967296] } } },
+        { $project: { n: 1, cdSum: { $mod: ['$cdSum', 4294967296] }, idSum: { $mod: ['$idSum', 4294967296] } } },
       ]).toArray();
       out.push({
         collection: name,
         maxCd: top?.cd instanceof Date ? top.cd.getTime() : 0,
         n: Number(agg?.n ?? 0),
         cdSum: Number(agg?.cdSum ?? 0),
+        idSum: Number(agg?.idSum ?? 0),
       });
     }
     return out;
+  }
+
+  /** Highest chunk upper_cd across the run — the audited region's ceiling when no cutover is given. */
+  async ledgerMaxUpperCd(): Promise<number> {
+    const all = await this.d.ledger.listAll(this.runId);
+    return all.reduce((m, c) => Math.max(m, c.upper_cd), 0);
+  }
+
+  /**
+   * One TARGET snapshot: row count + order-free cd checksum over the audited
+   * cd range, table-wide. The final check brackets itself with two of these:
+   * a mutation of audited target rows mid-check (a zombie dedupe delete
+   * surviving a lease takeover, a stray replay, any external write) cannot
+   * be fenced at the ClickHouse level, but it CANNOT escape this bracket
+   * either — whoever wrote, the count or checksum moves and the verdict
+   * refuses to stand.
+   */
+  async snapshotTargetState(upToMs: number): Promise<{ n: number; sumCd: number }> {
+    return this.d.staging.countAndSumLiveCdRange(0, upToMs, null);
   }
 
   /** Drop staging tables orphaned by crash-between-done-and-drop. */
