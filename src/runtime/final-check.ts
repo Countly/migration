@@ -68,6 +68,7 @@ interface ContentAuditRunner {
   snapshotSourceState(upToMs?: number | null): Promise<Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }>>;
   ledgerMaxUpperCd(): Promise<number>;
   snapshotTargetState(upToMs: number): Promise<{ n: number; sumCd: number }>;
+  snapshotSweepTargetPairs(): Promise<string[]>;
 }
 
 /**
@@ -219,6 +220,10 @@ export async function runFinalCheck(
     out.phase = 'snapshotting the target (audit-stability proof)';
     const targetHi = cutoverMs ?? await deps.orchestrator.ledgerMaxUpperCd();
     const targetBefore = await deps.orchestrator.snapshotTargetState(targetHi);
+    // null-cd sweep rows land at ts-derived cds that can lie BEYOND the
+    // ceiling — bracket their exact live pair set separately, without
+    // admitting unrelated post-cutover traffic
+    const sweepBefore = await deps.orchestrator.snapshotSweepTargetPairs();
 
     // ── 3b. DEEP tier: full source recount + cd-checksum fingerprint ──────
     const audit = newRebuildProgress();
@@ -328,10 +333,14 @@ export async function runFinalCheck(
     {
       out.phase = 'confirming the audited target rows did not change during the check';
       const targetAfter = await deps.orchestrator.snapshotTargetState(targetHi);
-      if (targetAfter.n !== targetBefore.n || targetAfter.sumCd !== targetBefore.sumCd) {
-        out.problems.push(`The TARGET changed under this check (audited cd range: ${targetBefore.n} rows → ${targetAfter.n}) — rows were inserted or deleted mid-audit (a concurrent dedupe/replay, a nightly cleanup job, or an external writer). Every layer above measured a moving target; stop target-mutating jobs and run the check again.`);
+      const sweepAfter = await deps.orchestrator.snapshotSweepTargetPairs();
+      const sweepMoved = sweepAfter.length !== sweepBefore.length || sweepAfter.some((k, i) => k !== sweepBefore[i]);
+      if (targetAfter.n !== targetBefore.n || targetAfter.sumCd !== targetBefore.sumCd || sweepMoved) {
+        out.problems.push(sweepMoved && targetAfter.n === targetBefore.n && targetAfter.sumCd === targetBefore.sumCd
+          ? `The TARGET's null-cd SWEEP rows changed under this check (${sweepBefore.length} live pairs → ${sweepAfter.length}, or different pairs) — audited rows moved mid-check; stop target-mutating jobs and run the check again.`
+          : `The TARGET changed under this check (audited cd range: ${targetBefore.n} rows → ${targetAfter.n}) — rows were inserted or deleted mid-audit (a concurrent dedupe/replay, a nightly cleanup job, or an external writer). Every layer above measured a moving target; stop target-mutating jobs and run the check again.`);
       } else {
-        out.passes.push('Target-stability bracket held: audited row count and cd checksum unchanged across the whole check.');
+        out.passes.push('Target-stability bracket held: audited row count, cd checksum and sweep pair set unchanged across the whole check.');
       }
     }
 

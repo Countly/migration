@@ -53,6 +53,7 @@ const contentClean = {
   snapshotSourceState: async () => [] as Array<{ collection: string; maxCd: number; n: number; cdSum: number; idSum: number }>,
   ledgerMaxUpperCd: async () => CUTOVER + 3_600_000,
   snapshotTargetState: async () => ({ n: 0, sumCd: 0 }),
+  snapshotSweepTargetPairs: async () => [] as string[],
 };
 
 describe('final check: the interpreted sign-off', () => {
@@ -242,6 +243,14 @@ describe('final check: the interpreted sign-off', () => {
     const out = await check({ cutoverMs: CUTOVER, deep: false, orchestrator: shifting });
     expect(out.verdict).toBe('FAIL');
     expect(out.problems.some((pr) => pr.includes('TARGET changed'))).toBe(true);
+  });
+
+  it('a sweep-row mutation beyond the ceiling FAILs even when the ranged bracket holds', async () => {
+    let sp = 0;
+    const sweepShift = { ...contentClean, snapshotSweepTargetPairs: async () => [`c\u0000n_x\u0000${1_000 + sp++}`] };
+    const out = await check({ cutoverMs: CUTOVER, deep: false, orchestrator: sweepShift });
+    expect(out.verdict).toBe('FAIL');
+    expect(out.problems.some((pr) => pr.includes('SWEEP rows changed'))).toBe(true);
   });
 
   it('a check that lost the cluster-wide maintenance lease can never publish a PASS', async () => {

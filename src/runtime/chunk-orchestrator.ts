@@ -1613,6 +1613,35 @@ export class ChunkOrchestrator {
     return this.d.staging.countAndSumLiveCdRange(0, upToMs, null);
   }
 
+  /**
+   * The LIVE audited sweep pairs, as sorted keys: null-cd documents land at
+   * ts-derived cds that can lie BEYOND the cutover / ledger ceiling, so the
+   * range-bounded target bracket cannot see them — this companion bracket
+   * compares the exact live pair set instead, without admitting unrelated
+   * post-cutover traffic.
+   */
+  async snapshotSweepTargetPairs(): Promise<string[]> {
+    const db = this.d.mongoReader.getPrimaryDatabase();
+    const collections = await discoverCollections(db, this.d.config.source.collectionPrefix, this.logger);
+    const keys: string[] = [];
+    for (const name of collections) {
+      const pairs: Array<{ id: string; cdMs: number }> = [];
+      const cursor = db.collection(name).find({ cd: null }, { projection: { _id: 1, ts: 1 } }).batchSize(10_000);
+      for await (const doc of cursor) {
+        const tsMs = toEpochMillis(doc.ts);
+        if (tsMs !== null && tsMs > 0) pairs.push({ id: String(doc._id), cdMs: clampDateTime64(tsMs) });
+        if (pairs.length > 1_000_000) throw new Error(`${name}: more than 1,000,000 null-cd documents — not outliers`);
+      }
+      if (pairs.length === 0) continue;
+      const defs = this.d.hashResolver.resolveCollectionName(name, this.d.config.source.collectionPrefix);
+      const scope = defs ? chScopeOf(defs) : null;
+      for (const p of await this.d.staging.filterLivePairs(pairs, scope)) {
+        keys.push(`${name}\u0000${p.id}\u0000${p.cdMs}`);
+      }
+    }
+    return keys.sort();
+  }
+
   /** Drop staging tables orphaned by crash-between-done-and-drop. */
   private async sweepOrphanStaging(collection: string): Promise<void> {
     if (this.dryRun) return;
@@ -2058,12 +2087,15 @@ export class ChunkOrchestrator {
         }
       }
 
-      // SCOPED live-pair lookup, per collection: a SIBLING collection's row
-      // with the same (_id, cd) pair must never stand in for this
-      // collection's row. Unscopable collections keep the table-wide check
-      // (same reduced evidence the audits document for them).
-      const liveMapFor = async (subRows: OutputRow[], subColls: string[]): Promise<Map<string, number>> => {
-        const liveCd = new Map<string, number>();
+      // SCOPED, PAIR-EXACT live lookup per collection: a SIBLING collection's
+      // row must never stand in for this collection's, and a native retry
+      // sharing the _id at ANOTHER cd must never shadow the exact pair (an
+      // id-to-single-cd map keeps one arbitrary row per id — the correct
+      // pair could read absent and be inserted twice). Unscopable
+      // collections keep the table-wide check (same reduced evidence the
+      // audits document for them).
+      const livePairSet = async (subRows: OutputRow[], subColls: string[]): Promise<Set<string>> => {
+        const live = new Set<string>();
         const rowsByColl = new Map<string, number[]>();
         for (let j = 0; j < subRows.length; j++) {
           const a = rowsByColl.get(subColls[j]) ?? [];
@@ -2073,15 +2105,12 @@ export class ChunkOrchestrator {
         for (const [collName, idxs] of rowsByColl) {
           const defs = this.d.hashResolver.resolveCollectionName(collName, config.source.collectionPrefix);
           const scope = defs ? chScopeOf(defs) : null;
-          const cds = idxs.map((j) => cdMsOf(subRows[j]));
-          const sub = await staging.fetchLiveCdByIds(
-            idxs.map((j) => subRows[j]._id),
-            { loMs: Math.min(...cds), hiMs: Math.max(...cds) },
-            scope,
-          );
-          for (const [k, v] of sub) liveCd.set(`${collName}\u0000${k}`, v);
+          const pairs = idxs.map((j) => ({ id: subRows[j]._id, cdMs: cdMsOf(subRows[j]) }));
+          for (const p of await staging.filterLivePairs(pairs, scope)) {
+            live.add(`${collName}\u0000${p.id}\u0000${p.cdMs}`);
+          }
         }
-        return liveCd;
+        return live;
       };
 
       // Idempotent-by-reconciliation insert: an acknowledgement-ambiguous
@@ -2095,8 +2124,8 @@ export class ChunkOrchestrator {
         let lastErr: unknown = null;
         for (let attempt = 0; attempt < 5; attempt++) {
           if (attempt > 0) {
-            const live = await liveMapFor(pending.map((x) => x.r), pending.map((x) => x.c));
-            pending = pending.filter(({ r, c }) => live.get(`${c}\u0000${r._id}`) !== cdMsOf(r));
+            const live = await livePairSet(pending.map((x) => x.r), pending.map((x) => x.c));
+            pending = pending.filter(({ r, c }) => !live.has(`${c}\u0000${r._id}\u0000${cdMsOf(r)}`));
             if (pending.length === 0) return; // the "failed" insert actually landed
             await sleep(1_000 * attempt);
           }
@@ -2112,14 +2141,13 @@ export class ChunkOrchestrator {
       // fixed transform migrates DLQ'd docs from the source; replaying them
       // on top would duplicate. Marked resolved: the doc IS migrated.
       if (rows.length > 0 && !this.dryRun) {
-        const liveCd = await liveMapFor(rows, colls);
+        const live = await livePairSet(rows, colls);
         const keep: OutputRow[] = [];
         const keepIds: string[] = [];
         const keepColls: string[] = [];
         const resolvedIds: string[] = [];
         for (let j = 0; j < rows.length; j++) {
-          const cdMs = Date.parse(rows[j].cd.replace(' ', 'T') + 'Z');
-          if (liveCd.get(`${colls[j]}\u0000${rows[j]._id}`) === cdMs) { resolvedIds.push(ids[j]); }
+          if (live.has(`${colls[j]}\u0000${rows[j]._id}\u0000${cdMsOf(rows[j])}`)) { resolvedIds.push(ids[j]); }
           else { keep.push(rows[j]); keepIds.push(ids[j]); keepColls.push(colls[j]); }
         }
         if (resolvedIds.length > 0) {
