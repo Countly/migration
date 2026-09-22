@@ -473,7 +473,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     expect(clean.mismatchedWindows.length).toBe(0);
   }, 60_000);
 
-  it('a replayed DLQ row bumps its done chunk\'s rows_expected — strict verify stays green after the documented replay workflow', async () => {
+  it('a replayed DLQ row carries a durable replay_inserted flag — strict verify discounts it and stays green', async () => {
     const srcTs = BASE + 55 * 60_000 + 30_000; // inside a migrated window, between existing docs
     const rawDoc = { _id: 'rp_replay', uid: 'r1', did: 'dr', ts: srcTs, cd: new Date(srcTs), sg: { v: 1 }, c: 1 };
     // the doc failed during migration: present in the source, absent in CH
@@ -490,8 +490,13 @@ describe('multi-collection scoping + ledger rebuild', () => {
     const res = await orchestrator.replayDlq();
     expect(res.replayed).toBe(1);
 
+    // the ledger is untouched — verification derives the discount from the
+    // resolved entry's durable replay_inserted flag instead
     const chunkAfter = await mc.db(DB).collection('mig_ranges').findOne({ _id: chunkBefore!._id } as never);
-    expect(chunkAfter!.rows_expected).toBe((chunkBefore!.rows_expected as number) + 1);
+    expect(chunkAfter!.rows_expected).toBe(chunkBefore!.rows_expected as number);
+    const entry = await mc.db(DB).collection('mig_dlq_docs').findOne({ _id: `${RUN}:rp_replay` } as never);
+    expect(entry!.status).toBe('resolved');
+    expect(entry!.replay_inserted).toBe(true);
     // the repaired window is NOT reported as an over-count
     const verifyAfter = await orchestrator.verifyMigration();
     expect((verifyAfter.mismatches as Array<{ chunk: string }>).map((m) => m.chunk))

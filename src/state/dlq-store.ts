@@ -32,6 +32,8 @@ export interface DlqDoc {
    * land in any window anyway).
    */
   cd_ms: number | null;
+  /** Set (while still pending) right before a REPLAY inserts this entry's row — verification discounts resolved replay-inserted rows from window expectations, which chunk-computed rows_expected excludes. */
+  replay_inserted?: boolean;
   status: DlqStatus;
   resolved_by_version: string | null;
   created_at: Date;
@@ -201,6 +203,37 @@ export class DlqStore {
       ])
       .toArray();
     return rows.map((r) => ({ error: r._id, n: r.n }));
+  }
+
+  /**
+   * Durable pre-insert intent: these entries' rows are about to be inserted
+   * by REPLAY, not by a chunk. Written while the entry is still PENDING so
+   * every crash ordering converges: crash before the insert = a plain retry;
+   * crash after it = the retry's already-live path resolves the entry WITH
+   * the flag and verification discounts the row.
+   */
+  async markReplayIntent(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.c().updateMany({ _id: { $in: ids } }, { $set: { replay_inserted: true, updated_at: new Date() } });
+  }
+
+  /** Total resolved replay-inserted entries for a collection — lets verification skip per-window queries in the common no-replay case. */
+  async countReplayInserted(runId: string, collection: string): Promise<number> {
+    return this.c().countDocuments({ run_id: runId, collection, status: 'resolved', replay_inserted: true });
+  }
+
+  /**
+   * Resolved replay-inserted rows in a regular window: they live in the
+   * window but rows_expected (computed when the doc was DLQ'd) excludes
+   * them. Date-cd docs only — a replayed null-cd doc's row is already
+   * subtracted by the verification's sweep index.
+   */
+  async countReplayInsertedInWindow(runId: string, collection: string, lowerCdMs: number, upperCdMs: number): Promise<number> {
+    return this.c().countDocuments({
+      run_id: runId, collection, status: 'resolved', replay_inserted: true,
+      'raw_doc.cd': { $type: 'date' },
+      cd_ms: { $gte: lowerCdMs, $lt: upperCdMs },
+    });
   }
 
   async markResolved(ids: string[], version: string): Promise<void> {

@@ -715,7 +715,16 @@ export class LedgerStore {
    * cleans up its own delta before the claim loop can drain it.
    */
   async prunePendingBeyondStoredBound(runId: string): Promise<number> {
-    const bound = await this.getStoredBound(runId);
+    // While an apply is mid-flight the stored bound may be PROVISIONAL and
+    // this cleanup keeps no receipt — a rollback could never restore what it
+    // deletes (and a collection whose regulars all died here while its
+    // null-cd sentinel survived would never remap). The marker is acquired
+    // BEFORE the store, so applying=false means the bound read is settled;
+    // deferring costs nothing: the apply's own prune, the post-claim fence,
+    // and the next map pass all cover the interim.
+    const state = await this.getBoundState(runId);
+    if (state.applying) return 0;
+    const bound = state.boundMs;
     if (bound === null) return 0;
     const del = await this.c().deleteMany({ run_id: runId, lower_cd: { $gte: bound }, status: 'pending' });
     await this.c().updateMany(
@@ -903,25 +912,6 @@ export class LedgerStore {
       });
     }
     await this.pj().insertMany(docs);
-  }
-
-  /**
-   * A replayed DLQ row now lives inside a done chunk's window — bump that
-   * chunk's expectation so the strict verification stays an equality after
-   * the documented replay workflow, instead of reporting the repaired
-   * window as an over-count forever. Rows whose cd no done regular chunk
-   * covers are skipped: nobody verifies those windows.
-   */
-  async incReplayExpected(runId: string, collection: string, cdMsList: number[]): Promise<number> {
-    let applied = 0;
-    for (const cdMs of cdMsList) {
-      const r = await this.c().updateOne(
-        { run_id: runId, collection, status: 'done', lower_cd: { $gte: 0, $lte: cdMs }, upper_cd: { $gt: cdMs } },
-        { $inc: { rows_expected: 1 }, $set: { updated_at: new Date() } },
-      );
-      if (r.modifiedCount > 0) applied++;
-    }
-    return applied;
   }
 
   /** Number of prune-journal entries for a run — non-zero means unsettled destructive work. */

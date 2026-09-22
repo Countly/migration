@@ -482,7 +482,17 @@ export class ChunkOrchestrator {
       // mapping or top-up pass is not observed until claiming begins.
       while (this.paused && !this.stopping) await sleep(1_000);
       if (this.stopping) break;
-      const storedBound = await this.d.ledger.getStoredBound(this.runId).catch(() => null);
+      const boundState = await this.d.ledger.getBoundState(this.runId)
+        .catch(() => ({ boundMs: null, token: null, applying: true }));
+      if (boundState.applying) {
+        // an apply is mid-flight (or the state is unreadable): the stored
+        // bound may be provisional — adopt/drop/prune decisions wait for a
+        // settled read on the next pass; nothing here may act on it
+        this.logger.info('Bound apply in flight — deferring bound adoption to the next map pass');
+        await sleep(1_000);
+        continue;
+      }
+      const storedBound = boundState.boundMs;
       if (storedBound !== null) {
         if (envBound !== null && envBound !== storedBound) {
           const msg = `bound conflict: LEDGER_CD_UPPER_BOUND=${envBound} but the run stores ${storedBound} — refusing to guess with duplication at stake`;
@@ -1935,28 +1945,6 @@ export class ChunkOrchestrator {
     let stillFailing = 0;
     let alreadyLive = 0;
     const cdMsOf = (r: OutputRow): number => Date.parse(r.cd.replace(' ', 'T') + 'Z');
-    // A replayed row lands INSIDE a done chunk's window, whose rows_expected
-    // was computed after subtracting the DLQ'd doc — without bumping it the
-    // strict verification reports every repaired window as an over-count and
-    // the documented replay workflow can never reach a sign-off verdict.
-    // Only regular date-cd docs need it: sweep sentinels compare with < (a
-    // replayed sweep row is subtracted from regular windows by the verify's
-    // sweep index), and windows nobody verifies need no adjustment.
-    const bumpExpected = async (ms: Array<{ collection: string; cdMs: number; regular: boolean }>): Promise<void> => {
-      if (this.dryRun) return;
-      const byColl = new Map<string, number[]>();
-      for (const m of ms) {
-        if (!m.regular) continue;
-        const a = byColl.get(m.collection) ?? [];
-        a.push(m.cdMs);
-        byColl.set(m.collection, a);
-      }
-      for (const [collection, cds] of byColl) {
-        await this.d.ledger.incReplayExpected(this.runId, collection, cds).catch((e: Error) => {
-          this.logger.error({ collection, rows: cds.length, err: e.message }, 'Replayed rows inserted but rows_expected could not be updated — verification will report these windows as over-counts; note them against the replay receipt');
-        });
-      }
-    };
     this.replayProgress.running = true;
     Object.assign(this.replayProgress, { processed: 0, replayed: 0, stillFailing: 0, alreadyLive: 0 });
     try {
@@ -1974,14 +1962,10 @@ export class ChunkOrchestrator {
       this.replayProgress.processed += batch.length;
       const rows: OutputRow[] = [];
       const ids: string[] = [];
-      const metas: Array<{ collection: string; cdMs: number; regular: boolean }> = [];
       for (const entry of batch) {
         const defaults = this.d.hashResolver.resolveCollectionName(entry.collection, config.source.collectionPrefix) ?? undefined;
         const { row } = transformDocument(entry.raw_doc as SourceDocument, defaults, this.coercions);
-        if (row) {
-          rows.push(row); ids.push(entry._id);
-          metas.push({ collection: entry.collection, cdMs: cdMsOf(row), regular: (entry.raw_doc as { cd?: unknown }).cd instanceof Date });
-        }
+        if (row) { rows.push(row); ids.push(entry._id); }
         else {
           await dlq.recordRetryError(entry._id, 'still fails transform under ' + config.transform.version);
           stillFailing++;
@@ -1999,12 +1983,11 @@ export class ChunkOrchestrator {
         );
         const keep: OutputRow[] = [];
         const keepIds: string[] = [];
-        const keepMetas: Array<{ collection: string; cdMs: number; regular: boolean }> = [];
         const resolvedIds: string[] = [];
         for (let j = 0; j < rows.length; j++) {
           const cdMs = Date.parse(rows[j].cd.replace(' ', 'T') + 'Z');
           if (liveCd.get(rows[j]._id) === cdMs) { resolvedIds.push(ids[j]); }
-          else { keep.push(rows[j]); keepIds.push(ids[j]); keepMetas.push(metas[j]); }
+          else { keep.push(rows[j]); keepIds.push(ids[j]); }
         }
         if (resolvedIds.length > 0) {
           await dlq.markResolved(resolvedIds, config.transform.version + ' (already live — no insert)');
@@ -2012,9 +1995,16 @@ export class ChunkOrchestrator {
         }
         rows.length = 0; rows.push(...keep);
         ids.length = 0; ids.push(...keepIds);
-        metas.length = 0; metas.push(...keepMetas);
       }
       if (rows.length === 0) { this.syncReplayProgress(replayed, stillFailing, alreadyLive); continue; }
+      // Durable INTENT before any insert: a replayed row's window will be
+      // over-expected by the strict verification unless it can tell the row
+      // apart from chunk-migrated ones. The flag is written while the entry
+      // is still pending, so every failure ordering converges: crash before
+      // insert = a plain retry; crash after insert = the retry's already-live
+      // path resolves the entry WITH the flag, and verification discounts it.
+      // A failed intent write aborts the batch untouched (fail closed).
+      if (!this.dryRun) await dlq.markReplayIntent(ids);
       try {
         await retryPolicy.execute(
           () => staging.insertIntoLive(rows, `dlqreplay:${batchKey}`, replayTarget),
@@ -2024,7 +2014,6 @@ export class ChunkOrchestrator {
           classifyError,
         );
         await dlq.markResolved(ids, config.transform.version);
-        await bumpExpected(metas);
         replayed += rows.length;
       } catch (err) {
         // Isolate row-level failures within the replay batch too.
@@ -2032,7 +2021,6 @@ export class ChunkOrchestrator {
           try {
             await staging.insertIntoLive([rows[j]], `dlqreplay:${batchKey}:${j}`, replayTarget);
             await dlq.markResolved([ids[j]], config.transform.version);
-            await bumpExpected([metas[j]]);
             replayed++;
           } catch (rowErr) {
             await dlq.recordRetryError(ids[j], (rowErr as Error).message.slice(0, 1_000));
@@ -2370,6 +2358,15 @@ export class ChunkOrchestrator {
         sweptCdsByCollection.set(chunk.collection, [...liveSweep.values()].sort((a, b) => a - b));
       }
 
+      // Replay-inserted rows: live in their windows, excluded from
+      // rows_expected (computed when the doc was DLQ'd). One count per
+      // collection decides whether per-window discounts are needed at all.
+      const replayInsByCollection = new Map<string, number>();
+      for (const collection of new Set(targets.map((c) => c.collection))) {
+        const n = await this.d.dlq.countReplayInserted(this.runId, collection);
+        if (n > 0) replayInsByCollection.set(collection, n);
+      }
+
       this.verifyProgress.phase = 'recounting chunk windows';
       // Bounded concurrency: each window count is minmax-pruned and cheap,
       // but a 10TB run has tens of thousands of them — sequential would take
@@ -2396,10 +2393,14 @@ export class ChunkOrchestrator {
             while (sLo < sHi) { const m = (sLo + sHi) >> 1; if (swept[m] < chunk.lower_cd) sLo = m + 1; else sHi = m; }
             for (let k = sLo; k < swept.length && swept[k] < chunk.upper_cd; k++) live--;
           }
-          const bad = live !== chunk.rows_expected;
+          let expected = chunk.rows_expected;
+          if (replayInsByCollection.has(chunk.collection)) {
+            expected += await this.d.dlq.countReplayInsertedInWindow(this.runId, chunk.collection, chunk.lower_cd, chunk.upper_cd);
+          }
+          const bad = live !== expected;
           checked++;
           this.verifyProgress.checked = checked;
-          if (bad) mismatches.push({ chunk: chunk._id, expected: chunk.rows_expected, live });
+          if (bad) mismatches.push({ chunk: chunk._id, expected, live });
         }
       }));
 
