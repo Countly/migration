@@ -2047,10 +2047,11 @@ export class ChunkOrchestrator {
       this.replayProgress.processed += batch.length;
       const rows: OutputRow[] = [];
       const ids: string[] = [];
+      const colls: string[] = [];
       for (const entry of batch) {
         const defaults = this.d.hashResolver.resolveCollectionName(entry.collection, config.source.collectionPrefix) ?? undefined;
         const { row } = transformDocument(entry.raw_doc as SourceDocument, defaults, this.coercions);
-        if (row) { rows.push(row); ids.push(entry._id); }
+        if (row) { rows.push(row); ids.push(entry._id); colls.push(entry.collection); }
         else {
           await dlq.recordRetryError(entry._id, 'still fails transform under ' + config.transform.version);
           stillFailing++;
@@ -2062,16 +2063,35 @@ export class ChunkOrchestrator {
       // on top would duplicate. Marked resolved: the doc IS migrated.
       if (rows.length > 0 && !this.dryRun) {
         const cdVals = rows.map(cdMsOf);
-        const liveCd = await staging.fetchLiveCdByIds(
-          rows.map((r) => r._id),
-          { loMs: Math.min(...cdVals), hiMs: Math.max(...cdVals) },
-        );
+        // SCOPED presence, per collection: a SIBLING collection's row with
+        // the same (_id, cd) pair must not stand in for this collection's
+        // replay row — resolving on it would silently skip a needed insert.
+        // Unscopable collections keep the table-wide check (same reduced
+        // evidence the audits document for them).
+        const liveCd = new Map<string, number>();
+        const rowsByColl = new Map<string, number[]>();
+        for (let j = 0; j < rows.length; j++) {
+          const a = rowsByColl.get(colls[j]) ?? [];
+          a.push(j);
+          rowsByColl.set(colls[j], a);
+        }
+        for (const [collName, idxs] of rowsByColl) {
+          const defs = this.d.hashResolver.resolveCollectionName(collName, config.source.collectionPrefix);
+          const scope = defs ? chScopeOf(defs) : null;
+          const cds = idxs.map((j) => cdVals[j]);
+          const sub = await staging.fetchLiveCdByIds(
+            idxs.map((j) => rows[j]._id),
+            { loMs: Math.min(...cds), hiMs: Math.max(...cds) },
+            scope,
+          );
+          for (const [k, v] of sub) liveCd.set(`${collName}\u0000${k}`, v);
+        }
         const keep: OutputRow[] = [];
         const keepIds: string[] = [];
         const resolvedIds: string[] = [];
         for (let j = 0; j < rows.length; j++) {
           const cdMs = Date.parse(rows[j].cd.replace(' ', 'T') + 'Z');
-          if (liveCd.get(rows[j]._id) === cdMs) { resolvedIds.push(ids[j]); }
+          if (liveCd.get(`${colls[j]}\u0000${rows[j]._id}`) === cdMs) { resolvedIds.push(ids[j]); }
           else { keep.push(rows[j]); keepIds.push(ids[j]); }
         }
         if (resolvedIds.length > 0) {
