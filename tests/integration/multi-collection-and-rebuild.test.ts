@@ -209,8 +209,8 @@ describe('multi-collection scoping + ledger rebuild', () => {
     await mc.db(DB).collection('mig_ranges').deleteMany({});
     await ch.command({
       query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
-              VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u_live', 'd_live', 'live_1', ${BASE + 40 * 86_400_000}, fromUnixTimestamp64Milli(${BASE + 40 * 86_400_000}))
-                   , ('${APP}', '[CLY]_custom', '${EV2}', 'u_live', 'd_live', 'live_2', ${BASE + 41 * 86_400_000}, fromUnixTimestamp64Milli(${BASE + 41 * 86_400_000}))`,
+              VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u_live', 'd_live', 'live_1', fromUnixTimestamp64Milli(${BASE + 40 * 86_400_000}), fromUnixTimestamp64Milli(${BASE + 40 * 86_400_000}))
+                   , ('${APP}', '[CLY]_custom', '${EV2}', 'u_live', 'd_live', 'live_2', fromUnixTimestamp64Milli(${BASE + 41 * 86_400_000}), fromUnixTimestamp64Milli(${BASE + 41 * 86_400_000}))`,
     });
 
     const progress = newRebuildProgress();
@@ -278,7 +278,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     // same event) — that shared ts month is what makes per-partition
     // duplicate scanning exact.
     const mk = (id: string, tsMs: number, cdMs: number) =>
-      `('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', '${id}', ${tsMs}, fromUnixTimestamp64Milli(${cdMs}))`;
+      `('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', '${id}', fromUnixTimestamp64Milli(${tsMs}), fromUnixTimestamp64Milli(${cdMs}))`;
     // 1) live at-least-once redelivery: same _id twice, NO migrated copy
     await ch.command({
       query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
@@ -305,7 +305,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     // (both written by migration — same doc migrated twice)
     await ch.command({
       query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
-              VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', 'p_6', ${BASE + 6 * 60_000}, fromUnixTimestamp64Milli(${BASE + 6 * 60_000 + 1}))`,
+              VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u_dup', 'd_dup', 'p_6', fromUnixTimestamp64Milli(${BASE + 6 * 60_000}), fromUnixTimestamp64Milli(${BASE + 6 * 60_000 + 1}))`,
     });
     verify = await orchestrator.verifyMigration();
     expect(verify.migrationDuplicates).toBe(1);
@@ -553,7 +553,7 @@ describe('multi-collection scoping + ledger rebuild', () => {
     // live retry copy: same _id, same ts (same partition), NOT migrated
     await ch.command({
       query: `INSERT INTO ${DB}.drill_events (a, e, n, uid, did, _id, ts, cd)
-              VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u', 'd', 'retry_victim', ${tsMs}, fromUnixTimestamp64Milli(${Date.now()}))`,
+              VALUES ('${APP}', '[CLY]_custom', '${EV1}', 'u', 'd', 'retry_victim', fromUnixTimestamp64Milli(${tsMs}), fromUnixTimestamp64Milli(${Date.now()}))`,
     });
     expect(await staging.countLiveMatchingStaged(stagingTable, partitionId)).toBe(0); // id-only matching: 1 → skipped attach → data loss
 
