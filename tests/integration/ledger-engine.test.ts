@@ -304,6 +304,8 @@ describe('ledger engine end-to-end', () => {
     ch = createClient({ url: CH_URL, password: CH_PASSWORD });
     await ch.command({ query: `CREATE DATABASE IF NOT EXISTS ${DB}` });
     await ch.command({ query: `DROP TABLE IF EXISTS ${DB}.drill_events` });
+    // countly-platform plugins/clickhouse/api/sql/01-drill_events.sql as
+    // shipped with ClickHouse 26.8 (codecs, cd index, object serialization).
     await ch.command({
       query: `CREATE TABLE ${DB}.drill_events (
         \`a\` LowCardinality(String), \`e\` LowCardinality(String), \`n\` String,
@@ -311,8 +313,16 @@ describe('ledger engine end-to-end', () => {
         \`_id\` String, \`ts\` DateTime64(3), \`up\` JSON(max_dynamic_paths = 32),
         \`custom\` Nullable(JSON(max_dynamic_paths = 0)), \`cmp\` Nullable(JSON(max_dynamic_paths = 0)),
         \`sg\` JSON(max_dynamic_paths = 0), \`c\` UInt32, \`s\` Float64, \`dur\` Float64,
-        \`lu\` Nullable(DateTime64(3)), \`cd\` DateTime64(3) DEFAULT now64(3))
-      ENGINE = MergeTree PARTITION BY toYYYYMM(ts, 'UTC') ORDER BY (a, e, n, ts)`,
+        \`lu\` Nullable(DateTime64(3)) CODEC (Delta, LZ4),
+        \`cd\` DateTime64(3) DEFAULT now64(3) CODEC (Delta, LZ4),
+        INDEX cd_minmax (cd) TYPE minmax GRANULARITY 1)
+      ENGINE = MergeTree PARTITION BY toYYYYMM(ts, 'UTC') ORDER BY (a, e, n, ts)
+      SETTINGS index_granularity = 8192,
+        object_serialization_version = 'v3',
+        object_shared_data_serialization_version = 'advanced',
+        object_shared_data_serialization_version_for_zero_level_parts = 'map_with_buckets',
+        object_shared_data_buckets_for_compact_part = 8,
+        object_shared_data_buckets_for_wide_part = 32`,
     });
 
     // Seed: clean docs + 3 transform-poisoned docs (bad ts) + 1 coercion doc
@@ -332,7 +342,8 @@ describe('ledger engine end-to-end', () => {
     }
     docs.push({
       _id: 'coerce_me', a: 'app1', e: 'big_int_event', uid: 'u9', did: 'd9',
-      ts: base + 1, cd: new Date(base + 1), sg: { order_id: 9.2e25, weird: Number.POSITIVE_INFINITY, user_ref: 5.2601586211929e19 }, c: 1,
+      ts: base + 1, cd: new Date(base + 1), lu: new Date(base + 2),
+      sg: { order_id: 9.2e25, weird: Number.POSITIVE_INFINITY, user_ref: 5.2601586211929e19 }, c: 1,
     });
     // Docs with no cd value — must be picked up by the null-cd sweep chunk
     docs.push({ _id: 'nocd_1', a: 'app1', e: 'legacy_event', uid: 'u1', did: 'd', ts: base - 86_400_000 });
@@ -393,6 +404,7 @@ describe('ledger engine end-to-end', () => {
   });
 
   it('migrates exactly: clean docs land once, poisoned docs go to DLQ with raw docs, coercions counted', async () => {
+    const runStartSec = Math.floor(Date.now() / 1000) - 1;
     await orchestrator.run();
 
     const res = await ch.query({
@@ -403,6 +415,47 @@ describe('ledger engine end-to-end', () => {
     // clean docs + coercion doc + 3 null-cd docs land; the 3 poisoned do not
     expect(Number(row.t)).toBe(CLEAN_DOCS + 4);
     expect(Number(row.u)).toBe(CLEAN_DOCS + 4); // zero duplicates
+
+    // Millisecond timestamps keep their value. From ClickHouse 26.8 a writer
+    // sending them as bare JSON numbers without
+    // input_format_read_datetime_number_as_raw_value=1 lands on 9999-12-31.
+    const dates = await ch.query({
+      query: `SELECT _id, toUnixTimestamp64Milli(ts) AS ts, toUnixTimestamp64Milli(cd) AS cd,
+                     toUnixTimestamp64Milli(lu) AS lu, _partition_id AS p
+              FROM ${DB}.drill_events WHERE _id IN ('doc_7', 'coerce_me', 'nocd_1') ORDER BY _id`,
+      format: 'JSONEachRow',
+    });
+    const base = Date.UTC(2026, 0, 1);
+    // Int64 comes back unquoted from 26.x (output_format_json_quote_64bit_integers=0), quoted before.
+    const num = (v: unknown): number | null => (v === null ? null : Number(v));
+    const got = (await dates.json<Record<string, unknown>>())
+      .map((r) => ({ _id: r._id, ts: num(r.ts), cd: num(r.cd), lu: num(r.lu), p: r.p }));
+    expect(got).toEqual([
+      { _id: 'coerce_me', ts: base + 1, cd: base + 1, lu: base + 2, p: '202601' },
+      { _id: 'doc_7', ts: base + 7 * 60_000, cd: base + 7 * 60_000, lu: null, p: '202601' },
+      { _id: 'nocd_1', ts: base - 86_400_000, cd: base - 86_400_000, lu: null, p: '202512' },
+    ]);
+    const poisoned = await ch.query({
+      query: `SELECT count() AS c FROM ${DB}.drill_events
+              WHERE toYear(ts) >= 9999 OR toYear(cd) >= 9999 OR toYear(assumeNotNull(lu)) >= 9999`,
+      format: 'JSONEachRow',
+    });
+    expect(Number((await poisoned.json<{ c: string }>())[0].c)).toBe(0);
+
+    // Every insert ran synchronously, whatever the server profile says
+    // (Countly's sets async_insert=1).
+    await ch.command({ query: 'SYSTEM FLUSH LOGS' });
+    const inserts = await ch.query({
+      query: `SELECT Settings['async_insert'] AS ai, count() AS c FROM system.query_log
+              WHERE type = 'QueryFinish' AND query_kind = 'Insert' AND has(databases, {db:String})
+                AND event_time >= toDateTime({since:UInt32})
+              GROUP BY ai`,
+      query_params: { db: DB, since: runStartSec },
+      format: 'JSONEachRow',
+    });
+    const byMode = await inserts.json<{ ai: string; c: string }>();
+    expect(byMode.map((r) => r.ai)).toEqual(['0']);
+    expect(Number(byMode[0].c)).toBeGreaterThan(0);
 
     // Null-cd docs arrived via the sweep chunk
     const nocd = await ch.query({

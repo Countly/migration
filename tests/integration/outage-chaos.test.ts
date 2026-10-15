@@ -124,7 +124,7 @@ describe.skipIf(!ENABLED)('backing-service outage chaos (CHAOS_OUTAGE=1, dedicat
     // dedicated throwaway services — NEVER the shared dev-stack containers
     sh(`docker rm -f ${MONGO_CTR} ${CH_CTR} 2>/dev/null || true`);
     const mongoImage = process.env.CHAOS_MONGO_IMAGE ?? 'mirror.gcr.io/library/mongo:8';
-    const chImage = process.env.CHAOS_CH_IMAGE ?? 'mirror.gcr.io/clickhouse/clickhouse-server:26.4';
+    const chImage = process.env.CHAOS_CH_IMAGE ?? 'mirror.gcr.io/clickhouse/clickhouse-server:26.8';
     sh(`docker run -d --name ${MONGO_CTR} -p 27117:27017 ${mongoImage}`);
     sh(`docker run -d --name ${CH_CTR} -p 8223:8123 -e CLICKHOUSE_PASSWORD=${CH_PASSWORD} ${chImage}`);
 

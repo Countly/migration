@@ -45,6 +45,17 @@ export class StagingManager {
       compression: { request: true },
       // Synchronous inserts: an acked insert is parsed, validated, and visible.
       clickhouse_settings: {
+        // Pinned, not inherited: Countly's ClickHouse runs its `default`
+        // profile with async_insert=1 (and wait_for_async_insert is an env
+        // knob there). With wait off an ack would precede the flush, and the
+        // verify-then-attach count right after it would race the buffer.
+        async_insert: 0,
+        // ts/lu/cd are sent as quoted 'yyyy-MM-dd HH:mm:ss.SSS' strings, never
+        // bare numbers: from ClickHouse 26.8 a bare number in JSON input for a
+        // DateTime64 column is read as seconds unless the session or profile
+        // sets input_format_read_datetime_number_as_raw_value=1 (a setting
+        // older servers reject), and a millisecond epoch lands on 9999-12-31.
+        // Strings parse the same on every version with or without it.
         date_time_input_format: 'best_effort',
         optimize_on_insert: 0,
         // Chunks are cut on cd (server insert time) but tables partition by

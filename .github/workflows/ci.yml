@@ -36,7 +36,7 @@ jobs:
         run: npx vitest run tests/differential
 
   integration:
-    name: Integration (MongoDB 7 + ClickHouse 26.4)
+    name: Integration (MongoDB 7 + ClickHouse 26.8)
     runs-on: ubuntu-latest
     services:
       mongo:
@@ -46,10 +46,13 @@ jobs:
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1})'"
           --health-interval 5s --health-timeout 5s --health-retries 30
       clickhouse:
-        # Production ClickHouse version (deploy/compose/images.standard.env
-        # in countly-platform). 26.4 requires a password for non-localhost
+        # Production ClickHouse minor (deploy/compose/components/clickhouse.yml
+        # in countly-platform; its floor is 26.8.6). The stock image has no
+        # Countly profile, so input_format_read_datetime_number_as_raw_value
+        # stays 0 here: the strictest case for the 26.8 DateTime64 change, as
+        # on an external ClickHouse. It requires a password for non-localhost
         # clients — the tests read TEST_CLICKHOUSE_PASSWORD.
-        image: clickhouse/clickhouse-server:26.4
+        image: clickhouse/clickhouse-server:26.8
         env:
           CLICKHOUSE_PASSWORD: ci-pass
         ports: ['8123:8123']
