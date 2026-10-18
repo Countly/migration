@@ -1,15 +1,31 @@
 name: Build and Push Docker Image
 
+# Releases publish semver tags. Pushes to main (and manual runs) publish a
+# main-<sha> tag instead, so a testable image exists without minting a public
+# release — the previous release-only trigger meant the only way to get an
+# image was to cut one.
 on:
   release:
     types: [published]
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'k8s/**'
+  workflow_dispatch:
 
 concurrency:
   group: docker-publish-${{ github.ref }}
   cancel-in-progress: true
 
+# Deliberately NOT countly-migration: that image holds the previous,
+# Redis-based migration service (tags up to 1.9.x). This service coordinates
+# through a chunk ledger in MongoDB instead, so it gets its own name and its
+# own tag series — otherwise `latest` would flip between two different
+# services and a chart default could silently pull the old one.
 env:
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/countly-migration
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/countly-drill-migrator
 
 jobs:
   build-and-push:
@@ -33,6 +49,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=sha,prefix=main-,enable={{is_default_branch}}
           flavor: |
             latest=auto
 
@@ -52,3 +69,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+
+      - name: Summary
+        run: |
+          echo "### Pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
