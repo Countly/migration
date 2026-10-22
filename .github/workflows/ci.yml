@@ -40,11 +40,12 @@ jobs:
         run: npx vitest run tests/unit
 
   integration:
-    name: Integration (MongoDB 7 + ClickHouse 26.8)
+    name: Integration (MongoDB 8.0 + ClickHouse 26.8)
     runs-on: ubuntu-latest
     services:
       mongo:
-        image: mongo:7
+        # The MongoDB line deployments run.
+        image: mongo:8.0
         ports: ['27017:27017']
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1})'"
