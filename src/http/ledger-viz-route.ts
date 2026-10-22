@@ -281,6 +281,13 @@ const PAGE = `<!doctype html>
     <div class="stat"><small>Failed chunks</small><b id="s-failed">–</b></div>
     <div class="stat"><small>ETA</small><b id="s-eta">–</b></div>
   </div>
+  <div id="index-progress" style="display:none;margin:-8px 0 12px 2px">
+    <div id="index-progress-title" style="font-weight:600;margin-bottom:4px"></div>
+    <div style="height:10px;border-radius:6px;background:var(--line);overflow:hidden">
+      <div id="index-progress-fill" style="height:100%;width:0%;background:var(--blue);transition:width .6s"></div>
+    </div>
+    <div id="index-progress-text" class="hint" style="margin-top:3px"></div>
+  </div>
   <div id="run-progress" style="display:none;margin:-8px 0 6px 2px">
     <div style="height:10px;border-radius:6px;background:var(--line);overflow:hidden">
       <div id="run-progress-fill" style="height:100%;width:0%;background:var(--green);transition:width .6s"></div>
@@ -696,25 +703,64 @@ async function buildIndexes(btn) {
   btn.disabled = true;
   try {
     const r = await fetch('/control/build-indexes', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then(x => x.json());
-    toast(r.started ? '\u2705 Index builds started (' + r.missing + ' collection(s))' : (r.missing === 0 ? '\u2705 All collections already indexed' : '\u26a0\ufe0f Build already running'));
+    toast(r.started
+      ? '\u2705 Index builds started (' + r.missing + ' collection(s)' + (r.inProgress ? ', ' + r.inProgress + ' already in progress' : '') + ')'
+      : (r.missing === 0 ? '\u2705 All collections already indexed' : '\u26a0\ufe0f Build already running'));
     pollIndexProgress();
   } catch (e) { toast('\u274c ' + e.message); }
   btn.disabled = false;
 }
-let idxTimer = null;
+function idxPhaseText(op, phases) {
+  return (op.phase ? 'step ' + op.phase + ' of ' + phases + ': ' : '') + op.phaseLabel +
+    (op.pct != null ? ' \u00b7 ' + op.pct + '% (' + fmt(op.done) + ' / ' + fmt(op.total) + ')' : '') +
+    // behind mongos each shard builds its own part; the run waits for the slowest
+    (op.shards > 1 ? ' \u00b7 slowest of ' + op.shards + ' shards still building: ' + op.shard
+      : (op.shard ? ' \u00b7 shard ' + op.shard : ''));
+}
+// Driven by slowTick: covers builds the run starts itself while mapping,
+// not only the ones started from the button.
 async function pollIndexProgress() {
   const p = await fetch('/api/index-progress').then(r => r.json()).catch(() => null);
   if (!p) return;
-  const el = document.getElementById('idx-progress');
+  const ops = p.serverOps || [];
   const rows = [];
   if (p.total > 0) rows.push('<div class="check"><span class="ic">' + (p.running ? '\u23f3' : (p.error ? '\u274c' : '\u2705')) + '</span><span class="lbl">' +
     p.done.length + '/' + p.total + ' built</span><span class="det">' + esc(p.current ? 'building: ' + p.current : (p.error || 'idle')) + '</span></div>');
-  for (const op of p.serverOps || []) {
-    rows.push('<div class="check"><span class="ic">\u23f3</span><span class="lbl">' + esc(op.collection) + '</span><span class="det">' + (op.pct != null ? op.pct + '%' : esc(op.msg || 'in progress')) + '</span></div>');
+  for (const op of ops) {
+    rows.push('<div class="check"><span class="ic">\u23f3</span><span class="lbl">' + esc(op.collection) + '</span><span class="det">' + esc(idxPhaseText(op, p.phases)) + '</span></div>');
   }
-  el.innerHTML = rows.join('');
-  if (p.running && !idxTimer) { idxTimer = setInterval(pollIndexProgress, 3000); }
-  if (!p.running && idxTimer) { clearInterval(idxTimer); idxTimer = null; }
+  document.getElementById('idx-progress').innerHTML = rows.join('');
+
+  // Overview bar: the build the run is blocked on first, then a button
+  // build, then any other in-flight build on the source db.
+  const box = document.getElementById('index-progress');
+  const target = p.auto ? p.auto.collection : (p.running && p.current ? p.current : (ops[0] ? ops[0].collection : null));
+  const op = target ? ops.find(o => o.collection === target) || null : null;
+  // ensureIndex on an already-built index returns in milliseconds \u2014 do not
+  // flash the bar for it
+  const blip = p.auto && !op && Date.now() - p.auto.startedAtMs < 3000;
+  document.getElementById('ph2-s').textContent = target && !blip ? 'building\u2026' : 'auto';
+  if (!target || blip) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  document.getElementById('index-progress-title').textContent = 'Building {cd:1,_id:1} index on ' + target +
+    (p.auto && p.auto.of ? ' \u2014 collection ' + p.auto.position + ' of ' + p.auto.of
+      : (!p.auto && p.running ? ' \u2014 ' + (p.done.length + 1) + ' of ' + p.total + ' (started from Guide step 2)' : ''));
+  const fill = document.getElementById('index-progress-fill');
+  if (op && op.pct != null) {
+    fill.style.width = op.pct + '%';
+    fill.style.animation = '';
+  } else {
+    fill.style.width = '100%';
+    fill.style.animation = 'pulse 1.2s ease-in-out infinite';
+  }
+  document.getElementById('index-progress-text').textContent =
+    (op ? idxPhaseText(op, p.phases)
+      : 'no server-side progress visible' + (p.serverOpsError ? ': ' + p.serverOpsError : ' (the build may run on another member)')) +
+    (p.auto ? ' \u00b7 waiting ' + fmtWait(Date.now() - p.auto.startedAtMs) + ' \u00b7 chunk copying starts once the index is ready' : '');
+}
+function fmtWait(ms) {
+  const m = Math.max(0, Math.floor(ms / 60000));
+  return m >= 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm' : (m > 0 ? m + 'm' : Math.floor(ms / 1000) + 's');
 }
 async function startDry(btn) {
   btn.disabled = true;
@@ -1305,6 +1351,7 @@ async function pollBoundary(btn) {
 // digits as a string, and unquoted they looked like a no-op in the UI
 function fmtVal(v) { return typeof v === 'string' ? '"' + esc(v) + '"' : esc(String(v)); }
 async function slowTick() {
+  pollIndexProgress().catch(() => {});
   try {
     const [dlq, report, replay] = await Promise.all([
       fetch('/api/dlq?offset=' + dlqOffset).then(r => r.json()),

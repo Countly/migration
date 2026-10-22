@@ -36,6 +36,7 @@ import { SkipCounter, SkipReason } from '../transform/skip-reasons.ts';
 import { CoercionCounter } from '../transform/coercions.ts';
 import { classifyError } from './error-classifier.ts';
 import { discoverCollections } from '../source/discover-collections.ts';
+import { parseIndexBuildOps, INDEX_BUILD_PHASES, type IndexBuildOp } from '../source/index-build-ops.ts';
 import type { Cursor } from '../types/cursor.ts';
 import { createHash } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -50,6 +51,14 @@ export interface ChunkOrchestratorDeps {
   retryPolicy: RetryPolicy;
   hashResolver: HashResolver;
   chPressure?: ClickHousePressure;
+}
+
+/** Mapping is blocked on this collection's {cd,_id} index (position/of: null outside the map pass). */
+export interface AutoIndexState {
+  collection: string;
+  position: number | null;
+  of: number | null;
+  startedAtMs: number;
 }
 
 export interface LedgerEngineStats {
@@ -534,9 +543,9 @@ export class ChunkOrchestrator {
           return !(d2 && skipEventNames.has(d2.e));
         });
       }
-      for (const collection of collections) {
+      for (const [i, collection] of collections.entries()) {
         if (this.stopping) break;
-        newChunks += await this.mapCollection(collection);
+        newChunks += await this.mapCollection(collection, { position: i + 1, of: collections.length });
       }
       if (mapPass === 0) {
         this.logger.info({ mapped: this.collectionDefaults.size }, 'All collections mapped — global claiming starts');
@@ -653,7 +662,7 @@ export class ChunkOrchestrator {
    * bounds, cut the chunk grid (+ null-cd sentinel), persist it idempotently.
    * No copying happens here — claims are global afterwards.
    */
-  private async mapCollection(collection: string): Promise<number> {
+  private async mapCollection(collection: string, at?: { position: number; of: number }): Promise<number> {
     const { config, mongoReader, ledger } = this.d;
     this.currentCollection = collection; // mapping progress visible in UI
     const log = this.logger.child({ collection });
@@ -662,7 +671,16 @@ export class ChunkOrchestrator {
     if (!(await mongoReader.hasRequiredIndex(collection))) {
       log.info('Building {cd:1,_id:1} index (this can take a long time on large collections — progress in the UI)');
     }
-    await mongoReader.ensureIndex(collection);
+    // State is set around ensureIndex itself, not the check above: an
+    // in-progress build (another pod's, the UI button's, or one a restart
+    // left behind) is listed as present, yet ensureIndex joins and blocks
+    // on it all the same.
+    this.autoIndex = { collection, position: at?.position ?? null, of: at?.of ?? null, startedAtMs: Date.now() };
+    try {
+      await mongoReader.ensureIndex(collection);
+    } finally {
+      this.autoIndex = null;
+    }
 
     const defaults = this.d.hashResolver.resolveCollectionName(collection, config.source.collectionPrefix) ?? undefined;
     this.collectionDefaults.set(collection, defaults);
@@ -2219,18 +2237,32 @@ export class ChunkOrchestrator {
   private indexBuild: { running: boolean; total: number; done: string[]; current: string | null; error: string | null } =
     { running: false, total: 0, done: [], current: null, error: null };
 
-  /** Kick off {cd,_id} index builds on all collections missing it (background). */
-  async startIndexBuilds(): Promise<{ started: boolean; missing: number }> {
-    if (this.indexBuild.running) return { started: false, missing: this.indexBuild.total - this.indexBuild.done.length };
+  /** The index build the run itself is blocked on during mapping (null when not waiting). */
+  private autoIndex: AutoIndexState | null = null;
+
+  autoIndexState(): AutoIndexState | null {
+    return this.autoIndex;
+  }
+
+  /**
+   * Kick off {cd,_id} index builds on all collections missing it (background).
+   * Builds already in flight are listed as present, so they are joined too —
+   * otherwise the button reports "all indexed" while a build is running.
+   */
+  async startIndexBuilds(): Promise<{ started: boolean; missing: number; inProgress: number }> {
+    if (this.indexBuild.running) return { started: false, missing: this.indexBuild.total - this.indexBuild.done.length, inProgress: 0 };
     const db = this.d.mongoReader.getDatabase();
     const collections = await discoverCollections(db, this.d.config.source.collectionPrefix, this.logger);
+    const inFlight = new Set((await this.currentIndexBuildOps()).ops.map((op) => op.collection));
     const missing: string[] = [];
+    let inProgress = 0;
     for (const name of collections) {
       const idx = await db.collection(name).indexes().catch(() => []);
       const has = idx.some((i) => (i.key as Record<string, unknown>).cd !== undefined && (i.key as Record<string, unknown>)._id !== undefined);
       if (!has) missing.push(name);
+      else if (inFlight.has(name)) { missing.push(name); inProgress++; }
     }
-    if (missing.length === 0) return { started: false, missing: 0 };
+    if (missing.length === 0) return { started: false, missing: 0, inProgress: 0 };
 
     this.indexBuild = { running: true, total: missing.length, done: [], current: null, error: null };
     void (async () => {
@@ -2247,30 +2279,38 @@ export class ChunkOrchestrator {
       this.indexBuild.running = false;
       this.indexBuild.current = null;
     })();
-    return { started: true, missing: missing.length };
+    return { started: true, missing: missing.length, inProgress };
   }
 
-  /** Index-build progress incl. live server-side build progress via $currentOp. */
-  async indexBuildProgress(): Promise<Record<string, unknown>> {
-    let serverOps: Array<{ collection: string; pct: number | null; msg: string }> = [];
+  /**
+   * In-flight {cd,_id} builds on the source db, from $currentOp. Progress is
+   * best-effort (it needs the inprog privilege), so a failure is returned,
+   * not thrown — but never swallowed: a silent [] hid the readConcern bug.
+   */
+  private async currentIndexBuildOps(): Promise<{ ops: IndexBuildOp[]; error: string | null }> {
     try {
-      const adminDb = this.d.mongoReader.getDatabase().client.db('admin');
-      const ops = await adminDb
+      const db = this.d.mongoReader.getDatabase();
+      const ops = await db.client.db('admin')
         .aggregate([
           { $currentOp: { allUsers: true } },
           { $match: { 'command.createIndexes': { $exists: true } } },
-          { $project: { command: 1, progress: 1, msg: 1 } },
-        ])
+          { $project: { ns: 1, command: 1, progress: 1, msg: 1, shard: 1 } },
+        ], {
+          // $currentOp refuses any readConcern but 'local', and the source
+          // client defaults to 'majority' (MONGO_READ_CONCERN)
+          readConcern: { level: 'local' },
+        })
         .toArray();
-      serverOps = ops.map((o: Record<string, unknown>) => ({
-        collection: String((o.command as Record<string, unknown>)?.createIndexes ?? '?'),
-        pct: o.progress && (o.progress as Record<string, number>).total
-          ? Math.round(((o.progress as Record<string, number>).done / (o.progress as Record<string, number>).total) * 100)
-          : null,
-        msg: String(o.msg ?? ''),
-      }));
-    } catch { /* $currentOp may need privileges — progress is then best-effort */ }
-    return { ...this.indexBuild, serverOps };
+      return { ops: parseIndexBuildOps(ops, db.databaseName), error: null };
+    } catch (err) {
+      return { ops: [], error: (err as Error).message };
+    }
+  }
+
+  /** Index-build progress: UI-button builds, the run's own mapping-time wait, and live server-side progress. */
+  async indexBuildProgress(): Promise<Record<string, unknown>> {
+    const server = await this.currentIndexBuildOps();
+    return { ...this.indexBuild, auto: this.autoIndex, phases: INDEX_BUILD_PHASES, serverOps: server.ops, serverOpsError: server.error };
   }
 
   // -------------------------------------------------------------------------

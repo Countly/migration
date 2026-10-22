@@ -35,6 +35,10 @@ jobs:
       - name: Ingestion-matching differential harness
         run: npx vitest run tests/differential
 
+      # Pure unit tests (e.g. $currentOp index-build parsing from captured ops).
+      - name: Unit tests
+        run: npx vitest run tests/unit
+
   integration:
     name: Integration (MongoDB 7 + ClickHouse 26.8)
     runs-on: ubuntu-latest

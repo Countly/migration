@@ -1,0 +1,358 @@
+{
+  "_note": "Real $currentOp entries captured on MongoDB 8.0.34 (2-member replica set rs8) during createIndex({cd:1,_id:1}) on a 1.5M-doc collection in db probe. primary.* sampled on the primary, secondary.* on the secondary (note: no command.$db there). lsid removed.",
+  "primary.waiter": {
+    "type": "op",
+    "desc": "conn40",
+    "appName": "mongosh 2.13.0",
+    "active": true,
+    "isFromUserConnection": true,
+    "opid": 78852,
+    "secs_running": 0,
+    "microsecs_running": 60098,
+    "op": "command",
+    "ns": "probe.drill_events_probe",
+    "redacted": false,
+    "command": {
+      "createIndexes": "drill_events_probe",
+      "indexes": [
+        {
+          "name": "cd_1__id_1",
+          "key": {
+            "cd": 1,
+            "_id": 1
+          }
+        }
+      ],
+      "$clusterTime": {
+        "clusterTime": {
+          "$timestamp": {
+            "t": 1792704236,
+            "i": 100
+          }
+        },
+        "signature": {
+          "hash": {
+            "$binary": {
+              "base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+              "subType": "00"
+            }
+          },
+          "keyId": 0
+        }
+      },
+      "$readPreference": {
+        "mode": "primaryPreferred"
+      },
+      "$db": "probe"
+    },
+    "numYields": 0,
+    "numInterruptChecks": 17,
+    "currentQueue": null
+  },
+  "primary.scan": {
+    "type": "op",
+    "desc": "IndexBuildsCoordinatorMongod-0",
+    "active": true,
+    "isFromUserConnection": false,
+    "opid": 81920,
+    "secs_running": 0,
+    "microsecs_running": 306243,
+    "op": "command",
+    "ns": "probe.drill_events_probe",
+    "redacted": false,
+    "command": {
+      "createIndexes": "drill_events_probe",
+      "indexes": [
+        {
+          "v": 2,
+          "key": {
+            "cd": 1,
+            "_id": 1
+          },
+          "name": "cd_1__id_1"
+        }
+      ],
+      "$clusterTime": {
+        "clusterTime": {
+          "$timestamp": {
+            "t": 1792704236,
+            "i": 100
+          }
+        },
+        "signature": {
+          "hash": {
+            "$binary": {
+              "base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+              "subType": "00"
+            }
+          },
+          "keyId": 0
+        }
+      },
+      "$readPreference": {
+        "mode": "primaryPreferred"
+      },
+      "$db": "probe"
+    },
+    "msg": "Index Build: scanning collection Index Build: scanning collection: 101951/1500000 6%",
+    "progress": {
+      "done": 101951,
+      "total": 1500000
+    },
+    "numYields": 13,
+    "numInterruptChecks": 102034,
+    "currentQueue": null
+  },
+  "primary.scanNoProgress": {
+    "type": "op",
+    "desc": "IndexBuildsCoordinatorMongod-0",
+    "active": true,
+    "isFromUserConnection": false,
+    "opid": 81920,
+    "secs_running": 3,
+    "microsecs_running": 3636956,
+    "op": "command",
+    "ns": "probe.drill_events_probe",
+    "redacted": false,
+    "command": {
+      "createIndexes": "drill_events_probe",
+      "indexes": [
+        {
+          "v": 2,
+          "key": {
+            "cd": 1,
+            "_id": 1
+          },
+          "name": "cd_1__id_1"
+        }
+      ],
+      "$clusterTime": {
+        "clusterTime": {
+          "$timestamp": {
+            "t": 1792704236,
+            "i": 100
+          }
+        },
+        "signature": {
+          "hash": {
+            "$binary": {
+              "base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+              "subType": "00"
+            }
+          },
+          "keyId": 0
+        }
+      },
+      "$readPreference": {
+        "mode": "primaryPreferred"
+      },
+      "$db": "probe"
+    },
+    "msg": "Index Build: scanning collection",
+    "numYields": 171,
+    "numInterruptChecks": 1500873,
+    "currentQueue": null
+  },
+  "primary.sorter": {
+    "type": "op",
+    "desc": "IndexBuildsCoordinatorMongod-0",
+    "active": true,
+    "isFromUserConnection": false,
+    "opid": 81920,
+    "secs_running": 6,
+    "microsecs_running": 6191279,
+    "op": "command",
+    "ns": "probe.drill_events_probe",
+    "redacted": false,
+    "command": {
+      "createIndexes": "drill_events_probe",
+      "indexes": [
+        {
+          "v": 2,
+          "key": {
+            "cd": 1,
+            "_id": 1
+          },
+          "name": "cd_1__id_1"
+        }
+      ],
+      "$clusterTime": {
+        "clusterTime": {
+          "$timestamp": {
+            "t": 1792704236,
+            "i": 100
+          }
+        },
+        "signature": {
+          "hash": {
+            "$binary": {
+              "base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+              "subType": "00"
+            }
+          },
+          "keyId": 0
+        }
+      },
+      "$readPreference": {
+        "mode": "primaryPreferred"
+      },
+      "$db": "probe"
+    },
+    "msg": "Index Build: inserting keys from external sorter into index Index Build: inserting keys from external sorter into index: 38606/1500000 2%",
+    "progress": {
+      "done": 38606,
+      "total": 1500000
+    },
+    "numYields": 209,
+    "numInterruptChecks": 1539632,
+    "currentQueue": null
+  },
+  "primary.sorterNoProgress": {
+    "type": "op",
+    "desc": "IndexBuildsCoordinatorMongod-0",
+    "active": true,
+    "isFromUserConnection": false,
+    "opid": 81920,
+    "secs_running": 7,
+    "microsecs_running": 7986437,
+    "op": "command",
+    "ns": "probe.drill_events_probe",
+    "redacted": false,
+    "command": {
+      "createIndexes": "drill_events_probe",
+      "indexes": [
+        {
+          "v": 2,
+          "key": {
+            "cd": 1,
+            "_id": 1
+          },
+          "name": "cd_1__id_1"
+        }
+      ],
+      "$clusterTime": {
+        "clusterTime": {
+          "$timestamp": {
+            "t": 1792704236,
+            "i": 100
+          }
+        },
+        "signature": {
+          "hash": {
+            "$binary": {
+              "base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+              "subType": "00"
+            }
+          },
+          "keyId": 0
+        }
+      },
+      "$readPreference": {
+        "mode": "primaryPreferred"
+      },
+      "$db": "probe"
+    },
+    "msg": "Index Build: inserting keys from external sorter into index",
+    "numYields": 1671,
+    "numInterruptChecks": 3006873,
+    "currentQueue": null
+  },
+  "secondary.scan": {
+    "type": "op",
+    "desc": "IndexBuildsCoordinatorMongod-0",
+    "active": true,
+    "isFromUserConnection": false,
+    "opid": 63488,
+    "secs_running": 0,
+    "microsecs_running": 68739,
+    "op": "command",
+    "ns": "probe.drill_events_probe",
+    "redacted": false,
+    "command": {
+      "createIndexes": "drill_events_probe",
+      "indexes": [
+        {
+          "v": 2,
+          "key": {
+            "cd": 1,
+            "_id": 1
+          },
+          "name": "cd_1__id_1"
+        }
+      ]
+    },
+    "queryFramework": "classic",
+    "msg": "Index Build: scanning collection Index Build: scanning collection: 10561/1500000 0%",
+    "progress": {
+      "done": 10561,
+      "total": 1500000
+    },
+    "numYields": 1,
+    "numInterruptChecks": 10585,
+    "currentQueue": null
+  },
+  "secondary.scanNoProgress": {
+    "type": "op",
+    "desc": "IndexBuildsCoordinatorMongod-0",
+    "active": true,
+    "isFromUserConnection": false,
+    "opid": 63488,
+    "secs_running": 3,
+    "microsecs_running": 3709206,
+    "op": "command",
+    "ns": "probe.drill_events_probe",
+    "redacted": false,
+    "command": {
+      "createIndexes": "drill_events_probe",
+      "indexes": [
+        {
+          "v": 2,
+          "key": {
+            "cd": 1,
+            "_id": 1
+          },
+          "name": "cd_1__id_1"
+        }
+      ]
+    },
+    "queryFramework": "classic",
+    "msg": "Index Build: scanning collection",
+    "numYields": 171,
+    "numInterruptChecks": 1500874,
+    "currentQueue": null
+  },
+  "secondary.sorter": {
+    "type": "op",
+    "desc": "IndexBuildsCoordinatorMongod-0",
+    "active": true,
+    "isFromUserConnection": false,
+    "opid": 63488,
+    "secs_running": 6,
+    "microsecs_running": 6010756,
+    "op": "command",
+    "ns": "probe.drill_events_probe",
+    "redacted": false,
+    "command": {
+      "createIndexes": "drill_events_probe",
+      "indexes": [
+        {
+          "v": 2,
+          "key": {
+            "cd": 1,
+            "_id": 1
+          },
+          "name": "cd_1__id_1"
+        }
+      ]
+    },
+    "queryFramework": "classic",
+    "msg": "Index Build: inserting keys from external sorter into index Index Build: inserting keys from external sorter into index: 152844/1500000 10%",
+    "progress": {
+      "done": 152844,
+      "total": 1500000
+    },
+    "numYields": 323,
+    "numInterruptChecks": 1654327,
+    "currentQueue": null
+  }
+}
