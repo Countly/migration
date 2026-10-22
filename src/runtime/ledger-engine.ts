@@ -139,6 +139,8 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
   // not actively copying.
   const dryState: { status: string; stats: Record<string, unknown> | null; error: string | null } =
     { status: 'not_run', stats: null, error: null };
+  // a dry run maps — and so builds missing indexes — on its own orchestrator
+  let dryOrchestrator: ChunkOrchestrator | null = null;
 
   async function startDryRun(): Promise<{ started: boolean; reason?: string }> {
     if (dryState.status === 'running') return { started: false, reason: 'dry run already running' };
@@ -171,6 +173,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
           config: dryConfig, logger, mongoReader: dryReader, ledger, dlq,
           staging: dryStaging, retryPolicy, hashResolver,
         });
+        dryOrchestrator = dryOrch;
         await dryOrch.run();
         dryState.stats = dryOrch.getStats() as unknown as Record<string, unknown>;
         dryState.status = 'completed';
@@ -178,6 +181,7 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
         dryState.status = 'failed';
         dryState.error = (err as Error).message;
       } finally {
+        dryOrchestrator = null;
         await dryReader.close().catch(() => {});
         await dryStaging.close().catch(() => {});
       }
@@ -378,7 +382,10 @@ export async function runLedgerEngine(config: Config, logger: Logger): Promise<v
     waived: await dlq.waive(config.ledger.dryRun ? `${config.ledger.runId}-dry` : config.ledger.runId, req.body?.ids),
   }));
   app.post('/control/build-indexes', async () => orchestrator.startIndexBuilds());
-  app.get('/api/index-progress', async () => orchestrator.indexBuildProgress());
+  app.get('/api/index-progress', async () => {
+    const progress = await orchestrator.indexBuildProgress();
+    return progress.auto ? progress : { ...progress, auto: dryOrchestrator?.autoIndexState() ?? null };
+  });
   app.post('/control/dry-run', async () => startDryRun());
   app.post<{ Body: { force?: boolean } }>('/control/rebuild-ledger', async (req) => startRebuild(req.body?.force === true));
   app.get('/api/rebuild', async () => rebuildState);
