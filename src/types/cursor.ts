@@ -41,7 +41,7 @@ export function compareCursors(a: Cursor, b: Cursor): number {
 }
 
 // ---------------------------------------------------------------------------
-// Serialization (for MongoDB TEXT columns and Redis JSON)
+// Serialization (for MongoDB-stored cursor strings)
 // ---------------------------------------------------------------------------
 
 /** Serialize a cursor to a deterministic JSON string. */

@@ -1,6 +1,6 @@
 # MongoDB to ClickHouse Migration Service
 
-Migrates Countly `drill_events*` collections from MongoDB into a single ClickHouse table. Supports multi-pod horizontal scaling, range-parallel processing, async writes, pause/resume, crash recovery, backpressure monitoring, and a real-time dashboard.
+Migrates Countly `drill_events*` collections from MongoDB into a single ClickHouse table using a chunk ledger stored in MongoDB (no Redis). Supports multi-pod horizontal scaling through chunk leases, pause/resume, crash recovery, backpressure monitoring, and a real-time dashboard.
 
 ## Setup & run
 
