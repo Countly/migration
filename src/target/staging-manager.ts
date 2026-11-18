@@ -341,11 +341,13 @@ export class StagingManager {
   /**
    * Ids per query when passed as a {ids:Array(String)} parameter. ClickHouse
    * receives query params as HTTP form fields capped by
-   * http_max_field_value_size (128 KiB default): ~5,000 ObjectId strings
-   * already trip "HTML Form Exception: Field value too long" (field report).
-   * 2,000 ids ≈ 52 KB — safely under default limits everywhere.
+   * http_max_field_value_size (128 KiB default). This assumes 24-char Mongo
+   * ObjectIds, but Countly drill_events _id values run ~76 chars — at that
+   * length, 2,000 ids ≈ 152 KB, already over the limit ("HTML Form Exception:
+   * Field value too long", hit on qureai and again on dbaudio). 200 ids ≈
+   * 15 KB — safely under default limits even at the longer id length.
    */
-  static readonly ID_PARAM_PAGE = 2_000;
+  static readonly ID_PARAM_PAGE = 200;
 
   private scopeSql(scope?: { a: string; e: string; n?: string } | null): string {
     if (!scope) return '';
